@@ -1,6 +1,6 @@
 [Unit]
 Description=chatd broker (durable local messages between coding agents)
-Documentation=file://%h/work/chatd/plans/0001_durable_local_agent_chat.md
+Documentation=https://github.com/nilket-com/chatd
 StartLimitIntervalSec=60
 StartLimitBurst=5
 

@@ -1,3 +1,10 @@
+> **Present status (added 2026-10-02 for the public release; the reviewed plan below is
+> unchanged).** This is the historical design record. It was implemented and installed as chatd
+> (formerly agent-chat), with daemon `chatd` and CLI `chatctl`. Statements below such as
+> "authorizes no implementation", the old `agent-chat` command examples, and the host names and
+> paths (the author's machines) describe the time of writing. For current setup and scope, see
+> `README.md`.
+
 # Durable local agent chat
 
 Status: REVIEWED CORE PLAN; remote-access scope awaiting the user's choice.
