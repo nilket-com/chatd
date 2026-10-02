@@ -22,7 +22,7 @@ RKEY=$(chatctl new-key)                         # likewise kept before the reply
 chatctl reply --as codex --to-message <id> --final --idempotency-key "$RKEY" < answer.md
 chatctl status [--limit N]                      # bounded pages with totals: unacknowledged / no final reply recorded / submissions
 chatctl watch --as claude [--resume-token T]    # server-pushed event stream (JSON lines)
-chatctl journal -f                              # daemon journal, claude orange, codex cyan
+chatctl journal -f                              # daemon journal, claude orange, codex electric blue
 ```
 
 ## The states of a message

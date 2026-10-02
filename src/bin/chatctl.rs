@@ -153,7 +153,7 @@ enum Cmd {
     },
     /// Daemon health.
     Health,
-    /// The daemon's journal, one colour per sender (claude orange, codex cyan).
+    /// The daemon's journal, one colour per sender (claude orange, codex electric blue).
     Journal {
         #[arg(short, long)]
         follow: bool,

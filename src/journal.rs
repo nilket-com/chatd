@@ -44,11 +44,11 @@ pub fn log(priority: u8, message: &str, fields: &[(&str, &str)]) {
     eprintln!("<{priority}>{} {}", clean(message), extra.join(" "));
 }
 
-/// ANSI colour per sender: claude orange, codex cyan, anything else (the daemon itself) default.
+/// ANSI colour per sender: claude orange, codex electric blue (#0087ff), anything else (the daemon itself) default.
 pub fn color_for(sender: Option<&str>) -> &'static str {
     match sender {
         Some("claude") => "\x1b[38;5;208m",
-        Some("codex") => "\x1b[36m",
+        Some("codex") => "\x1b[38;5;33m",
         Some(_) => "\x1b[35m",
         None => "",
     }
@@ -79,7 +79,7 @@ mod tests {
     fn colours_follow_the_sender_field() {
         let l = r#"{"__REALTIME_TIMESTAMP":"3723000000","MESSAGE":"stored","PRIORITY":"6","CHATD_SENDER":"codex"}"#;
         let out = colorize(l, true).unwrap();
-        assert!(out.starts_with("\x1b[36m01:02:03Z"), "{out:?}");
+        assert!(out.starts_with("\x1b[38;5;33m01:02:03Z"), "{out:?}");
         assert!(out.ends_with("\x1b[0m"));
         let c = r#"{"__REALTIME_TIMESTAMP":"0","MESSAGE":"x","CHATD_SENDER":"claude"}"#;
         assert!(colorize(c, true).unwrap().starts_with("\x1b[38;5;208m"));
