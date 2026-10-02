@@ -1,0 +1,24 @@
+[Unit]
+Description=chatd broker (durable local messages between coding agents)
+Documentation=file://%h/work/chatd/plans/0001_durable_local_agent_chat.md
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/bin/chatd
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+KillMode=control-group
+UMask=0077
+RuntimeDirectory=chatd
+RuntimeDirectoryMode=0700
+StateDirectory=chatd
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
