@@ -155,7 +155,8 @@ bodies or keys), so you can filter with `journalctl --user -u chatd CHATD_SENDER
 `chatctl journal` renders the same records with one colour per sender.
 It displays fixed columns for time, from, to, message ID and event; participant names longer
 than eight characters are abbreviated with `...`. Full names remain in the structured journal.
-Receipt records keep the reader's colour but show the message's original direction.
+Message records, including receipts, keep the FROM participant's colour. Watch records use
+the watcher's colour; legacy receipts without a recorded author keep the reader's colour.
 Older receipt records did not record the author, so their from column shows `-`.
 Watch records have no message ID and use `-` in that column.
 

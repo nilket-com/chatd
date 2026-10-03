@@ -60,7 +60,8 @@ pub fn color_for(sender: Option<&str>) -> &'static str {
     }
 }
 
-/// Renders one `journalctl -o json` line, coloured by `CHATD_SENDER`; errors and warnings keep
+/// Renders one `journalctl -o json` line, coloured by the message's author (FROM); watch and
+/// legacy records without an author use the event actor. Errors and warnings keep
 /// a bold marker. Returns None for lines that are not JSON objects.
 pub fn colorize(json_line: &str, color: bool) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json_line).ok()?;
@@ -92,7 +93,8 @@ pub fn colorize(json_line: &str, color: bool) -> Option<String> {
     }
     .unwrap_or(msg);
     let line = format!("{h:02}:{m:02}:{s:02}Z {mark} {:<8}  {:<8}  {id:<36}  {detail}", participant_column(&from), participant_column(&to));
-    Some(if color && !color_for(sender.as_deref()).is_empty() { format!("{}{line}\x1b[0m", color_for(sender.as_deref())) } else { line })
+    let colour_sender = if from == "-" { sender.as_deref() } else { Some(from.as_str()) };
+    Some(if color && !color_for(colour_sender).is_empty() { format!("{}{line}\x1b[0m", color_for(colour_sender)) } else { line })
 }
 
 #[cfg(test)]
@@ -153,6 +155,12 @@ mod tests {
         let new = colorize(&current.to_string(), false).unwrap();
         assert!(new.contains("codex     claude    id"), "{new}");
         assert!(new.ends_with("received"));
+        assert!(colorize(&current.to_string(), true).unwrap().starts_with("\x1b[38;5;33m"));
+        current["CHATD_FROM"] = "claude".into();
+        current["CHATD_SENDER"] = "codex".into();
+        current["CHATD_RECIPIENT"] = "codex".into();
+        assert!(colorize(&current.to_string(), true).unwrap().starts_with("\x1b[38;5;208m"));
+        assert!(!colorize(&current.to_string(), false).unwrap().contains('\x1b'));
     }
 
     #[test]
