@@ -147,12 +147,17 @@ service and run `chatd restore /abs/path.db`. The restore is failure-atomic:
 The old database and its WAL are moved to `replaced-<ms>/` and never deleted. Every watcher must
 resynchronize, and refetch `chatctl status`.
 
-## Colours in the journal
+## Journal columns and colours
 
 `journalctl` colours lines by priority only. The daemon writes structured fields instead
-(`CHATD_SENDER`, `CHATD_RECIPIENT`, `CHATD_MESSAGE_ID`, `CHATD_EVENT`; never
+(`CHATD_SENDER`, `CHATD_FROM`, `CHATD_RECIPIENT`, `CHATD_MESSAGE_ID`, `CHATD_EVENT`; never
 bodies or keys), so you can filter with `journalctl --user -u chatd CHATD_SENDER=codex`.
 `chatctl journal` renders the same records with one colour per sender.
+It displays fixed columns for time, from, to, message ID and event; participant names longer
+than eight characters are abbreviated with `...`. Full names remain in the structured journal.
+Receipt records keep the reader's colour but show the message's original direction.
+Older receipt records did not record the author, so their from column shows `-`.
+Watch records have no message ID and use `-` in that column.
 
 ## License
 

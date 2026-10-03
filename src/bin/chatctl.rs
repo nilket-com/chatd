@@ -395,6 +395,7 @@ fn watch(who: &str, conversation: Option<String>, token: Option<String>, timeout
 
 fn journal_view(follow: bool, lines: u32, no_color: bool, from_stdin: bool, unit: &str) -> ExitCode {
     let color = !no_color && io::stdout().is_terminal();
+    emit(journal::HEADER);
     let render = |line: &str| {
         if let Some(s) = journal::colorize(line, color) {
             emit(&s);

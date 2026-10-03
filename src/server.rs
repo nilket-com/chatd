@@ -321,10 +321,11 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
             Ok((acknowledged, already)) => {
                 wrote = !acknowledged.is_empty();
                 for id in &acknowledged {
+                    let from = store.receive(&as_, id).map(|m| m.sender).unwrap_or_else(|_| "-".into());
                     journal::log(
                         journal::PRIORITY_INFO,
                         &format!("received {id} by {as_}"),
-                        &[("SENDER", &as_), ("MESSAGE_ID", id), ("EVENT", "received")],
+                        &[("SENDER", &as_), ("FROM", &from), ("RECIPIENT", &as_), ("MESSAGE_ID", id), ("EVENT", "received")],
                     );
                 }
                 Response::Acked { acknowledged, already }

@@ -9,6 +9,7 @@ pub const PRIORITY_ERR: u8 = 3;
 pub const PRIORITY_WARNING: u8 = 4;
 pub const PRIORITY_NOTICE: u8 = 5;
 pub const PRIORITY_INFO: u8 = 6;
+pub const HEADER: &str = "TIME        FROM      TO        MESSAGE ID                            EVENT";
 
 static SOCKET: OnceLock<Option<UnixDatagram>> = OnceLock::new();
 
@@ -27,6 +28,11 @@ fn socket() -> Option<&'static UnixDatagram> {
 
 fn clean(v: &str) -> String {
     v.chars().map(|c| if c == '\n' || c.is_control() { ' ' } else { c }).take(512).collect()
+}
+
+fn participant_column(name: &str) -> String {
+    let name = clean(name);
+    if name.chars().count() > 8 { format!("{}...", name.chars().take(5).collect::<String>()) } else { name }
 }
 
 /// Emits one record. `fields` are extra `CHATD_*` journal fields (upper-case names).
@@ -66,8 +72,26 @@ pub fn colorize(json_line: &str, color: bool) -> Option<String> {
     let msg = clean(&field("MESSAGE").unwrap_or_default());
     let prio: u8 = field("PRIORITY").and_then(|p| p.parse().ok()).unwrap_or(PRIORITY_INFO);
     let mark = if prio <= PRIORITY_WARNING { "!" } else { " " };
-    let who = sender.clone().unwrap_or_else(|| "daemon".into());
-    let line = format!("{h:02}:{m:02}:{s:02}Z {mark} {who:>6}  {msg}");
+    let event = field("CHATD_EVENT").unwrap_or_default();
+    let id = clean(&field("CHATD_MESSAGE_ID").unwrap_or_else(|| "-".into()));
+    let recipient = field("CHATD_RECIPIENT");
+    // Older acknowledgement records name the reader as SENDER and omit the author.
+    // Show that author as unknown rather than reversing the message's direction.
+    let from = field("CHATD_FROM").or_else(|| if event == "received" { None } else { sender.clone() }).unwrap_or_else(|| "-".into());
+    let to = recipient.or_else(|| if event == "received" { sender.clone() } else { None }).unwrap_or_else(|| "-".into());
+    let detail = match event.as_str() {
+        "stored" => msg.strip_prefix("stored ").and_then(|s| s.split_whitespace().next()).map(|kind| format!("stored {kind}")),
+        "received" => Some("received".into()),
+        "submission_started" => msg.strip_prefix(&format!("submitting {id} to {to}")).map(|tail| format!("submitting{tail}")),
+        "submission" => msg.strip_prefix(&format!("submission of {id} to {to}: ")).map(str::to_string),
+        "watch_open" => Some("watch opened".into()),
+        "watch_close" => {
+            msg.strip_prefix(&format!("watch by {} ", sender.as_deref().unwrap_or_default())).map(|tail| format!("watch {tail}"))
+        }
+        _ => None,
+    }
+    .unwrap_or(msg);
+    let line = format!("{h:02}:{m:02}:{s:02}Z {mark} {:<8}  {:<8}  {id:<36}  {detail}", participant_column(&from), participant_column(&to));
     Some(if color && !color_for(sender.as_deref()).is_empty() { format!("{}{line}\x1b[0m", color_for(sender.as_deref())) } else { line })
 }
 
@@ -91,5 +115,51 @@ mod tests {
         let l = "{\"MESSAGE\":\"a\\u001b[2Jb\\nc\"}";
         let out = colorize(l, false).unwrap();
         assert!(!out.chars().any(|c| c.is_control()), "{out:?}");
+    }
+
+    #[test]
+    fn message_ids_and_details_align_across_events() {
+        let id = "00000000-0000-7000-8000-000000000001";
+        let render = |event: &str, msg: &str, from: &str, to: &str| {
+            colorize(
+                &serde_json::json!({"MESSAGE": msg, "CHATD_EVENT": event,
+                "CHATD_MESSAGE_ID": id, "CHATD_SENDER": from, "CHATD_RECIPIENT": to})
+                .to_string(),
+                false,
+            )
+            .unwrap()
+        };
+        let stored = render("stored", &format!("stored request {id} claude->codex"), "claude", "codex");
+        let submit = render("submission_started", &format!("submitting {id} to codex (attempt 25, generation 5)"), "claude", "codex");
+        let result = render("submission", &format!("submission of {id} to claude: failed (timeout)"), "codex", "claude");
+        let long_name = render("stored", &format!("stored info {id} long-participant->claude"), "long-participant", "claude");
+        for line in [&stored, &submit, &result, &long_name] {
+            assert_eq!(line.find(id), Some(32), "{line}");
+            assert_eq!(line.matches(id).count(), 1);
+        }
+        assert!(stored.ends_with("stored request"));
+        assert!(submit.ends_with("submitting (attempt 25, generation 5)"));
+        assert!(result.ends_with("failed (timeout)"));
+    }
+
+    #[test]
+    fn receipt_direction_is_not_the_reader_as_author() {
+        let legacy = serde_json::json!({"MESSAGE": "received id by claude", "CHATD_EVENT": "received", "CHATD_SENDER": "claude", "CHATD_MESSAGE_ID": "id"});
+        let old = colorize(&legacy.to_string(), false).unwrap();
+        assert!(old.contains("-         claude    id"), "{old}");
+        let mut current = legacy;
+        current["CHATD_FROM"] = "codex".into();
+        current["CHATD_RECIPIENT"] = "claude".into();
+        let new = colorize(&current.to_string(), false).unwrap();
+        assert!(new.contains("codex     claude    id"), "{new}");
+        assert!(new.ends_with("received"));
+    }
+
+    #[test]
+    fn watch_records_have_no_fake_message_id_or_repeated_actor() {
+        let v = serde_json::json!({"MESSAGE": "watch by claude ended: Broken pipe (os error 32)", "CHATD_EVENT": "watch_close", "CHATD_SENDER": "claude"});
+        let line = colorize(&v.to_string(), false).unwrap();
+        assert_eq!(line.matches("claude").count(), 1);
+        assert!(line.ends_with("watch ended: Broken pipe (os error 32)"));
     }
 }

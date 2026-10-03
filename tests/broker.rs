@@ -933,8 +933,11 @@ fn the_journal_view_colours_by_sender() {
     let input = "{\"__REALTIME_TIMESTAMP\":\"0\",\"MESSAGE\":\"stored request\",\"CHATD_SENDER\":\"claude\"}\n{\"__REALTIME_TIMESTAMP\":\"0\",\"MESSAGE\":\"stored final\",\"CHATD_SENDER\":\"codex\"}\n";
     let out = e.cli(&["journal", "--stdin"], Some(input));
     let s = stdout(&out);
-    assert_eq!(s.lines().count(), 2);
-    assert!(s.contains("claude  stored request") && s.contains("codex  stored final"));
+    let lines: Vec<_> = s.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0], chatd::journal::HEADER);
+    assert!(lines[1].contains("claude    -         -") && lines[1].ends_with("stored request"));
+    assert!(lines[2].contains("codex     -         -") && lines[2].ends_with("stored final"));
     assert!(!s.contains('\x1b'), "no colour when stdout is not a terminal");
 }
 
