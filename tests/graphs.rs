@@ -327,9 +327,9 @@ impl Graph {
         }
     }
 
-    /// The directory must describe each agent as configured and reachable only if it can be reached now.
+    /// The directory must describe each agent as configured, with a path in place only where one is attached.
     fn assert_directory(&self, unreachable: &[&str]) {
-        let rows = self.daemon.status().participants;
+        let rows = self.daemon.status().participants.expect("a current daemon reports the directory");
         assert_eq!(rows.len(), self.agents.len(), "one row per participant");
         for a in &self.agents {
             let r = rows.iter().find(|r| r.name == a.name).unwrap_or_else(|| panic!("no row for {}", a.name));
@@ -342,7 +342,7 @@ impl Graph {
             assert_eq!(r.transport, transport, "{}", a.name);
             assert_eq!(r.expected_transport.as_deref(), Some(transport), "{}", a.name);
             assert_eq!(r.watchers, watching, "{}", a.name);
-            assert_eq!(r.reachable, !unreachable.contains(&a.name.as_str()), "{} reachable", a.name);
+            assert_eq!(r.path_ready, !unreachable.contains(&a.name.as_str()), "{} path_ready", a.name);
         }
     }
 
@@ -448,8 +448,8 @@ fn lapsed_pull_agent(claudes: usize, codexes: usize) {
     g.assert_directory(&[&lapsed]);
     g.run(&lapsed);
     let t0 = Instant::now();
-    while g.daemon.status().participants.iter().any(|p| !p.reachable) {
-        assert!(t0.elapsed() < Duration::from_secs(10), "the lapsed agent never became reachable again");
+    while g.daemon.status().participants.unwrap().iter().any(|p| !p.path_ready) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the lapsed agent never had a path again");
         std::thread::sleep(Duration::from_millis(20));
     }
     g.assert_directory(&[]);

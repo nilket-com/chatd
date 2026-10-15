@@ -117,7 +117,8 @@ What it found:
 `[participant.<name>]` in the config carries `product` and `tier` (short lowercase tokens, validated at
 start; metadata, never routing). `status` returns a `participants` directory and `chatctl peers` prints it:
 product, tier, transport (push with an endpoint, else pull), expected transport for the product,
-watchers, oldest watcher, and `reachable`. The harness asserts the directory for every mix, including a
-lapsed pull agent shown unreachable and reachable again on return. The attributes live in the config, so
+watchers, oldest watcher, and `path_ready` (a delivery path is in place; not proof of delivery or
+wakefulness, per Codex's review). The harness asserts the directory for every mix, including a lapsed pull
+agent with no path and a path again on return. The attributes live in the config, so
 there is no store schema change; a participant added only under `[participant.*]` is migrated in like any
 other. Not done here: group send, per-request owner, and any change to routing based on product.

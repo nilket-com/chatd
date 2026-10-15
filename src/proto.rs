@@ -213,13 +213,15 @@ pub struct StatusView {
     pub uncertain_or_failed_total: i64,
     pub endpoints: Vec<EndpointView>,
     pub watchers: Vec<WatcherView>,
-    /// Every participant with its configured product and tier and how it can be reached now.
+    /// Every participant with its configured product and tier and the delivery path in place now.
+    /// `None` only from a daemon that predates the directory, so a daemon with no participants is
+    /// distinguishable from an old one.
     #[serde(default)]
-    pub participants: Vec<ParticipantView>,
+    pub participants: Option<Vec<ParticipantView>>,
 }
 
 /// One row of the directory (plan 0003). `product` and `tier` come from the configuration and are
-/// metadata; `transport`, `reachable` and the watcher fields come from what is attached now.
+/// metadata; `transport`, `path_ready` and the watcher fields come from what is attached now.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParticipantView {
     pub name: String,
@@ -229,9 +231,10 @@ pub struct ParticipantView {
     pub transport: String,
     /// What the configured product normally uses: "push" for codex, "pull" for claude, else absent.
     pub expected_transport: Option<String>,
-    /// A push participant is reachable while its endpoint is registered; a pull participant while at
-    /// least one watcher is attached. Reachable is not awake: it says a message can be delivered.
-    pub reachable: bool,
+    /// A delivery path is in place: a push participant has a registered endpoint, a pull participant has
+    /// at least one attached watcher. It does not prove delivery or that the agent is awake. Recent push
+    /// failures are per message and stay a separate signal (`status` submissions).
+    pub path_ready: bool,
     pub watchers: u32,
     /// When the oldest attached watcher connected.
     pub watching_since_ms: Option<i64>,

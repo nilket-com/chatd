@@ -1900,7 +1900,7 @@ fn peers_shows_product_tier_and_reachability_and_follows_a_watcher() {
 }
 
 #[test]
-fn a_codex_with_a_registered_endpoint_is_reachable_by_push() {
+fn a_codex_with_a_registered_endpoint_has_a_push_path() {
     let mut e = Env::new("heartbeat_ms = 300\n[participant.codex]\nproduct = \"codex\"\n");
     e.start();
     let reg = e.cli(&["endpoint", "register", "--as", "codex", "--session", "s1", "--exe", "/bin/true"], None);

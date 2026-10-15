@@ -111,8 +111,8 @@ fn valid_token(s: &str) -> bool {
 impl Config {
     /// The participant list plus any name that only appears under `[participant.*]`, in that order.
     pub fn participant_names(&self) -> Vec<String> {
-        let mut names = self.participants.clone();
-        for n in self.participant.keys() {
+        let mut names: Vec<String> = Vec::new();
+        for n in self.participants.iter().chain(self.participant.keys()) {
             if !names.contains(n) {
                 names.push(n.clone());
             }
@@ -140,7 +140,7 @@ impl Config {
     }
 }
 
-/// The directory: every participant, how it is configured, and whether a message can reach it now.
+/// The directory: every participant, how it is configured, and whether a delivery path is in place now.
 pub fn directory(config: &Config, endpoints: &[EndpointView], watchers: &[WatcherView]) -> Vec<ParticipantView> {
     config
         .participant_names()
@@ -156,7 +156,7 @@ pub fn directory(config: &Config, endpoints: &[EndpointView], watchers: &[Watche
                 _ => None,
             };
             ParticipantView {
-                reachable: if endpoint.is_some() { true } else { !mine.is_empty() },
+                path_ready: endpoint.is_some() || !mine.is_empty(),
                 watchers: mine.len() as u32,
                 watching_since_ms: mine.iter().map(|w| w.connected_at_ms).min(),
                 session: endpoint.map(|e| e.session.clone()),
@@ -427,7 +427,7 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
             match store.status(as_.as_deref(), conversation.as_deref(), limit, unacknowledged_after, unanswered_after) {
                 Ok(mut s) => {
                     s.watchers = shared.watchers.lock().map(|w| w.values().cloned().collect()).unwrap_or_default();
-                    s.participants = directory(&shared.config, &s.endpoints, &s.watchers);
+                    s.participants = Some(directory(&shared.config, &s.endpoints, &s.watchers));
                     Response::Status(s)
                 }
                 Err(e) => err(e),
@@ -743,6 +743,28 @@ mod directory_tests {
     }
 
     #[test]
+    fn a_status_without_a_directory_is_an_older_daemon_not_an_empty_one() {
+        let old = serde_json::json!({
+            "store_id": "s", "head_seq": 0, "unacknowledged": [], "unacknowledged_total": 0, "next_unacknowledged_after": null,
+            "unanswered": [], "unanswered_total": 0, "next_unanswered_after": null, "uncertain_or_failed_submissions": [],
+            "uncertain_or_failed_total": 0, "endpoints": [], "watchers": []
+        });
+        let status: crate::proto::StatusView = serde_json::from_value(old).unwrap();
+        assert!(status.participants.is_none());
+        let mut current = serde_json::to_value(&status).unwrap();
+        current["participants"] = serde_json::json!([]);
+        let status: crate::proto::StatusView = serde_json::from_value(current).unwrap();
+        assert_eq!(status.participants, Some(vec![]), "an empty directory is still a directory");
+    }
+
+    #[test]
+    fn a_duplicate_in_the_list_does_not_make_two_rows() {
+        let c = config("participants = [\"a\", \"b\", \"a\"]\n[participant.b]\nproduct = \"claude\"\n");
+        assert_eq!(c.participant_names(), vec!["a", "b"]);
+        assert_eq!(directory(&c, &[], &[]).len(), 2);
+    }
+
+    #[test]
     fn tokens_are_short_lowercase_words() {
         for ok in ["claude", "codex", "luna", "gpt-6_luna", "a", "0x"] {
             assert!(valid_token(ok), "{ok}");
@@ -756,23 +778,23 @@ mod directory_tests {
     }
 
     #[test]
-    fn push_is_reachable_with_an_endpoint_and_pull_with_a_watcher() {
+    fn push_has_a_path_with_an_endpoint_and_pull_with_a_watcher() {
         let c = config(
             "participants = [\"c1\", \"x1\", \"x2\", \"c2\"]\n[participant.c1]\nproduct = \"claude\"\ntier = \"luna\"\n[participant.x1]\nproduct = \"codex\"\n[participant.x2]\nproduct = \"codex\"\n",
         );
         let rows = directory(&c, &[endpoint("x1")], &[watcher("c1", 50), watcher("c1", 10)]);
         let by = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
         let (c1, x1, x2, c2) = (by("c1"), by("x1"), by("x2"), by("c2"));
-        assert!(c1.reachable && c1.transport == "pull" && c1.watchers == 2 && c1.watching_since_ms == Some(10));
+        assert!(c1.path_ready && c1.transport == "pull" && c1.watchers == 2 && c1.watching_since_ms == Some(10));
         assert_eq!(
             (c1.product.as_deref(), c1.tier.as_deref(), c1.expected_transport.as_deref()),
             (Some("claude"), Some("luna"), Some("pull"))
         );
-        assert!(x1.reachable && x1.transport == "push" && x1.session.as_deref() == Some("s-x1"));
+        assert!(x1.path_ready && x1.transport == "push" && x1.session.as_deref() == Some("s-x1"));
         assert!(
-            !x2.reachable && x2.transport == "pull" && x2.expected_transport.as_deref() == Some("push"),
-            "a codex with no endpoint is unreachable"
+            !x2.path_ready && x2.transport == "pull" && x2.expected_transport.as_deref() == Some("push"),
+            "a codex with no endpoint has no path"
         );
-        assert!(!c2.reachable && c2.product.is_none() && c2.expected_transport.is_none());
+        assert!(!c2.path_ready && c2.product.is_none() && c2.expected_transport.is_none());
     }
 }

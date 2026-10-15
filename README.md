@@ -85,9 +85,10 @@ Shortcuts (plan 0002):
   A name that appears only under `[participant.*]` is a participant too. A bad token stops the daemon
   at start with the offending key. `chatctl peers` (and `chatctl --json peers`, or the new
   `participants` field of `status`) lists each participant with its product, tier, transport (push when
-  an endpoint is registered, otherwise pull), watcher count and whether it is reachable now: a push
-  participant while its endpoint is registered, a pull participant while a watcher is attached. Reachable
-  means a message can be delivered, not that the agent is awake. A note column says when a participant
+  an endpoint is registered, otherwise pull), watcher count and whether a delivery path is in place: a push
+  participant while its endpoint is registered, a pull participant while a watcher is attached. A path is
+  not proof of delivery and not that the agent is awake; recent push failures stay in the `status`
+  submissions list. A note column says when a participant
   does not use the transport its product normally does (a codex with no endpoint). Name the instance, not
   the model or role, so a model can be swapped and roles can change (plan 0003).
 

@@ -151,7 +151,7 @@ enum Cmd {
         #[arg(long)]
         unanswered_after: Option<i64>,
     },
-    /// The directory: each participant's product and tier, how it is reached, and whether it is reachable now.
+    /// The directory: each participant's product and tier, how it is reached, and whether a delivery path is in place.
     Peers,
     /// The durable event log.
     Log {
@@ -912,19 +912,17 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
             else {
                 return Err(ExitCode::FAILURE);
             };
-            if s.participants.is_empty() {
-                eprintln!(
-                    "chatctl: this chatd predates the participant directory (it reported none); restart chatd to pick up the new binary"
-                );
+            let Some(participants) = s.participants else {
+                eprintln!("chatctl: this chatd predates the participant directory; restart chatd to pick up the new binary");
                 return Err(ExitCode::from(EXIT_REFUSED));
-            }
+            };
             if json {
-                print_json(&s.participants);
+                print_json(&participants);
                 return Ok(());
             }
-            println!("{:<12} {:<8} {:<10} {:<9} {:<10} {:<9} NOTE", "PARTICIPANT", "PRODUCT", "TIER", "TRANSPORT", "REACHABLE", "WATCHING");
-            for p in &s.participants {
-                let note = match (&p.expected_transport, p.reachable) {
+            println!("{:<12} {:<8} {:<10} {:<9} {:<5} {:<9} NOTE", "PARTICIPANT", "PRODUCT", "TIER", "TRANSPORT", "PATH", "WATCHING");
+            for p in &participants {
+                let note = match (&p.expected_transport, p.path_ready) {
                     (Some(e), _) if *e != p.transport => format!(
                         "{} normally uses {e}; no {}",
                         p.product.as_deref().unwrap_or("?"),
@@ -934,12 +932,12 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                     _ => String::new(),
                 };
                 println!(
-                    "{:<12} {:<8} {:<10} {:<9} {:<10} {:<9} {}",
+                    "{:<12} {:<8} {:<10} {:<9} {:<5} {:<9} {}",
                     p.name,
                     p.product.as_deref().unwrap_or("-"),
                     p.tier.as_deref().unwrap_or("-"),
                     p.transport,
-                    if p.reachable { "yes" } else { "no" },
+                    if p.path_ready { "yes" } else { "no" },
                     p.watching_since_ms.map(|t| age(now_ms() - t)).unwrap_or_else(|| "-".into()),
                     note
                 );
