@@ -10,11 +10,14 @@ graphs is 3 agents; 4 is included to see the whole space.
 | --- | --- | --- |
 | Product | Claude, Codex | HOW an agent is woken (the transport) |
 | Model tier | Astra, Sol, Luna (a tier exists on both vendors' sides; "Luna" alone is ambiguous) | what the agent is good at; not routing |
-| Instance / role | `reviewer`, `impl`, `scout` | WHO a message is for (the chatd participant name) |
+| Instance | `a1`, `a2`, `scout-host` | WHO a message is for: a STABLE participant name, the routing identity |
+| Role | `reviewer`, `impl`, `owner of request R` | what an instance does NOW; assigned per conversation or request, may change per task |
 
-A chatd participant name is a routing label. Name instances, not products or models, so a model can be
-swapped without rewriting the graph. Record the product (and tier, as metadata) per participant so the
-daemon and humans can tell how it is reached. Today the names are `claude` and `codex`, which only works
+A chatd participant name is a stable routing label for one instance. Do not use it for a role: roles move
+between instances, and a name that is a role breaks when it does (review feedback, Codex). Name instances,
+not products or models, so a model can be swapped without rewriting the graph, and keep roles as data on
+the conversation or request. Record the product (and tier, as metadata) per participant so the daemon and
+humans can tell how it is reached. Today the names are `claude` and `codex`, which only works
 for one of each.
 
 ## Transport is decided by the receiver's product and the sender's product
@@ -59,7 +62,12 @@ transport from the table above.
    named owner per request, others informed. Today `status` lists every unanswered request, with no
    owner.
 3. **Broadcast.** A send has exactly one recipient. Telling N agents costs N sends and N keys. A group
-   send (one key, per-recipient delivery and ack state) is the first addition.
+   send is the first addition. Decided shape: ONE logical idempotency key per broadcast; the daemon
+   stores one message per recipient, derived deterministically from (key, recipient), each with its own
+   delivery, ack and answer state. Retrying with the same key and the same recipient set returns the
+   original messages; the same key with a different recipient set or body is a Conflict, as for a single
+   send today. Per-recipient keys chosen by the caller are not offered, so a partial retry cannot
+   produce a different set.
 4. **Peer reachability.** Nothing tells a sender whether a peer is watching, how it is woken, or whether
    its watcher lapsed. A directory (participant, product, tier, watching since, transport) is the
    natural place; `status` already lists watchers.
