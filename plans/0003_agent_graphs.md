@@ -1,0 +1,86 @@
+# 0003: Agent graphs over chatd
+
+Status: draft for review (Claude wrote it; Codex asked for its shape in `chatd-ergonomics-pairs`).
+Scope: designing the space of 2 to 4 agents. Nothing here is implemented. The standing cap on live
+graphs is 3 agents; 4 is included to see the whole space.
+
+## Three things that must stay separate
+
+| Axis | Examples | What it decides |
+| --- | --- | --- |
+| Product | Claude, Codex | HOW an agent is woken (the transport) |
+| Model tier | Astra, Sol, Luna (a tier exists on both vendors' sides; "Luna" alone is ambiguous) | what the agent is good at; not routing |
+| Instance / role | `reviewer`, `impl`, `scout` | WHO a message is for (the chatd participant name) |
+
+A chatd participant name is a routing label. Name instances, not products or models, so a model can be
+swapped without rewriting the graph. Record the product (and tier, as metadata) per participant so the
+daemon and humans can tell how it is reached. Today the names are `claude` and `codex`, which only works
+for one of each.
+
+## Transport is decided by the receiver's product and the sender's product
+
+| Receiver | Sender | Transport | Wake-up |
+| --- | --- | --- | --- |
+| Codex | anyone | chatd + `codex queue` push | true push, interrupts a busy turn |
+| Claude | Claude | native `SendMessage`, or chatd + Monitor | native wakes an idle session; chatd path is pull |
+| Claude | Codex | chatd + Monitor | pull, re-armed every 30 min (Monitor cap) |
+
+Native Claude-to-Claude messaging has no durability, acks or retry-safe keys, and a peer in a different
+permission mode may hold messages for approval. Whether it wakes a fully idle session reliably was seen
+once, in the spike (plan 0002), and should be re-checked. chatd adds the durable parts.
+
+## The compositions
+
+`c` Claudes and `x` Codexes give C(c,2) Claude-Claude, C(x,2) Codex-Codex and c*x Claude-Codex POTENTIAL
+pairwise links. The realized graph can be sparse or hub-shaped, and each realized edge chooses a
+transport from the table above.
+
+| Agents | Mix (c,x) | CC | XX | CX | What dominates |
+| --- | --- | --- | --- | --- | --- |
+| 2 | (2,0) | 1 | 0 | 0 | native is enough; chatd optional |
+| 2 | (1,1) | 0 | 0 | 1 | the asymmetric pair we run today |
+| 2 | (0,2) | 0 | 1 | 0 | symmetric push |
+| 3 | (3,0) | 3 | 0 | 0 | native mesh possible |
+| 3 | (2,1) | 1 | 0 | 2 | Codex is a hub; two pull-side Claudes |
+| 3 | (1,2) | 0 | 1 | 2 | one Claude is the pull bottleneck |
+| 3 | (0,3) | 0 | 3 | 0 | all push; worst busy-turn pile-up |
+| 4 | (4,0) | 6 | 0 | 0 | native mesh gets large |
+| 4 | (3,1) | 3 | 0 | 3 | |
+| 4 | (2,2) | 1 | 1 | 4 | CX-heavy |
+| 4 | (1,3) | 0 | 3 | 3 | |
+| 4 | (0,4) | 0 | 6 | 0 | |
+
+## Problems the pair work did not need to solve
+
+1. **Busy-turn fan-in.** Push into a busy Codex turn adds a task with no defer or priority control
+   (Codex's top friction). Several senders into one Codex multiplies it. Options: coalesce
+   notifications per conversation, a per-participant "do not interrupt" window, or a priority field.
+2. **Per-request ownership.** With three or more agents, "who owes the answer" must be explicit: one
+   named owner per request, others informed. Today `status` lists every unanswered request, with no
+   owner.
+3. **Broadcast.** A send has exactly one recipient. Telling N agents costs N sends and N keys. A group
+   send (one key, per-recipient delivery and ack state) is the first addition.
+4. **Peer reachability.** Nothing tells a sender whether a peer is watching, how it is woken, or whether
+   its watcher lapsed. A directory (participant, product, tier, watching since, transport) is the
+   natural place; `status` already lists watchers.
+5. **Identity.** Names are routing labels; any local process can send `--as` any name. Fine for two
+   trusted agents, riskier for four.
+6. **The Claude pull limit.** Every Claude receiving over chatd needs its own Monitor (30 min cap).
+   `--exclusive` stops duplicates per participant.
+
+## Proposed order
+
+1. This note, reviewed.
+2. A deterministic harness: fake participants with three delivery adapters (push, pull, native stand-in)
+   to exercise every composition without real model sessions, since chatd does not care about product.
+3. Participant records carrying product and tier; group send; owner per request; reachability in
+   `status`.
+4. Live graphs with real sessions: (1,1) today, then (2,1) with a second Claude (a background session,
+   as in the spike), then (1,2) only if a second Codex is available.
+
+## Not decided here
+
+- Whether native Claude-to-Claude should be an adapter (wrapping `SendMessage`) or stay outside chatd.
+- Whether to let chatd write to a Claude session's private socket. It is undocumented and would inject
+  text as a trusted teammate message; it needs an explicit decision (see plan 0002, spike).
+- A 4-agent live run: the cap is 3 until the user lifts it.
