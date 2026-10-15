@@ -280,8 +280,8 @@ fn handle(shared: &Arc<Shared>, stream: UnixStream) -> io::Result<()> {
             )?;
             return Ok(());
         }
-        if let Request::Watch { as_, conversation, resume_token } = frame.req {
-            return watch(shared, &stream, &mut writer, &as_, conversation.as_deref(), resume_token.as_deref());
+        if let Request::Watch { as_, conversation, resume_token, exclusive } = frame.req {
+            return watch(shared, &stream, &mut writer, &as_, conversation.as_deref(), resume_token.as_deref(), exclusive);
         }
         let resp = dispatch(shared, frame.req);
         send(&mut writer, resp)?;
@@ -427,6 +427,7 @@ fn watch<W: io::Write>(
     who: &str,
     conversation: Option<&str>,
     token: Option<&str>,
+    exclusive: bool,
 ) -> io::Result<()> {
     // Each watcher reads through its own connection; the writer is never held while waiting.
     let mut reader = match Store::open(&shared.db_path) {
@@ -469,7 +470,30 @@ fn watch<W: io::Write>(
         connected_at_ms: now_ms(),
         last_event_seq: last,
     };
-    shared.watchers.lock().unwrap().insert(id, view);
+    // Count, refuse and register under one lock: exclusivity cannot race.
+    let others = {
+        let mut registry = shared.watchers.lock().unwrap();
+        let n =
+            registry.values().filter(|o| o.participant == who && filters_overlap(o.conversation.as_deref(), conversation)).count() as u32;
+        if exclusive && n > 0 {
+            drop(registry);
+            let _ = reader.conn().execute_batch("ROLLBACK");
+            journal::log(
+                journal::PRIORITY_INFO,
+                &format!("exclusive watch by {who} refused: {n} already attached"),
+                &[("SENDER", who), ("EVENT", "watch_refused")],
+            );
+            return send(
+                w,
+                Response::Error {
+                    code: ErrorCode::Conflict,
+                    message: format!("{who} already has {n} overlapping watcher(s); an exclusive watch was refused"),
+                },
+            );
+        }
+        registry.insert(id, view);
+        n
+    };
     journal::log(journal::PRIORITY_INFO, &format!("watch opened by {who}"), &[("SENDER", who), ("EVENT", "watch_open")]);
     // The client sends nothing after Watch: a read returning means it closed (or broke). Noticing
     // it here keeps `status` accurate instead of waiting for the next failed heartbeat write.
@@ -499,6 +523,7 @@ fn watch<W: io::Write>(
                 resume_token: resume_token(&store_id, generation, &filter, last),
                 unacknowledged_total,
                 resynchronized,
+                other_watchers: Some(others),
             },
         )?;
         let (mut after, mut pages) = (0i64, 0u64);
@@ -577,4 +602,26 @@ fn watch<W: io::Write>(
     };
     journal::log(journal::PRIORITY_INFO, &format!("watch by {who} {why}"), &[("SENDER", who), ("EVENT", "watch_close")]);
     Ok(())
+}
+
+/// Two watch filters overlap when either sees every conversation or both name the same one.
+fn filters_overlap(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::filters_overlap;
+
+    #[test]
+    fn a_wildcard_overlaps_everything_and_named_filters_only_themselves() {
+        assert!(filters_overlap(None, None));
+        assert!(filters_overlap(None, Some("a")));
+        assert!(filters_overlap(Some("a"), None));
+        assert!(filters_overlap(Some("a"), Some("a")));
+        assert!(!filters_overlap(Some("a"), Some("b")));
+    }
 }

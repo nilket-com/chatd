@@ -597,7 +597,7 @@ struct Snap {
 }
 
 fn read_snapshot(c: &mut Client) -> Snap {
-    let Response::SnapshotBegin { head_seq, resume_token, unacknowledged_total, resynchronized } = c.recv().unwrap() else {
+    let Response::SnapshotBegin { head_seq, resume_token, unacknowledged_total, resynchronized, .. } = c.recv().unwrap() else {
         panic!("no SnapshotBegin")
     };
     let mut unacknowledged = Vec::new();
@@ -620,7 +620,7 @@ fn read_snapshot(c: &mut Client) -> Snap {
 
 fn open_watch(e: &Env, who: &str, token: Option<String>) -> (Client, Snap) {
     let mut c = Client::connect(&e.socket(), Some(Duration::from_secs(5))).unwrap();
-    c.send(Request::Watch { as_: who.into(), conversation: None, resume_token: token }).unwrap();
+    c.send(Request::Watch { as_: who.into(), conversation: None, resume_token: token, exclusive: false }).unwrap();
     let snap = read_snapshot(&mut c);
     (c, snap)
 }
@@ -1127,7 +1127,7 @@ fn a_backlog_larger_than_one_frame_is_paged_consistently() {
     let ids = backlog(&mut e, 6000);
     // Snapshot pages carry the whole inbox in order, with a commit landing mid-snapshot.
     let mut c = Client::connect(&e.socket(), Some(Duration::from_secs(20))).unwrap();
-    c.send(Request::Watch { as_: "claude".into(), conversation: None, resume_token: None }).unwrap();
+    c.send(Request::Watch { as_: "claude".into(), conversation: None, resume_token: None, exclusive: false }).unwrap();
     let Response::SnapshotBegin { head_seq, unacknowledged_total, .. } = c.recv().unwrap() else { panic!() };
     assert_eq!(unacknowledged_total, 6000);
     let late = e.send("codex", "claude", "backlog", Kind::Request, "late", "committed during the snapshot");
@@ -1622,4 +1622,108 @@ fn a_receipt_that_cannot_be_written_keeps_the_pending_key_so_a_retry_stores_once
     assert!(stdout(&retry).contains("already stored"), "{}", stdout(&retry));
     assert_eq!(e.status(Some("codex")).unacknowledged.len(), 1, "stored once");
     assert!(e.pending_files().is_empty());
+}
+
+// ---- plan 0002: duplicate watchers ----
+
+impl Env {
+    fn spawn_wait(&self, extra: &[&str]) -> Child {
+        let mut cmd = Command::new(CLI);
+        self.envs(&mut cmd);
+        cmd.args(["wait", "--as", "claude", "--follow"]).args(extra).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.spawn().unwrap()
+    }
+
+    fn watcher_count(&self) -> usize {
+        self.status(None).watchers.len()
+    }
+
+    fn until_watchers(&self, n: usize) {
+        let t0 = Instant::now();
+        while self.watcher_count() != n {
+            assert!(t0.elapsed() < Duration::from_secs(10), "expected {n} watchers, have {}", self.watcher_count());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn finish(mut child: Child) -> Output {
+    let _ = child.kill();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn a_second_watcher_warns_and_the_first_reports_none() {
+    let mut e = Env::standard();
+    e.start();
+    let first = e.spawn_wait(&[]);
+    e.until_watchers(1);
+    let second = e.spawn_wait(&[]);
+    e.until_watchers(2);
+    let (a, b) = (finish(first), finish(second));
+    assert!(!stderr(&a).contains("other watcher"), "the first watcher had no company: {}", stderr(&a));
+    assert!(stderr(&b).contains("1 other watcher(s) for claude overlap"), "{}", stderr(&b));
+}
+
+#[test]
+fn an_exclusive_watcher_is_refused_while_another_overlaps_and_allowed_after() {
+    let mut e = Env::standard();
+    e.start();
+    let first = e.spawn_wait(&[]);
+    e.until_watchers(1);
+    let refused = e.spawn_wait(&["--exclusive"]).wait_with_output().unwrap();
+    assert_eq!(code(&refused), 7, "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("exclusive watch was refused"), "{}", stderr(&refused));
+    assert_eq!(e.watcher_count(), 1, "the refused watcher left no registration");
+    let id = e.send("codex", "claude", "c", Kind::Request, "x1", "still delivered to the first");
+    let mut first = first;
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(first.stdout.as_mut().unwrap()), &mut line).unwrap();
+    assert!(line.contains(&id), "{line:?}");
+    let _ = finish(first);
+    e.until_watchers(0);
+    let allowed = e.spawn_wait(&["--exclusive"]);
+    e.until_watchers(1);
+    let _ = finish(allowed);
+}
+
+#[test]
+fn exclusivity_only_counts_overlapping_filters() {
+    let mut e = Env::standard();
+    e.start();
+    let named = e.spawn_wait(&["--conversation", "a"]);
+    e.until_watchers(1);
+    let other = e.spawn_wait(&["--conversation", "b", "--exclusive"]);
+    e.until_watchers(2);
+    let wildcard = e.spawn_wait(&["--exclusive"]).wait_with_output().unwrap();
+    assert_eq!(code(&wildcard), 7, "a wildcard overlaps the named ones");
+    let same = e.spawn_wait(&["--conversation", "a", "--exclusive"]).wait_with_output().unwrap();
+    assert_eq!(code(&same), 7);
+    let _ = (finish(named), finish(other));
+}
+
+#[test]
+fn racing_exclusive_watchers_admit_exactly_one() {
+    let mut e = Env::standard();
+    e.start();
+    let kids: Vec<Child> = (0..6).map(|_| e.spawn_wait(&["--exclusive"])).collect();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(e.watcher_count(), 1, "exactly one exclusive watcher registered");
+    let outs: Vec<Output> = kids.into_iter().map(finish).collect();
+    let refused = outs.iter().filter(|o| code(o) == 7).count();
+    assert_eq!(refused, 5, "the other five were refused with exit 7");
+}
+
+#[test]
+fn the_first_watch_reports_zero_other_watchers_on_the_wire() {
+    let mut e = Env::standard();
+    e.start();
+    let mut c = e.client();
+    c.send(Request::Watch { as_: "claude".into(), conversation: None, resume_token: None, exclusive: true }).unwrap();
+    let Response::SnapshotBegin { other_watchers, .. } = c.recv().unwrap() else { panic!("no SnapshotBegin") };
+    assert_eq!(other_watchers, Some(0));
+    let mut c2 = e.client();
+    c2.send(Request::Watch { as_: "claude".into(), conversation: None, resume_token: None, exclusive: true }).unwrap();
+    let Response::Error { code, .. } = c2.recv().unwrap() else { panic!("expected a refusal") };
+    assert_eq!(code, ErrorCode::Conflict);
 }

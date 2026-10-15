@@ -17,6 +17,7 @@ const EXIT_UNAVAILABLE: u8 = 3;
 const EXIT_NOT_FOUND: u8 = 4;
 const EXIT_REFUSED: u8 = 5;
 const EXIT_TIMEOUT: u8 = 6;
+const EXIT_WATCHED: u8 = 7;
 
 #[derive(Parser)]
 #[command(name = "chatctl", version, about = "Durable local messages between coding agents")]
@@ -102,6 +103,9 @@ enum Cmd {
         /// Print every unacknowledged and new message (once per id per connection) until the timeout.
         #[arg(long)]
         follow: bool,
+        /// Refuse to start (exit 7) if another watcher of this participant overlaps this one.
+        #[arg(long)]
+        exclusive: bool,
     },
     /// Stream this participant's events as JSON lines (server-pushed; resumable).
     Watch {
@@ -113,6 +117,9 @@ enum Cmd {
         resume_token: Option<String>,
         #[arg(long, default_value_t = 1800)]
         timeout: u64,
+        /// Refuse to start (exit 7) if another watcher of this participant overlaps this one.
+        #[arg(long)]
+        exclusive: bool,
     },
     /// Unacknowledged messages, unanswered requests, submissions, endpoints and watchers.
     Status {
@@ -374,6 +381,28 @@ fn wait_seconds(timeout: Option<u64>, follow: bool) -> Option<u64> {
     }
 }
 
+/// What a watch learned about other watchers of the same participant. Warns once per process; with
+/// `--exclusive`, a daemon that did not report the count predates the option and cannot be trusted
+/// to have enforced it, so the watch is refused rather than silently unprotected.
+fn check_watchers(who: &str, others: Option<u32>, exclusive: bool, warned: &mut bool) -> Option<ExitCode> {
+    match others {
+        None if exclusive => {
+            eprintln!(
+                "chatctl: this chatd predates --exclusive and did not enforce it; restart chatd to pick up the new binary. Refusing to run unprotected"
+            );
+            Some(ExitCode::from(EXIT_REFUSED))
+        }
+        Some(n) if n > 0 && !*warned => {
+            *warned = true;
+            eprintln!(
+                "chatctl: warning: {n} other watcher(s) for {who} overlap this one; every watcher prints each notification (use --exclusive to refuse duplicates)"
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Time left before `deadline`; an absent deadline never runs out (a slice longer than any wait step).
 fn left(deadline: Option<Instant>) -> Duration {
     deadline.map_or(Duration::from_secs(u32::MAX as u64), |d| d.saturating_duration_since(Instant::now()))
@@ -381,7 +410,8 @@ fn left(deadline: Option<Instant>) -> Duration {
 
 /// wait / wait --follow over a server-pushed watch, reconnecting within the deadline. Printing
 /// never acknowledges; a reconnect replays everything still unacknowledged.
-fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: bool) -> ExitCode {
+fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: bool, exclusive: bool) -> ExitCode {
+    let mut warned = false;
     let deadline = wait_seconds(timeout, follow).map(|n| Instant::now() + Duration::from_secs(n));
     let mut printed_any = false;
     loop {
@@ -401,7 +431,7 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
                 return ExitCode::from(EXIT_UNAVAILABLE);
             }
         };
-        if let Err(e) = c.send(Request::Watch { as_: who.to_string(), conversation: conversation.clone(), resume_token: None }) {
+        if let Err(e) = c.send(Request::Watch { as_: who.to_string(), conversation: conversation.clone(), resume_token: None, exclusive }) {
             eprintln!("chatctl: {e}");
             std::thread::sleep(Duration::from_secs(1).min(remaining));
             continue;
@@ -414,7 +444,10 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
             }
             let _ = c.set_read_timeout(Some(remaining.min(Duration::from_secs(35))));
             match c.recv() {
-                Ok(Response::SnapshotBegin { resynchronized, .. }) => {
+                Ok(Response::SnapshotBegin { resynchronized, other_watchers, .. }) => {
+                    if let Some(code) = check_watchers(who, other_watchers, exclusive, &mut warned) {
+                        return code;
+                    }
                     if let Some(r) = resynchronized {
                         eprintln!(
                             "chatctl: resynchronized: {r}; the inbox below is authoritative; refetch `chatctl status` for submissions and unanswered requests"
@@ -446,7 +479,11 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
                 Ok(Response::Heartbeat { .. }) => {}
                 Ok(Response::Error { code, message }) => {
                     eprintln!("chatctl: {code:?}: {message}");
-                    return ExitCode::from(if code == ErrorCode::UnknownParticipant { EXIT_REFUSED } else { EXIT_UNAVAILABLE });
+                    return ExitCode::from(match code {
+                        ErrorCode::UnknownParticipant => EXIT_REFUSED,
+                        ErrorCode::Conflict if exclusive => EXIT_WATCHED,
+                        _ => EXIT_UNAVAILABLE,
+                    });
                 }
                 Ok(_) => {}
                 Err(ClientError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
@@ -468,13 +505,14 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
     ExitCode::from(EXIT_TIMEOUT)
 }
 
-fn watch(who: &str, conversation: Option<String>, token: Option<String>, timeout: u64) -> ExitCode {
+fn watch(who: &str, conversation: Option<String>, token: Option<String>, timeout: u64, exclusive: bool) -> ExitCode {
+    let mut warned = false;
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut c = match connect(Some(Duration::from_secs(35))) {
         Ok(c) => c,
         Err(code) => return code,
     };
-    if let Err(e) = c.send(Request::Watch { as_: who.to_string(), conversation, resume_token: token }) {
+    if let Err(e) = c.send(Request::Watch { as_: who.to_string(), conversation, resume_token: token, exclusive }) {
         eprintln!("chatctl: {e}");
         return ExitCode::from(EXIT_UNAVAILABLE);
     }
@@ -487,9 +525,16 @@ fn watch(who: &str, conversation: Option<String>, token: Option<String>, timeout
         match c.recv() {
             Ok(Response::Error { code, message }) => {
                 eprintln!("chatctl: {code:?}: {message}");
-                return ExitCode::from(EXIT_REFUSED);
+                return ExitCode::from(if code == ErrorCode::Conflict && exclusive { EXIT_WATCHED } else { EXIT_REFUSED });
             }
-            Ok(r) => emit(&serde_json::to_string(&r).unwrap_or_default()),
+            Ok(r) => {
+                if let Response::SnapshotBegin { other_watchers, .. } = &r
+                    && let Some(code) = check_watchers(who, *other_watchers, exclusive, &mut warned)
+                {
+                    return code;
+                }
+                emit(&serde_json::to_string(&r).unwrap_or_default());
+            }
             Err(ClientError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                 if deadline.saturating_duration_since(Instant::now()).is_zero() {
                     return ExitCode::from(EXIT_TIMEOUT);
@@ -624,13 +669,15 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                 println!("acknowledged {} (already {})", acknowledged.len(), already.len());
             }
         }
-        Cmd::Wait { who, conversation, timeout, follow } => {
-            return match wait(&who, conversation, timeout, follow) {
+        Cmd::Wait { who, conversation, timeout, follow, exclusive } => {
+            return match wait(&who, conversation, timeout, follow, exclusive) {
                 c if c == ExitCode::SUCCESS => Ok(()),
                 c => Err(c),
             };
         }
-        Cmd::Watch { who, conversation, resume_token, timeout } => return Err(watch(&who, conversation, resume_token, timeout)),
+        Cmd::Watch { who, conversation, resume_token, timeout, exclusive } => {
+            return Err(watch(&who, conversation, resume_token, timeout, exclusive));
+        }
         Cmd::Status { who, conversation, limit, unacknowledged_after, unanswered_after } => {
             let Response::Status(s) = call(Request::Status { as_: who, conversation, limit, unacknowledged_after, unanswered_after })?
             else {
@@ -769,7 +816,22 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::wait_seconds;
+    use super::{check_watchers, wait_seconds};
+
+    #[test]
+    fn a_daemon_that_did_not_report_watchers_cannot_back_an_exclusive_watch() {
+        let mut warned = false;
+        assert!(check_watchers("claude", None, true, &mut warned).is_some(), "exclusive against an old daemon is refused");
+        assert!(check_watchers("claude", None, false, &mut warned).is_none(), "a plain watch against an old daemon is fine");
+        assert!(check_watchers("claude", Some(0), true, &mut warned).is_none());
+    }
+
+    #[test]
+    fn the_company_warning_is_given_once() {
+        let mut warned = false;
+        assert!(check_watchers("claude", Some(2), false, &mut warned).is_none());
+        assert!(warned);
+    }
 
     #[test]
     fn follow_without_a_timeout_is_unbounded_and_everything_else_is_as_before() {

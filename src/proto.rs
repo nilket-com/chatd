@@ -110,6 +110,10 @@ pub enum Request {
         as_: String,
         conversation: Option<String>,
         resume_token: Option<String>,
+        /// Refuse (Conflict) if another watcher of this participant overlaps this filter. The check
+        /// and the registration are one step, so two racing exclusive watchers cannot both win.
+        #[serde(default)]
+        exclusive: bool,
     },
     Backup {
         path: String,
@@ -282,6 +286,11 @@ pub enum Response {
         resume_token: String,
         unacknowledged_total: i64,
         resynchronized: Option<String>,
+        /// Other watchers of this participant whose filters overlap this one, when this watch was
+        /// registered. Absent from a daemon that predates the field, which is how a client knows
+        /// `exclusive` was not honoured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        other_watchers: Option<u32>,
     },
     SnapshotPage {
         unacknowledged: Vec<MessageView>,

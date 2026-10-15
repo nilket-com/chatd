@@ -45,6 +45,13 @@ Shortcuts (plan 0002):
 - `take` writes and flushes the message before acknowledging, so a failed write (closed pipe, full
   disk) leaves it unacknowledged. Acknowledging still means received, not done.
 
+- Duplicate watchers: `wait`/`watch` warn on stderr when another watcher of the same participant
+  overlaps (every watcher prints each notification). `--exclusive` refuses instead, with exit 7 and a
+  `Conflict`; the count and the registration are one step, so racing exclusive watchers admit exactly
+  one. Filters overlap when either has no `--conversation` or both name the same one. Against a chatd
+  that predates the option, `--exclusive` refuses to run (exit 5) rather than silently not excluding;
+  restart chatd to pick up the new binary.
+
 ## The states of a message
 
 | State | Meaning |

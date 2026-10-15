@@ -57,3 +57,16 @@ before acking, so a stdout failure never marks an unseen message received.
 - Item 3: kill chatctl between key write and receipt; the rerun yields `already stored`, not a
   duplicate.
 - Item 4: `take` on an already-acknowledged id reports `already 1` and still prints the body.
+
+## Cut 2: duplicate watchers (Codex's first pick)
+
+Observed live: overlapping Claude Monitors each printed every notification. `SnapshotBegin` now
+carries `other_watchers` (overlapping watchers of the same participant at registration); chatctl
+warns once. `Watch.exclusive` makes the daemon refuse (Conflict, chatctl exit 7) when any overlap
+exists, counted and registered under one lock. Both fields are optional on the wire (protocol
+version unchanged); a client that asked for `--exclusive` and got no count refuses, because the
+daemon predates the option.
+
+Not in this cut (Codex-side ranking, to revisit): deferring or prioritising push into a busy turn;
+reading before acknowledging as the default (`take` is for the immediate case); a direct reply path
+for info messages (today a new `send`).
