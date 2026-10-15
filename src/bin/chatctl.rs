@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use chatd::client::{Client, ClientError};
 use chatd::proto::{ErrorCode, EventView, Kind, MessageView, Request, Response, SendReq};
 use chatd::store::now_ms;
-use chatd::{journal, paths, text};
+use chatd::{journal, paths, pending, text};
 
 const EXIT_UNAVAILABLE: u8 = 3;
 const EXIT_NOT_FOUND: u8 = 4;
@@ -32,7 +32,7 @@ struct Cli {
 enum Cmd {
     /// Store a request or information message.
     Send {
-        #[arg(long = "as", alias = "from")]
+        #[arg(long = "as", alias = "from", env = "CHATD_AS")]
         who: String,
         #[arg(long)]
         to: String,
@@ -40,9 +40,10 @@ enum Cmd {
         conversation: String,
         #[arg(long, default_value = "request", value_parser = ["request", "info"])]
         kind: String,
-        /// Required: generate one with `chatctl new-key` and keep it for retries.
+        /// Optional. Omit it and chatctl stores a generated key before sending and reuses it when the
+        /// same command is re-run, until a receipt is seen. Give one to manage retries yourself.
         #[arg(long)]
-        idempotency_key: String,
+        idempotency_key: Option<String>,
         #[arg(long)]
         summary: Option<String>,
         /// Read the body from this file (default: stdin).
@@ -51,15 +52,16 @@ enum Cmd {
     },
     /// Store a progress or final reply to a request (goes to the request's sender).
     Reply {
-        #[arg(long = "as")]
+        #[arg(long = "as", env = "CHATD_AS")]
         who: String,
         #[arg(long)]
         to_message: String,
         /// A final reply answers the request; without it the reply is progress.
         #[arg(long)]
         r#final: bool,
+        /// Optional; see `send`.
         #[arg(long)]
-        idempotency_key: String,
+        idempotency_key: Option<String>,
         #[arg(long)]
         summary: Option<String>,
         #[arg(long)]
@@ -67,34 +69,43 @@ enum Cmd {
     },
     /// Print a message in full. Does not acknowledge it.
     Receive {
-        #[arg(long = "as")]
+        #[arg(long = "as", env = "CHATD_AS")]
+        who: String,
+        #[arg(long)]
+        id: String,
+    },
+    /// Print a message in full, then acknowledge it (receive + ack). The body is written and
+    /// flushed first, so a failed write never marks an unseen message received.
+    Take {
+        #[arg(long = "as", env = "CHATD_AS")]
         who: String,
         #[arg(long)]
         id: String,
     },
     /// Acknowledge receipt (not an answer).
     Ack {
-        #[arg(long = "as")]
+        #[arg(long = "as", env = "CHATD_AS")]
         who: String,
         #[arg(required = true)]
         ids: Vec<String>,
     },
     /// Block until an unacknowledged message is available; print one notification line and exit.
     Wait {
-        #[arg(long = "as")]
+        #[arg(long = "as", env = "CHATD_AS")]
         who: String,
         #[arg(long)]
         conversation: Option<String>,
-        /// Seconds; exit status 6 on expiry.
-        #[arg(long, default_value_t = 1800)]
-        timeout: u64,
+        /// Seconds; exit status 6 on expiry. Default 1800, or unbounded with --follow (0 also means
+        /// unbounded with --follow).
+        #[arg(long)]
+        timeout: Option<u64>,
         /// Print every unacknowledged and new message (once per id per connection) until the timeout.
         #[arg(long)]
         follow: bool,
     },
     /// Stream this participant's events as JSON lines (server-pushed; resumable).
     Watch {
-        #[arg(long = "as")]
+        #[arg(long = "as", env = "CHATD_AS")]
         who: String,
         #[arg(long)]
         conversation: Option<String>,
@@ -224,8 +235,61 @@ fn call(req: Request) -> Result<Response, ExitCode> {
     }
 }
 
+/// An explicit key is used as given. Otherwise a key is stored (or reused) under the request's
+/// identity before anything is sent; the returned record is cleared once a receipt is seen.
+fn resolve_key(explicit: Option<String>, f: &pending::Fields) -> Result<(String, Option<(PathBuf, String)>), ExitCode> {
+    if let Some(k) = explicit {
+        return Ok((k, None));
+    }
+    let dir = paths::pending_dir();
+    let id = pending::identity(f);
+    match pending::key_for(&dir, &id) {
+        Ok((key, reused)) => {
+            if reused {
+                eprintln!("chatctl: reusing the pending key for this identical request (a previous attempt may have been sent)");
+            }
+            Ok((key, Some((dir, id))))
+        }
+        Err(e) => {
+            eprintln!("chatctl: cannot store a pending key ({e}); nothing was sent. Pass --idempotency-key to manage it yourself");
+            Err(ExitCode::from(EXIT_REFUSED))
+        }
+    }
+}
+
+fn settle(pending: Option<(PathBuf, String)>) {
+    if let Some((dir, id)) = pending {
+        pending::clear(&dir, &id);
+    }
+}
+
 fn print_json<T: serde::Serialize>(v: &T) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+}
+
+fn print_message(m: &MessageView, json: bool) -> io::Result<()> {
+    let mut out = String::new();
+    if json {
+        out.push_str(&serde_json::to_string_pretty(m).unwrap_or_default());
+        out.push('\n');
+    } else {
+        out.push_str(&format!("id:           {}\n", m.id));
+        out.push_str(&format!("from -> to:   {} -> {}\n", m.sender, m.recipient));
+        out.push_str(&format!("conversation: {}  kind: {}  seq: {}\n", m.conversation, m.kind.as_str(), m.seq));
+        if let Some(r) = &m.reply_to {
+            out.push_str(&format!("reply to:     {r}\n"));
+        }
+        out.push_str(&format!("received:     {}\n", if m.received_at_ms.is_some() { "acknowledged" } else { "not acknowledged" }));
+        if let Some(a) = &m.answered_by {
+            out.push_str(&format!("answered by:  {a}\n"));
+        }
+        out.push_str(&format!("summary:      {}\n---\n", m.summary));
+        out.push_str(m.body.as_deref().unwrap_or_default());
+        out.push('\n');
+    }
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(out.as_bytes())?;
+    stdout.flush()
 }
 
 fn age(ms: i64) -> String {
@@ -267,10 +331,22 @@ fn emit(line: &str) {
     let _ = out.flush();
 }
 
+/// Seconds a `wait` lasts. Follow mode with no timeout (or 0) is unbounded, in practice ten years.
+fn wait_seconds(timeout: Option<u64>, follow: bool) -> u64 {
+    const DEFAULT: u64 = 1800;
+    const UNBOUNDED: u64 = 10 * 365 * 24 * 3600;
+    match timeout {
+        None if follow => UNBOUNDED,
+        Some(0) if follow => UNBOUNDED,
+        None => DEFAULT,
+        Some(n) => n,
+    }
+}
+
 /// wait / wait --follow over a server-pushed watch, reconnecting within the deadline. Printing
 /// never acknowledges; a reconnect replays everything still unacknowledged.
-fn wait(who: &str, conversation: Option<String>, timeout: u64, follow: bool) -> ExitCode {
-    let deadline = Instant::now() + Duration::from_secs(timeout);
+fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: bool) -> ExitCode {
+    let deadline = Instant::now() + Duration::from_secs(wait_seconds(timeout, follow));
     let mut printed_any = false;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -438,6 +514,18 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                 eprintln!("chatctl: {e}");
                 ExitCode::from(EXIT_REFUSED)
             })?;
+            let (idempotency_key, pending) = resolve_key(
+                idempotency_key,
+                &pending::Fields {
+                    from: &who,
+                    to: Some(&to),
+                    conversation: Some(&conversation),
+                    kind: &kind,
+                    reply_to: None,
+                    summary: summary.as_deref(),
+                    body: &body,
+                },
+            )?;
             let req = SendReq {
                 from: who,
                 to: Some(to),
@@ -449,6 +537,7 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                 body,
             };
             let Response::Stored(r) = call(Request::Send(req))? else { return Err(ExitCode::FAILURE) };
+            settle(pending);
             if json {
                 print_json(&r)
             } else {
@@ -461,8 +550,21 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                 ExitCode::from(EXIT_REFUSED)
             })?;
             let kind = if r#final { Kind::Final } else { Kind::Progress };
+            let (idempotency_key, pending) = resolve_key(
+                idempotency_key,
+                &pending::Fields {
+                    from: &who,
+                    to: None,
+                    conversation: None,
+                    kind: kind.as_str(),
+                    reply_to: Some(&to_message),
+                    summary: summary.as_deref(),
+                    body: &body,
+                },
+            )?;
             let req = SendReq { from: who, to: None, conversation: None, kind, reply_to: Some(to_message), idempotency_key, summary, body };
             let Response::Stored(r) = call(Request::Send(req))? else { return Err(ExitCode::FAILURE) };
+            settle(pending);
             if json {
                 print_json(&r)
             } else {
@@ -471,24 +573,22 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
         }
         Cmd::Receive { who, id } => {
             let Response::Message(m) = call(Request::Receive { as_: who, id })? else { return Err(ExitCode::FAILURE) };
-            if json {
-                print_json(&m)
-            } else {
-                println!("id:           {}", m.id);
-                println!("from -> to:   {} -> {}", m.sender, m.recipient);
-                println!("conversation: {}  kind: {}  seq: {}", m.conversation, m.kind.as_str(), m.seq);
-                if let Some(r) = &m.reply_to {
-                    println!("reply to:     {r}");
-                }
-                println!("received:     {}", if m.received_at_ms.is_some() { "acknowledged" } else { "not acknowledged" });
-                if let Some(a) = &m.answered_by {
-                    println!("answered by:  {a}");
-                }
-                println!("summary:      {}", m.summary);
-                println!("---");
-                print!("{}", m.body.unwrap_or_default());
-                println!();
-            }
+            print_message(&m, json).map_err(|e| {
+                eprintln!("chatctl: {e}");
+                ExitCode::FAILURE
+            })?;
+        }
+        Cmd::Take { who, id } => {
+            let Response::Message(m) = call(Request::Receive { as_: who.clone(), id: id.clone() })? else { return Err(ExitCode::FAILURE) };
+            // Never acknowledge what was not written out: a stdout failure leaves the message unacknowledged.
+            print_message(&m, json).map_err(|e| {
+                eprintln!("chatctl: could not write the message ({e}); not acknowledged");
+                ExitCode::FAILURE
+            })?;
+            let Response::Acked { acknowledged, already } = call(Request::Ack { as_: who, ids: vec![id] })? else {
+                return Err(ExitCode::FAILURE);
+            };
+            eprintln!("chatctl: acknowledged {} (already {})", acknowledged.len(), already.len());
         }
         Cmd::Ack { who, ids } => {
             let r = call(Request::Ack { as_: who, ids })?;
@@ -638,5 +738,20 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(c) => c,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_seconds;
+
+    #[test]
+    fn follow_without_a_timeout_is_unbounded_and_everything_else_is_as_before() {
+        assert_eq!(wait_seconds(None, false), 1800);
+        assert_eq!(wait_seconds(Some(5), false), 5);
+        assert_eq!(wait_seconds(Some(0), false), 0, "a plain wait with 0 still expires at once");
+        assert_eq!(wait_seconds(Some(5), true), 5);
+        assert!(wait_seconds(None, true) > 365 * 24 * 3600);
+        assert_eq!(wait_seconds(Some(0), true), wait_seconds(None, true));
     }
 }

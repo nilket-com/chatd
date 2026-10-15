@@ -34,3 +34,12 @@ pub fn socket_path() -> PathBuf {
 pub fn config_path() -> PathBuf {
     env::var_os("CHATD_CONFIG").map(PathBuf::from).unwrap_or_else(|| xdg("XDG_CONFIG_HOME", ".config").join("chatd").join("config.toml"))
 }
+
+/// `$CHATCTL_STATE_DIR/pending`, else `$XDG_STATE_HOME/chatctl/pending`: keys chatctl generated for
+/// sends whose receipt it has not yet seen (plan 0002).
+pub fn pending_dir() -> PathBuf {
+    env::var_os("CHATCTL_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| xdg("XDG_STATE_HOME", ".local/state").join("chatctl"))
+        .join("pending")
+}

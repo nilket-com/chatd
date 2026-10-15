@@ -47,6 +47,8 @@ impl Env {
             .env("CHATD_SOCKET", self.socket())
             .env("CHATD_CONFIG", self.dir.join("config.toml"))
             .env("CHATD_NO_JOURNAL", "1")
+            .env("CHATCTL_STATE_DIR", self.dir.join("ctl"))
+            .env_remove("CHATD_AS")
             .env_remove("NOTIFY_SOCKET");
     }
 
@@ -1426,4 +1428,176 @@ fn a_continuous_stderr_flood_cannot_delay_shutdown() {
     assert!(t0.elapsed() < Duration::from_secs(6), "{:?}", t0.elapsed());
     e.start();
     assert_eq!(attempts(&e, &id), vec!["uncertain"]);
+}
+
+// ---- plan 0002: pair ergonomics ----
+
+impl Env {
+    fn pending_files(&self) -> Vec<PathBuf> {
+        match std::fs::read_dir(self.dir.join("ctl").join("pending")) {
+            Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    fn cli_with(&self, envs: &[(&str, &str)], args: &[&str]) -> Output {
+        let mut cmd = Command::new(CLI);
+        self.envs(&mut cmd);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.spawn().unwrap().wait_with_output().unwrap()
+    }
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+fn key_of(o: &Output) -> String {
+    let out = stdout(o);
+    out.split("key ").nth(1).unwrap_or_else(|| panic!("no key in {out}")).split([',', ')']).next().unwrap().to_string()
+}
+
+#[test]
+fn a_send_without_a_key_stores_one_and_clears_it_on_receipt() {
+    let mut e = Env::standard();
+    e.start();
+    let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c"];
+    let first = e.cli(&args, Some("same body"));
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    assert!(e.pending_files().is_empty(), "the record is cleared once the receipt is printed");
+    let second = e.cli(&args, Some("same body"));
+    assert_eq!(code(&second), 0);
+    assert_ne!(key_of(&first), key_of(&second), "a delivered send is not replayed by an identical later one");
+    assert!(!stdout(&second).contains("already stored"));
+}
+
+#[test]
+fn a_lost_receipt_is_retried_with_the_same_key_and_stores_once() {
+    let mut e = Env::standard();
+    let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--summary", "s"];
+    let down = e.cli(&args, Some("body"));
+    assert_eq!(code(&down), 3);
+    let files = e.pending_files();
+    assert_eq!(files.len(), 1, "the key is stored before dispatch");
+    let stored = std::fs::read_to_string(&files[0]).unwrap().trim().to_string();
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777, 0o600);
+    e.start();
+    let retry = e.cli(&args, Some("body"));
+    assert_eq!(code(&retry), 0, "{}", stderr(&retry));
+    assert_eq!(key_of(&retry), stored);
+    assert!(stderr(&retry).contains("reusing the pending key"));
+    assert!(e.pending_files().is_empty());
+    assert_eq!(e.status(Some("codex")).unacknowledged.len(), 1);
+}
+
+#[test]
+fn any_changed_field_gets_its_own_pending_key() {
+    let e = Env::standard();
+    let base = ["send", "--as", "claude", "--to", "codex", "--conversation", "c"];
+    e.cli(&base, Some("one"));
+    e.cli(&base, Some("two"));
+    e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--kind", "info"], Some("one"));
+    e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--summary", "x"], Some("one"));
+    e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "d"], Some("one"));
+    assert_eq!(e.pending_files().len(), 5, "no two different requests share a key");
+}
+
+#[test]
+fn an_explicit_key_is_untouched_and_a_corrupt_record_refuses_the_send() {
+    let mut e = Env::standard();
+    e.start();
+    let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "mine"];
+    assert_eq!(code(&e.cli(&args, Some("x"))), 0);
+    assert!(e.pending_files().is_empty());
+    let down = Env::standard();
+    down.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c"], Some("x"));
+    let file = down.pending_files().pop().unwrap();
+    std::fs::write(&file, "garbage!\n").unwrap();
+    let out = down.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c"], Some("x"));
+    assert_eq!(code(&out), 5);
+    assert!(stderr(&out).contains("nothing was sent"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "garbage!\n");
+}
+
+#[test]
+fn a_reply_without_a_key_is_retry_safe_too() {
+    let mut e = Env::standard();
+    e.start();
+    let id = e.send("codex", "claude", "c", Kind::Request, "q", "question");
+    let reply = e.cli(&["reply", "--as", "claude", "--to-message", &id, "--final"], Some("answer"));
+    assert_eq!(code(&reply), 0, "{}", stderr(&reply));
+    assert!(e.pending_files().is_empty());
+    assert_eq!(e.status(Some("claude")).unanswered.len(), 0);
+}
+
+#[test]
+fn take_prints_the_body_then_acknowledges() {
+    let mut e = Env::standard();
+    e.start();
+    let id = e.send("codex", "claude", "c", Kind::Request, "t", "take me");
+    let out = e.cli(&["take", "--as", "claude", "--id", &id], None);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("take me") && stdout(&out).contains("not acknowledged"), "{}", stdout(&out));
+    assert!(stderr(&out).contains("acknowledged 1 (already 0)"));
+    assert!(e.status(Some("claude")).unacknowledged.is_empty());
+    let again = e.cli(&["take", "--as", "claude", "--id", &id], None);
+    assert_eq!(code(&again), 0);
+    assert!(stdout(&again).contains("take me"));
+    assert!(stderr(&again).contains("acknowledged 0 (already 1)"));
+}
+
+#[test]
+fn take_does_not_acknowledge_when_the_body_cannot_be_written() {
+    let mut e = Env::standard();
+    e.start();
+    let id = e.send("codex", "claude", "c", Kind::Request, "t2", "unseen");
+    let mut cmd = Command::new(CLI);
+    e.envs(&mut cmd);
+    let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+    let out = cmd.args(["take", "--as", "claude", "--id", &id]).stdin(Stdio::null()).stdout(full).stderr(Stdio::piped()).output().unwrap();
+    assert_ne!(code(&out), 0);
+    assert!(stderr(&out).contains("not acknowledged"), "{}", stderr(&out));
+    assert_eq!(e.status(Some("claude")).unacknowledged.len(), 1, "the message stays unacknowledged");
+}
+
+#[test]
+fn the_participant_defaults_from_chatd_as_and_an_explicit_flag_wins() {
+    let mut e = Env::standard();
+    e.start();
+    let id = e.send("codex", "claude", "c", Kind::Request, "env", "for claude");
+    let by_env = e.cli_with(&[("CHATD_AS", "claude")], &["receive", "--id", &id]);
+    assert_eq!(code(&by_env), 0, "{}", stderr(&by_env));
+    assert!(stdout(&by_env).contains("for claude"));
+    let unknown = e.cli_with(&[("CHATD_AS", "nobody")], &["receive", "--id", &id]);
+    assert_ne!(code(&unknown), 0, "the env value is used, and an unknown participant is refused");
+    let flag_wins = e.cli_with(&[("CHATD_AS", "nobody")], &["receive", "--as", "claude", "--id", &id]);
+    assert_eq!(code(&flag_wins), 0);
+    let missing = e.cli(&["receive", "--id", &id], None);
+    assert_eq!(code(&missing), 2, "with neither, the argument is still required");
+}
+
+#[test]
+fn an_untimed_follow_outlives_the_old_deadline_and_a_daemon_restart() {
+    let mut e = Env::standard();
+    e.start();
+    let mut cmd = Command::new(CLI);
+    e.envs(&mut cmd);
+    let mut follower = cmd.args(["wait", "--as", "claude", "--follow"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(follower.try_wait().unwrap().is_none(), "no default deadline ends an untimed follow");
+    e.kill9();
+    e.start();
+    let id = e.send("codex", "claude", "c", Kind::Request, "after-restart", "post restart");
+    let mut line = String::new();
+    let mut out = std::io::BufReader::new(follower.stdout.take().unwrap());
+    let t0 = Instant::now();
+    std::io::BufRead::read_line(&mut out, &mut line).unwrap();
+    let _ = follower.kill();
+    let _ = follower.wait();
+    assert!(line.contains(&id), "the watcher reconnected and was notified: {line:?}");
+    assert!(t0.elapsed() < Duration::from_secs(15));
 }

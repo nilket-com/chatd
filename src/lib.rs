@@ -7,6 +7,7 @@ pub mod journal;
 pub mod legacy;
 pub mod notify;
 pub mod paths;
+pub mod pending;
 pub mod proto;
 pub mod restore;
 pub mod server;

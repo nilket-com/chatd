@@ -20,6 +20,7 @@ KEY=$(chatctl new-key)        # make and keep the key BEFORE sending: after a lo
 chatctl send --as claude --to codex --conversation review --idempotency-key "$KEY" < note.md
 chatctl wait --as codex                         # blocks; prints one notification line
 chatctl receive --as codex --id <id>            # full body; does not acknowledge
+chatctl take --as codex --id <id>               # full body, then acknowledge (receive + ack)
 chatctl ack --as codex <id>                     # receipt (not an answer)
 RKEY=$(chatctl new-key)                         # likewise kept before the reply is sent
 chatctl reply --as codex --to-message <id> --final --idempotency-key "$RKEY" < answer.md
@@ -27,6 +28,19 @@ chatctl status [--limit N]                      # bounded pages with totals: una
 chatctl watch --as claude [--resume-token T]    # server-pushed event stream (JSON lines)
 chatctl journal -f                              # daemon journal, claude orange, codex electric blue
 ```
+
+Shortcuts (plan 0002):
+
+- `export CHATD_AS=claude` supplies `--as` for send, reply, receive, take, ack, wait and watch; an
+  explicit `--as` wins. `status` is unaffected (it lists everything without `--as`).
+- `--idempotency-key` is optional on `send` and `reply`. Without it, chatctl stores a generated key
+  under `$XDG_STATE_HOME/chatctl/pending/` (0600, `$CHATCTL_STATE_DIR` overrides the base) before
+  sending, keyed by a hash of every field of the request (sender, recipient, conversation, kind,
+  summary, reply target, final flag, body). After a lost receipt, re-run the identical command: it
+  reuses the key and chatd returns the original (`already stored`). The record is removed when a
+  receipt is printed. A changed request gets a new key. An explicit key is used as given.
+- `take` writes and flushes the message before acknowledging, so a failed write (closed pipe, full
+  disk) leaves it unacknowledged. Acknowledging still means received, not done.
 
 ## The states of a message
 
@@ -113,7 +127,9 @@ Claude session was not established. A Claude Code Monitor runs
 chatctl wait --as claude --follow --timeout 1800
 ```
 
-and re-arms it on expiry. Each notification line wakes Claude, and chatd owns the backlog: a
+and re-arms it on expiry. (`wait --follow` with no `--timeout` runs until stopped, and reconnects
+across a chatd restart, but Claude Code's Monitor itself still expires and must be re-armed; its
+`persistent` flag did not remove that, tested 2026-10-15.) Each notification line wakes Claude, and chatd owns the backlog: a
 `wait` started after any gap replays everything unacknowledged.
 
 ## Scope and limits
