@@ -96,3 +96,12 @@ Throwaway background session (`claude --bg`, Haiku, text only), driven three way
 
 Consequence for graphs: two Claude sessions can already wake each other natively. chatd still adds
 durability, acks, retry-safe keys and Codex in the same conversation, which SendMessage does not.
+
+## Cut 3: whole messages in the stream
+
+`wait --follow --full [--take]`: one JSON line per message, body included (cut at 16 KiB), instead of
+a notification line followed by `receive`/`take`. Bodies are fetched with a short `Receive` per
+message (the watch stream carries none). Acknowledgement stays opt-in and happens only after the
+line is flushed, the same ordering as `take`, so a crash between seeing and handling a message
+leaves it unacknowledged and replayed. Motivation: the Monitor is the only way events reach Claude
+between tool calls, and one line per event means a body must be a single line.

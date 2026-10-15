@@ -106,6 +106,15 @@ enum Cmd {
         /// Refuse to start (exit 7) if another watcher of this participant overlaps this one.
         #[arg(long)]
         exclusive: bool,
+        /// Print one compact JSON line per message with its body (sender, conversation, kind, summary,
+        /// body, ...) instead of a notification line, so no follow-up `receive` is needed. Bodies over
+        /// 16 KiB are cut and flagged `truncated`; the line names the `take` command for the rest.
+        #[arg(long)]
+        full: bool,
+        /// With --full: acknowledge each message only after its line has been written and flushed. Without
+        /// it nothing is acknowledged and a reconnect replays unacknowledged messages.
+        #[arg(long, requires = "full")]
+        take: bool,
     },
     /// Stream this participant's events as JSON lines (server-pushed; resumable).
     Watch {
@@ -370,6 +379,113 @@ fn emit(line: &str) {
     let _ = out.flush();
 }
 
+/// How `wait` reports a message: the notification line, or the whole message as one JSON line.
+#[derive(Clone, Copy)]
+enum Announce {
+    Line,
+    Full { take: bool },
+}
+
+const MAX_FULL_BODY: usize = 16 * 1024;
+
+/// The longest prefix of `s` that is at most `max` bytes and ends on a character boundary.
+fn cut(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[derive(serde::Serialize)]
+struct FullLine<'a> {
+    id: &'a str,
+    seq: i64,
+    from: &'a str,
+    to: &'a str,
+    conversation: &'a str,
+    kind: &'a str,
+    reply_to: Option<&'a str>,
+    summary: &'a str,
+    created_at_ms: i64,
+    /// None when the body could not be fetched (see `error`).
+    body: Option<&'a str>,
+    truncated: bool,
+    body_bytes: Option<usize>,
+    error: Option<String>,
+    /// The command that returns the whole message (and acknowledges it).
+    take: String,
+}
+
+/// A message's body, fetched over its own short connection (the watch connection is a stream).
+fn fetch(who: &str, id: &str) -> Result<MessageView, String> {
+    let mut c = Client::connect(&paths::socket_path(), Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
+    match c.call(Request::Receive { as_: who.to_string(), id: id.to_string() }) {
+        Ok(Response::Message(m)) => Ok(m),
+        Ok(Response::Error { code, message }) => Err(format!("{code:?}: {message}")),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Report one message. Returns an exit code only when the output itself is broken: then nothing more
+/// is printed or acknowledged. In `--take` mode the acknowledgement follows a successful flush and
+/// only when the body was fetched; a failed acknowledgement is reported and the message replays.
+fn announce(who: &str, m: &MessageView, mode: Announce) -> Option<ExitCode> {
+    let Announce::Full { take } = mode else {
+        emit(&text::notification(m, who, now_ms()));
+        return None;
+    };
+    let fetched = fetch(who, &m.id);
+    let (body, error) = match &fetched {
+        Ok(full) => (full.body.as_deref(), None),
+        Err(e) => (None, Some(e.clone())),
+    };
+    let shown = body.map(|b| cut(b, MAX_FULL_BODY));
+    let line = FullLine {
+        id: &m.id,
+        seq: m.seq,
+        from: &m.sender,
+        to: who,
+        conversation: &m.conversation,
+        kind: m.kind.as_str(),
+        reply_to: m.reply_to.as_deref(),
+        summary: &m.summary,
+        created_at_ms: m.created_at_ms,
+        body: shown,
+        truncated: matches!((body, shown), (Some(b), Some(s)) if s.len() < b.len()),
+        body_bytes: body.map(str::len),
+        error,
+        take: format!("chatctl take --as {who} --id {}", m.id),
+    };
+    let mut out = serde_json::to_string(&line).unwrap_or_default();
+    out.push('\n');
+    let written = {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(out.as_bytes()).and_then(|()| stdout.flush())
+    };
+    if let Err(e) = written {
+        eprintln!("chatctl: could not write the message ({e}); not acknowledged");
+        return Some(ExitCode::FAILURE);
+    }
+    if take && fetched.is_ok() {
+        match call_quiet(Request::Ack { as_: who.to_string(), ids: vec![m.id.clone()] }) {
+            Ok(()) => {}
+            Err(e) => eprintln!("chatctl: could not acknowledge {} ({e}); it will be replayed", m.id),
+        }
+    }
+    None
+}
+
+fn call_quiet(req: Request) -> Result<(), String> {
+    let mut c = Client::connect(&paths::socket_path(), Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
+    match c.call(req) {
+        Ok(Response::Error { code, message }) => Err(format!("{code:?}: {message}")),
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Seconds a `wait` lasts; `None` is no deadline. Follow mode with no timeout (or 0) is unbounded.
 fn wait_seconds(timeout: Option<u64>, follow: bool) -> Option<u64> {
     const DEFAULT: u64 = 1800;
@@ -410,7 +526,7 @@ fn left(deadline: Option<Instant>) -> Duration {
 
 /// wait / wait --follow over a server-pushed watch, reconnecting within the deadline. Printing
 /// never acknowledges; a reconnect replays everything still unacknowledged.
-fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: bool, exclusive: bool) -> ExitCode {
+fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: bool, exclusive: bool, mode: Announce) -> ExitCode {
     let mut warned = false;
     let deadline = wait_seconds(timeout, follow).map(|n| Instant::now() + Duration::from_secs(n));
     let mut printed_any = false;
@@ -457,7 +573,9 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
                 Ok(Response::SnapshotPage { unacknowledged }) => {
                     for m in unacknowledged {
                         if emitted.insert(m.id.clone()) {
-                            emit(&text::notification(&m, who, now_ms()));
+                            if let Some(code) = announce(who, &m, mode) {
+                                return code;
+                            }
                             printed_any = true;
                             if !follow {
                                 return ExitCode::SUCCESS;
@@ -469,7 +587,9 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
                     if let Some(m) = view_from_event(&event, who)
                         && emitted.insert(m.id.clone())
                     {
-                        emit(&text::notification(&m, who, now_ms()));
+                        if let Some(code) = announce(who, &m, mode) {
+                            return code;
+                        }
                         printed_any = true;
                         if !follow {
                             return ExitCode::SUCCESS;
@@ -669,8 +789,9 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                 println!("acknowledged {} (already {})", acknowledged.len(), already.len());
             }
         }
-        Cmd::Wait { who, conversation, timeout, follow, exclusive } => {
-            return match wait(&who, conversation, timeout, follow, exclusive) {
+        Cmd::Wait { who, conversation, timeout, follow, exclusive, full, take } => {
+            let mode = if full { Announce::Full { take } } else { Announce::Line };
+            return match wait(&who, conversation, timeout, follow, exclusive, mode) {
                 c if c == ExitCode::SUCCESS => Ok(()),
                 c => Err(c),
             };
@@ -816,7 +937,17 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_watchers, wait_seconds};
+    use super::{check_watchers, cut, wait_seconds};
+
+    #[test]
+    fn cut_never_splits_a_character() {
+        assert_eq!(cut("abc", 10), "abc");
+        assert_eq!(cut("abcdef", 3), "abc");
+        let s = "aé"; // 'é' is two bytes at 1..3
+        assert_eq!(cut(s, 2), "a");
+        assert_eq!(cut(s, 3), "aé");
+        assert_eq!(cut("", 5), "");
+    }
 
     #[test]
     fn a_daemon_that_did_not_report_watchers_cannot_back_an_exclusive_watch() {

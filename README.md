@@ -45,6 +45,14 @@ Shortcuts (plan 0002):
 - `take` writes and flushes the message before acknowledging, so a failed write (closed pipe, full
   disk) leaves it unacknowledged. Acknowledging still means received, not done.
 
+- Streaming whole messages: `chatctl wait --as X --follow --full` prints one compact JSON line per
+  message (id, seq, from, to, conversation, kind, reply_to, summary, created_at_ms, body, truncated,
+  body_bytes, error, take), so a Monitor event carries the message and no `receive` is needed. Bodies
+  over 16 KiB are cut on a character boundary with `truncated: true` and the `take` command for the
+  rest. Nothing is acknowledged by default, so a reconnect replays unacknowledged messages. Add
+  `--take` to acknowledge each message after its line has been written and flushed (never before,
+  and not when the body could not be fetched); a failed acknowledgement is reported and the message
+  replays. `--take` requires `--full`.
 - Duplicate watchers: `wait`/`watch` warn on stderr when another watcher of the same participant
   overlaps (every watcher prints each notification). `--exclusive` refuses instead, with exit 7 and a
   `Conflict`; the count and the registration are one step, so racing exclusive watchers admit exactly

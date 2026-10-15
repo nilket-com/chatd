@@ -1727,3 +1727,98 @@ fn the_first_watch_reports_zero_other_watchers_on_the_wire() {
     let Response::Error { code, .. } = c2.recv().unwrap() else { panic!("expected a refusal") };
     assert_eq!(code, ErrorCode::Conflict);
 }
+
+// ---- plan 0002: wait --follow --full [--take] ----
+
+fn first_json_line(child: &mut Child) -> serde_json::Value {
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.as_mut().unwrap()), &mut line).unwrap();
+    assert!(!line.is_empty(), "the stream ended before a message");
+    serde_json::from_str(line.trim_end()).unwrap_or_else(|e| panic!("not one JSON line ({e}): {line:?}"))
+}
+
+#[test]
+fn full_streams_the_whole_message_as_one_line_and_acknowledges_nothing() {
+    let mut e = Env::standard();
+    e.start();
+    let mut w = e.spawn_wait(&["--full"]);
+    e.until_watchers(1);
+    let id = e.send("codex", "claude", "conv", Kind::Request, "f1", "line one\nline two \"quoted\" ünïcode");
+    let v = first_json_line(&mut w);
+    assert_eq!(v["id"], id.as_str());
+    assert_eq!(v["from"], "codex");
+    assert_eq!(v["to"], "claude");
+    assert_eq!(v["conversation"], "conv");
+    assert_eq!(v["kind"], "request");
+    assert_eq!(v["body"], "line one\nline two \"quoted\" ünïcode");
+    assert_eq!(v["truncated"], false);
+    assert_eq!(v["take"], format!("chatctl take --as claude --id {id}"));
+    assert_eq!(e.status(Some("claude")).unacknowledged.len(), 1, "without --take nothing is acknowledged");
+    let _ = finish(w);
+    let mut again = e.spawn_wait(&["--full"]);
+    assert_eq!(first_json_line(&mut again)["id"], id.as_str(), "an unacknowledged message replays on reconnect");
+    let _ = finish(again);
+}
+
+#[test]
+fn full_with_take_acknowledges_after_the_line_is_written() {
+    let mut e = Env::standard();
+    e.start();
+    let id = e.send("codex", "claude", "conv", Kind::Request, "t1", "from the backlog");
+    let mut w = e.spawn_wait(&["--full", "--take"]);
+    let v = first_json_line(&mut w);
+    assert_eq!(v["id"], id.as_str());
+    assert_eq!(v["body"], "from the backlog");
+    let t0 = Instant::now();
+    while !e.status(Some("claude")).unacknowledged.is_empty() {
+        assert!(t0.elapsed() < Duration::from_secs(5), "never acknowledged");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let id2 = e.send("codex", "claude", "conv", Kind::Info, "t2", "pushed after");
+    assert_eq!(first_json_line(&mut w)["id"], id2.as_str());
+    let _ = finish(w);
+}
+
+#[test]
+fn a_long_body_is_cut_on_a_character_boundary_and_flagged() {
+    let mut e = Env::standard();
+    e.start();
+    let body = "é".repeat(40_000); // 80,000 bytes
+    let id = e.send("codex", "claude", "conv", Kind::Info, "big", &body);
+    let mut w = e.spawn_wait(&["--full"]);
+    let v = first_json_line(&mut w);
+    assert_eq!(v["id"], id.as_str());
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["body_bytes"], 80_000);
+    let shown = v["body"].as_str().unwrap();
+    assert!(shown.len() <= 16 * 1024 && shown.chars().all(|c| c == 'é'), "{} bytes", shown.len());
+    assert!(v["take"].as_str().unwrap().contains(&id));
+    let _ = finish(w);
+}
+
+#[test]
+fn take_never_acknowledges_a_line_it_could_not_write() {
+    let mut e = Env::standard();
+    e.start();
+    e.send("codex", "claude", "conv", Kind::Request, "u1", "unseen");
+    let mut cmd = Command::new(CLI);
+    e.envs(&mut cmd);
+    let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+    let out = cmd
+        .args(["wait", "--as", "claude", "--follow", "--full", "--take"])
+        .stdin(Stdio::null())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_ne!(code(&out), 0);
+    assert!(stderr(&out).contains("not acknowledged"), "{}", stderr(&out));
+    assert_eq!(e.status(Some("claude")).unacknowledged.len(), 1);
+}
+
+#[test]
+fn take_needs_full() {
+    let e = Env::standard();
+    let out = e.cli(&["wait", "--as", "claude", "--follow", "--take"], None);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+}
