@@ -354,11 +354,11 @@ fn mesh(claudes: usize, codexes: usize) {
 /// Everyone else sends `per_sender` requests to the first agent at once. A push receiver is woken once
 /// per message today (no coalescing), which is the busy-turn pile-up plan 0003 names; this pins the
 /// current behaviour so a coalescing change is a visible, deliberate one.
-fn fan_in(claudes: usize, codexes: usize, per_sender: usize) {
+fn fan_in(claudes: usize, codexes: usize, per_sender: usize, target: &str) {
     let mut g = Graph::new(claudes, codexes);
     g.run_all();
     let names: Vec<String> = g.agents.iter().map(|a| a.name.clone()).collect();
-    let target = names[0].clone();
+    let target = target.to_string();
     let senders: Vec<&String> = names.iter().filter(|n| **n != target).collect();
     for s in &senders {
         for k in 0..per_sender {
@@ -377,6 +377,17 @@ fn fan_in(claudes: usize, codexes: usize, per_sender: usize) {
         senders.len(),
         g.agent(&target).product
     );
+}
+
+/// Fan-in to each kind of target the mix has: a pull agent (`c1`) and a push agent (`x1`). Mixed graphs
+/// need both, since senders of either product write to a receiver of either product.
+fn fan_in_each_target(claudes: usize, codexes: usize) {
+    if claudes > 0 {
+        fan_in(claudes, codexes, 3, "c1");
+    }
+    if codexes > 0 {
+        fan_in(claudes, codexes, 3, "x1");
+    }
 }
 
 /// A pull agent whose watcher lapsed: messages for it wait unacknowledged and the directory shows no
@@ -409,7 +420,7 @@ fn lapsed_pull_agent(claudes: usize, codexes: usize) {
 macro_rules! mixes {
     ($($name:ident: ($c:expr, $x:expr)),* $(,)?) => {
         mod mesh_all { use super::*; $(#[test] fn $name() { mesh($c, $x); })* }
-        mod fan_in_all { use super::*; $(#[test] fn $name() { fan_in($c, $x, 3); })* }
+        mod fan_in_all { use super::*; $(#[test] fn $name() { fan_in_each_target($c, $x); })* }
     };
 }
 
