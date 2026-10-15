@@ -257,6 +257,38 @@ fn resolve_key(explicit: Option<String>, f: &pending::Fields) -> Result<(String,
     }
 }
 
+/// The receipt line (or JSON), written and flushed with failures reported, so a pending key is only
+/// cleared after the caller really has the receipt.
+fn print_receipt(r: &chatd::proto::Receipt, json: bool) -> io::Result<()> {
+    let mut out = if json {
+        serde_json::to_string_pretty(r).unwrap_or_default()
+    } else {
+        format!("{} (seq {}, key {}{})", r.id, r.seq, r.idempotency_key, if r.duplicate { ", already stored" } else { "" })
+    };
+    out.push('\n');
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(out.as_bytes())?;
+    stdout.flush()
+}
+
+/// Print the receipt, and only then forget the pending key. If the receipt cannot be written the
+/// message may be stored: keep the key, so the identical command retried stores it once.
+fn deliver_receipt(r: &chatd::proto::Receipt, json: bool, pending: Option<(PathBuf, String)>) -> Result<(), ExitCode> {
+    match print_receipt(r, json) {
+        Ok(()) => {
+            settle(pending);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "chatctl: could not write the receipt ({e}); the message may be stored as {} (key {}); re-run the same command to confirm",
+                r.id, r.idempotency_key
+            );
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
 fn settle(pending: Option<(PathBuf, String)>) {
     if let Some((dir, id)) = pending {
         pending::clear(&dir, &id);
@@ -331,25 +363,29 @@ fn emit(line: &str) {
     let _ = out.flush();
 }
 
-/// Seconds a `wait` lasts. Follow mode with no timeout (or 0) is unbounded, in practice ten years.
-fn wait_seconds(timeout: Option<u64>, follow: bool) -> u64 {
+/// Seconds a `wait` lasts; `None` is no deadline. Follow mode with no timeout (or 0) is unbounded.
+fn wait_seconds(timeout: Option<u64>, follow: bool) -> Option<u64> {
     const DEFAULT: u64 = 1800;
-    const UNBOUNDED: u64 = 10 * 365 * 24 * 3600;
     match timeout {
-        None if follow => UNBOUNDED,
-        Some(0) if follow => UNBOUNDED,
-        None => DEFAULT,
-        Some(n) => n,
+        None if follow => None,
+        Some(0) if follow => None,
+        None => Some(DEFAULT),
+        Some(n) => Some(n),
     }
+}
+
+/// Time left before `deadline`; an absent deadline never runs out (a slice longer than any wait step).
+fn left(deadline: Option<Instant>) -> Duration {
+    deadline.map_or(Duration::from_secs(u32::MAX as u64), |d| d.saturating_duration_since(Instant::now()))
 }
 
 /// wait / wait --follow over a server-pushed watch, reconnecting within the deadline. Printing
 /// never acknowledges; a reconnect replays everything still unacknowledged.
 fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: bool) -> ExitCode {
-    let deadline = Instant::now() + Duration::from_secs(wait_seconds(timeout, follow));
+    let deadline = wait_seconds(timeout, follow).map(|n| Instant::now() + Duration::from_secs(n));
     let mut printed_any = false;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = left(deadline);
         if remaining.is_zero() {
             break;
         }
@@ -372,7 +408,7 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
         }
         let mut emitted: HashSet<String> = HashSet::new();
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = left(deadline);
             if remaining.is_zero() {
                 break;
             }
@@ -414,7 +450,7 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
                 }
                 Ok(_) => {}
                 Err(ClientError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                    if left(deadline).is_zero() {
                         break;
                     }
                     eprintln!("chatctl: no heartbeat from chatd; reconnecting");
@@ -537,12 +573,7 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                 body,
             };
             let Response::Stored(r) = call(Request::Send(req))? else { return Err(ExitCode::FAILURE) };
-            settle(pending);
-            if json {
-                print_json(&r)
-            } else {
-                println!("{} (seq {}, key {}{})", r.id, r.seq, r.idempotency_key, if r.duplicate { ", already stored" } else { "" })
-            }
+            deliver_receipt(&r, json, pending)?;
         }
         Cmd::Reply { who, to_message, r#final, idempotency_key, summary, body_file } => {
             let body = body(&body_file).map_err(|e| {
@@ -564,12 +595,7 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
             )?;
             let req = SendReq { from: who, to: None, conversation: None, kind, reply_to: Some(to_message), idempotency_key, summary, body };
             let Response::Stored(r) = call(Request::Send(req))? else { return Err(ExitCode::FAILURE) };
-            settle(pending);
-            if json {
-                print_json(&r)
-            } else {
-                println!("{} (seq {}, key {}{})", r.id, r.seq, r.idempotency_key, if r.duplicate { ", already stored" } else { "" })
-            }
+            deliver_receipt(&r, json, pending)?;
         }
         Cmd::Receive { who, id } => {
             let Response::Message(m) = call(Request::Receive { as_: who, id })? else { return Err(ExitCode::FAILURE) };
@@ -747,11 +773,11 @@ mod tests {
 
     #[test]
     fn follow_without_a_timeout_is_unbounded_and_everything_else_is_as_before() {
-        assert_eq!(wait_seconds(None, false), 1800);
-        assert_eq!(wait_seconds(Some(5), false), 5);
-        assert_eq!(wait_seconds(Some(0), false), 0, "a plain wait with 0 still expires at once");
-        assert_eq!(wait_seconds(Some(5), true), 5);
-        assert!(wait_seconds(None, true) > 365 * 24 * 3600);
+        assert_eq!(wait_seconds(None, false), Some(1800));
+        assert_eq!(wait_seconds(Some(5), false), Some(5));
+        assert_eq!(wait_seconds(Some(0), false), Some(0), "a plain wait with 0 still expires at once");
+        assert_eq!(wait_seconds(Some(5), true), Some(5));
+        assert_eq!(wait_seconds(None, true), None);
         assert_eq!(wait_seconds(Some(0), true), wait_seconds(None, true));
     }
 }

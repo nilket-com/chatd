@@ -1601,3 +1601,25 @@ fn an_untimed_follow_outlives_the_old_deadline_and_a_daemon_restart() {
     assert!(line.contains(&id), "the watcher reconnected and was notified: {line:?}");
     assert!(t0.elapsed() < Duration::from_secs(15));
 }
+
+#[test]
+fn a_receipt_that_cannot_be_written_keeps_the_pending_key_so_a_retry_stores_once() {
+    let mut e = Env::standard();
+    e.start();
+    let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c"];
+    let mut cmd = Command::new(CLI);
+    e.envs(&mut cmd);
+    let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+    let mut child = cmd.args(args).stdin(Stdio::piped()).stdout(full).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"body").unwrap();
+    let broken = child.wait_with_output().unwrap();
+    assert_ne!(code(&broken), 0);
+    assert!(stderr(&broken).contains("could not write the receipt"), "{}", stderr(&broken));
+    assert_eq!(e.pending_files().len(), 1, "the key survives a lost receipt");
+    assert_eq!(e.status(Some("codex")).unacknowledged.len(), 1, "the message was stored");
+    let retry = e.cli(&args, Some("body"));
+    assert_eq!(code(&retry), 0, "{}", stderr(&retry));
+    assert!(stdout(&retry).contains("already stored"), "{}", stdout(&retry));
+    assert_eq!(e.status(Some("codex")).unacknowledged.len(), 1, "stored once");
+    assert!(e.pending_files().is_empty());
+}

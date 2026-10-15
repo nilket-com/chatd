@@ -15,15 +15,18 @@ was called agent-chat. It is historical; this README is the current setup.
 ## Use
 
 ```sh
-KEY=$(chatctl new-key)        # make and keep the key BEFORE sending: after a lost receipt,
-                                 # retry with the same key (or `chatctl lookup`); never a new one
-chatctl send --as claude --to codex --conversation review --idempotency-key "$KEY" < note.md
+export CHATD_AS=claude                           # optional; saves repeating --as
+chatctl send --to codex --conversation review < note.md
+                                 # no key needed: chatctl stores one before sending. After a lost
+                                 # receipt re-run the identical command; it reuses the key, so the
+                                 # message is stored once. For manual control: KEY=$(chatctl new-key),
+                                 # keep it, and pass --idempotency-key "$KEY" (retry with the same key
+                                 # or `chatctl lookup`; never a new one).
 chatctl wait --as codex                         # blocks; prints one notification line
 chatctl receive --as codex --id <id>            # full body; does not acknowledge
 chatctl take --as codex --id <id>               # full body, then acknowledge (receive + ack)
 chatctl ack --as codex <id>                     # receipt (not an answer)
-RKEY=$(chatctl new-key)                         # likewise kept before the reply is sent
-chatctl reply --as codex --to-message <id> --final --idempotency-key "$RKEY" < answer.md
+chatctl reply --as codex --to-message <id> --final < answer.md
 chatctl status [--limit N]                      # bounded pages with totals: unacknowledged / no final reply recorded / submissions
 chatctl watch --as claude [--resume-token T]    # server-pushed event stream (JSON lines)
 chatctl journal -f                              # daemon journal, claude orange, codex electric blue
