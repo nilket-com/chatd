@@ -430,7 +430,8 @@ fn fetch(who: &str, id: &str) -> Result<MessageView, String> {
 
 /// Report one message. Returns an exit code only when the output itself is broken: then nothing more
 /// is printed or acknowledged. In `--take` mode the acknowledgement follows a successful flush and
-/// only when the body was fetched; a failed acknowledgement is reported and the message replays.
+/// only when the body was fetched. An acknowledgement whose result is unknown (the response may have been
+/// lost after the commit) is reported and the message may replay: delivery is at-least-once.
 fn announce(who: &str, m: &MessageView, mode: Announce) -> Option<ExitCode> {
     let Announce::Full { take } = mode else {
         emit(&text::notification(m, who, now_ms()));
@@ -471,7 +472,7 @@ fn announce(who: &str, m: &MessageView, mode: Announce) -> Option<ExitCode> {
     if take && fetched.is_ok() {
         match call_quiet(Request::Ack { as_: who.to_string(), ids: vec![m.id.clone()] }) {
             Ok(()) => {}
-            Err(e) => eprintln!("chatctl: could not acknowledge {} ({e}); it will be replayed", m.id),
+            Err(e) => eprintln!("chatctl: could not confirm the acknowledgement of {} ({e}); it may replay, check `chatctl status`", m.id),
         }
     }
     None

@@ -51,8 +51,10 @@ Shortcuts (plan 0002):
   over 16 KiB are cut on a character boundary with `truncated: true` and the `take` command for the
   rest. Nothing is acknowledged by default, so a reconnect replays unacknowledged messages. Add
   `--take` to acknowledge each message after its line has been written and flushed (never before,
-  and not when the body could not be fetched); a failed acknowledgement is reported and the message
-  replays. `--take` requires `--full`.
+  and not when the body could not be fetched). Delivery is at-least-once: without `--take` a
+  reconnect repeats unacknowledged ids, and with it a crash after the line but before a committed
+  acknowledgement can too, as can an acknowledgement whose response was lost (reported on stderr; check
+  `chatctl status`). A consumer with side effects should deduplicate on `id`. `--take` requires `--full`.
 - Duplicate watchers: `wait`/`watch` warn on stderr when another watcher of the same participant
   overlaps (every watcher prints each notification). `--exclusive` refuses instead, with exit 7 and a
   `Conflict`; the count and the registration are one step, so racing exclusive watchers admit exactly
