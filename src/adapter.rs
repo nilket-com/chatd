@@ -27,6 +27,10 @@ pub fn run(shared: Arc<Shared>) {
         if shared.shutdown.load(Ordering::SeqCst) {
             return;
         }
+        // Sampled BEFORE reading what is due: a commit during the deliveries below (or during the read)
+        // moves the counter past this value, so the wait at the bottom returns at once instead of
+        // sleeping through a message the snapshot could not include.
+        let head = shared.hub.head();
         let due = match shared.store.lock().map(|s| s.due_deliveries(now_ms())) {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
@@ -42,7 +46,6 @@ pub fn run(shared: Arc<Shared>) {
             deliver(&shared, &d);
         }
         // Wake on the next commit, or after a second to honour retry backoff deadlines.
-        let head = shared.hub.head();
         shared.hub.wait_beyond(head, Duration::from_secs(1));
     }
 }

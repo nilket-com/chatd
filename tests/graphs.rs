@@ -111,10 +111,11 @@ impl Drop for Daemon {
     }
 }
 
-/// A recording stand-in for `codex queue --thread S --message LINE`: appends LINE to `<dir>/<S>.log`.
-fn write_fake_queue(dir: &Path) -> PathBuf {
+/// A recording stand-in for `codex queue --thread S --message LINE`: appends LINE to `<dir>/<S>.log`,
+/// after `delay` (a slow adapter keeps one delivery in progress while the next message commits).
+fn write_fake_queue(dir: &Path, delay: &str) -> PathBuf {
     let exe = dir.join("fake-queue");
-    std::fs::write(&exe, format!("#!/bin/sh\nprintf '%s\\n' \"$5\" >> \"{}/$3.log\"\n", dir.display())).unwrap();
+    std::fs::write(&exe, format!("#!/bin/sh\nsleep {delay}\nprintf '%s\\n' \"$5\" >> \"{}/$3.log\"\n", dir.display())).unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
     exe
 }
@@ -187,7 +188,7 @@ impl Graph {
         let names: Vec<String> = specs.iter().map(|(n, _)| n.clone()).collect();
         let daemon = Daemon::start(&names);
         let dir = daemon.dir.clone();
-        let fake = write_fake_queue(&dir);
+        let fake = write_fake_queue(&dir, "0");
         for (n, p) in &specs {
             if *p == Product::Codex {
                 let registered = daemon.call(Request::EndpointRegister {
@@ -457,4 +458,44 @@ mod lapse_all {
     fn c1_x3() {
         lapsed_pull_agent(1, 3)
     }
+}
+
+/// A message that commits while an earlier push is still being delivered must be pushed promptly, not
+/// after the adapter loop's one-second poll. (Regression: the loop sampled the commit counter AFTER
+/// delivering, so a commit that happened during a delivery was missed and waited out the poll.)
+#[test]
+fn a_push_is_not_delayed_by_a_delivery_in_progress() {
+    let names = vec!["c1".to_string(), "x1".to_string()];
+    let daemon = Daemon::start(&names);
+    let fake = write_fake_queue(&daemon.dir, "0.4");
+    let registered =
+        daemon.call(Request::EndpointRegister { name: "x1".into(), session: "x1".into(), exe: fake.to_string_lossy().into_owned() });
+    assert!(!matches!(registered, Response::Error { .. }), "{registered:?}");
+    let send = |key: &str| match daemon.call(Request::Send(SendReq {
+        from: "c1".into(),
+        to: Some("x1".into()),
+        conversation: Some("lat".into()),
+        kind: Kind::Info,
+        reply_to: None,
+        idempotency_key: key.into(),
+        summary: None,
+        body: key.into(),
+    })) {
+        Response::Stored(r) => r.id,
+        other => panic!("{other:?}"),
+    };
+    let log = daemon.dir.join("x1.log");
+    let lines = || std::fs::read_to_string(&log).unwrap_or_default().lines().count();
+    send("first");
+    std::thread::sleep(Duration::from_millis(150)); // the first delivery is mid-flight (it takes 0.4 s)
+    let t0 = Instant::now();
+    send("second");
+    while lines() < 2 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "never delivered");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let waited = t0.elapsed();
+    // Two sequential 0.4 s deliveries finish about 0.65 s after the second send; a missed wakeup adds
+    // most of a second on top.
+    assert!(waited < Duration::from_millis(900), "the second push waited {waited:?}");
 }

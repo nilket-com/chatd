@@ -92,3 +92,22 @@ transport from the table above.
 - Whether to let chatd write to a Claude session's private socket. It is undocumented and would inject
   text as a trusted teammate message; it needs an explicit decision (see plan 0002, spike).
 - A 4-agent live run: the cap is 3 until the user lifts it.
+
+## Harness findings (tests/graphs.rs)
+
+Built first, as proposed: fake agents over all 12 mixes, scenarios mesh / fan-in / lapsed pull agent.
+All 12 mixes pass the mesh and fan-in scenarios, and every mix with a pull agent passes the lapse one.
+What it found:
+
+- **Lost wakeup in the push adapter (fixed).** `adapter::run` sampled the commit counter after
+  delivering, so a message committed while an earlier push was in flight was missed and waited out the
+  one-second poll: the second of two back-to-back pushes arrived about 1.0 s late (1.66 s measured against
+  a 0.65 s floor, 5 of 5). The counter is now sampled before the due-deliveries read. Regression test:
+  `a_push_is_not_delayed_by_a_delivery_in_progress`. This is the busy-turn friction's cousin on the
+  daemon side: a push target under load was being delayed by the daemon, not just interrupted.
+- **`status` counts an in-flight submission as "needing attention".** For a few milliseconds after a push
+  agent acknowledges, chatd has not yet recorded the adapter's exit, and `uncertain_or_failed_total`
+  is 1. Harmless, but a human or an agent reading `status` can mistake it for a failure. Candidate fix:
+  report in-flight attempts separately from uncertain or failed ones.
+- **Fan-in is one push per message.** Three senders into one push agent produce three pushes; nothing
+  coalesces. Pinned by the fan-in test so a coalescing change is deliberate.
