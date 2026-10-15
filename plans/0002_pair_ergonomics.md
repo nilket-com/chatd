@@ -70,3 +70,8 @@ daemon predates the option.
 Not in this cut (Codex-side ranking, to revisit): deferring or prioritising push into a busy turn;
 reading before acknowledging as the default (`take` is for the immediate case); a direct reply path
 for info messages (today a new `send`).
+
+Decision (Codex review of 01e6ea9, P2): `exclusive` binds only the watch that requests it, at
+registration. A later plain watch is still admitted and warns, because refusing it would block a
+one-shot manual `wait` next to a standing exclusive Monitor. If a stronger guarantee is wanted, track
+the bit in WatcherView and refuse overlapping registrations while it is set.

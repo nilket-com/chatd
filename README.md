@@ -48,7 +48,9 @@ Shortcuts (plan 0002):
 - Duplicate watchers: `wait`/`watch` warn on stderr when another watcher of the same participant
   overlaps (every watcher prints each notification). `--exclusive` refuses instead, with exit 7 and a
   `Conflict`; the count and the registration are one step, so racing exclusive watchers admit exactly
-  one. Filters overlap when either has no `--conversation` or both name the same one. Against a chatd
+  one. `--exclusive` is a start-time check on the watcher that asks for it: it does not bar a later
+  plain watch, which still warns (a quick manual `wait` beside a standing Monitor stays possible).
+  Filters overlap when either has no `--conversation` or both name the same one. Against a chatd
   that predates the option, `--exclusive` refuses to run (exit 5) rather than silently not excluding;
   restart chatd to pick up the new binary.
 
