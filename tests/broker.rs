@@ -1868,3 +1868,55 @@ fn take_needs_full() {
     let out = e.cli(&["wait", "--as", "claude", "--follow", "--take"], None);
     assert_eq!(code(&out), 2, "{}", stderr(&out));
 }
+
+// ---- plan 0003: participant records and the directory ----
+
+#[test]
+fn peers_shows_product_tier_and_reachability_and_follows_a_watcher() {
+    let mut e = Env::new(
+        "participants = [\"claude\", \"codex\"]\nheartbeat_ms = 300\n[participant.claude]\nproduct = \"claude\"\ntier = \"luna\"\n[participant.codex]\nproduct = \"codex\"\ntier = \"gpt-6-luna\"\n[participant.scout]\nproduct = \"claude\"\ntier = \"astra\"\n",
+    );
+    e.start();
+    let before = stdout(&e.cli(&["peers"], None));
+    let row = |text: &str, name: &str| {
+        text.lines().find(|l| l.starts_with(name)).unwrap_or_else(|| panic!("no {name} row in {text}")).to_string()
+    };
+    assert!(row(&before, "claude").contains("luna") && row(&before, "claude").contains("no watcher attached"), "{before}");
+    assert!(
+        row(&before, "codex").contains("gpt-6-luna") && row(&before, "codex").contains("normally uses push; no endpoint registered"),
+        "{before}"
+    );
+    assert!(row(&before, "scout").contains("astra"), "a name only under [participant.*] is a participant: {before}");
+    let w = e.spawn_wait(&[]);
+    e.until_watchers(1);
+    let during = stdout(&e.cli(&["peers"], None));
+    let _ = finish(w);
+    let claude = row(&during, "claude");
+    assert!(claude.contains("pull") && claude.contains("yes"), "{claude}");
+    let json = stdout(&e.cli(&["--json", "peers"], None));
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let c = v.as_array().unwrap().iter().find(|p| p["name"] == "claude").unwrap();
+    assert_eq!((c["product"].as_str(), c["tier"].as_str()), (Some("claude"), Some("luna")));
+}
+
+#[test]
+fn a_codex_with_a_registered_endpoint_is_reachable_by_push() {
+    let mut e = Env::new("heartbeat_ms = 300\n[participant.codex]\nproduct = \"codex\"\n");
+    e.start();
+    let reg = e.cli(&["endpoint", "register", "--as", "codex", "--session", "s1", "--exe", "/bin/true"], None);
+    assert_eq!(code(&reg), 0, "{}", stderr(&reg));
+    let row = stdout(&e.cli(&["peers"], None)).lines().find(|l| l.starts_with("codex")).unwrap().to_string();
+    assert!(row.contains("push") && row.contains("yes") && !row.contains("normally"), "{row}");
+}
+
+#[test]
+fn a_bad_product_token_stops_the_daemon_with_a_clear_error() {
+    let mut e = Env::new("[participant.claude]\nproduct = \"Claude Code\"\n");
+    assert!(e.try_start(false).is_none(), "the daemon must refuse an invalid product");
+    let mut err = String::new();
+    if let Some(mut d) = e.daemon.take() {
+        use std::io::Read;
+        let _ = d.stderr.take().unwrap().read_to_string(&mut err);
+    }
+    assert!(err.contains("participant.claude.product"), "{err}");
+}

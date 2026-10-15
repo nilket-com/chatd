@@ -69,6 +69,28 @@ Shortcuts (plan 0002):
   that predates the option, `--exclusive` refuses to run (exit 5) rather than silently not excluding;
   restart chatd to pick up the new binary.
 
+- Participant records and the directory (plan 0003): describe each agent in `config.toml` without
+  changing routing:
+
+  ```toml
+  participants = ["c1", "x1"]
+  [participant.c1]
+  product = "claude"   # short lowercase token; "claude" is expected to pull, "codex" to be pushed to
+  tier = "luna"        # model tier, metadata only
+  [participant.x1]
+  product = "codex"
+  tier = "gpt-6-luna"
+  ```
+
+  A name that appears only under `[participant.*]` is a participant too. A bad token stops the daemon
+  at start with the offending key. `chatctl peers` (and `chatctl --json peers`, or the new
+  `participants` field of `status`) lists each participant with its product, tier, transport (push when
+  an endpoint is registered, otherwise pull), watcher count and whether it is reachable now: a push
+  participant while its endpoint is registered, a pull participant while a watcher is attached. Reachable
+  means a message can be delivered, not that the agent is awake. A note column says when a participant
+  does not use the transport its product normally does (a codex with no endpoint). Name the instance, not
+  the model or role, so a model can be swapped and roles can change (plan 0003).
+
 ## The states of a message
 
 | State | Meaning |

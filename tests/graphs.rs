@@ -38,17 +38,31 @@ struct Daemon {
     child: Option<Child>,
 }
 
+impl Product {
+    fn token(self) -> &'static str {
+        match self {
+            Product::Codex => "codex",
+            Product::Claude => "claude",
+        }
+    }
+}
+
+const TIERS: [&str; 3] = ["astra", "sol", "luna"];
+
 impl Daemon {
-    fn start(names: &[String]) -> Daemon {
+    /// Participants are stable instance names; product and tier are configured metadata (tiers cycle).
+    fn start(specs: &[(String, Product)]) -> Daemon {
+        let names: Vec<&String> = specs.iter().map(|(n, _)| n).collect();
         let dir = std::env::temp_dir().join(format!("chatd-graph-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("run")).unwrap();
         let list = names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
-        std::fs::write(
-            dir.join("config.toml"),
-            format!("participants = [{list}]\nheartbeat_ms = 300\nadapter_timeout_ms = 3000\nretry_backoff_ms = [100, 100, 100]\n"),
-        )
-        .unwrap();
+        let mut config =
+            format!("participants = [{list}]\nheartbeat_ms = 300\nadapter_timeout_ms = 3000\nretry_backoff_ms = [100, 100, 100]\n");
+        for (i, (name, product)) in specs.iter().enumerate() {
+            config.push_str(&format!("[participant.{name}]\nproduct = \"{}\"\ntier = \"{}\"\n", product.token(), TIERS[i % TIERS.len()]));
+        }
+        std::fs::write(dir.join("config.toml"), config).unwrap();
         let notify = dir.join("notify.sock");
         let sock = UnixDatagram::bind(&notify).unwrap();
         sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
@@ -185,8 +199,7 @@ impl Graph {
     fn new(claudes: usize, codexes: usize) -> Graph {
         let mut specs: Vec<(String, Product)> = (1..=claudes).map(|i| (format!("c{i}"), Product::Claude)).collect();
         specs.extend((1..=codexes).map(|i| (format!("x{i}"), Product::Codex)));
-        let names: Vec<String> = specs.iter().map(|(n, _)| n.clone()).collect();
-        let daemon = Daemon::start(&names);
+        let daemon = Daemon::start(&specs);
         let dir = daemon.dir.clone();
         let fake = write_fake_queue(&dir, "0");
         for (n, p) in &specs {
@@ -314,6 +327,25 @@ impl Graph {
         }
     }
 
+    /// The directory must describe each agent as configured and reachable only if it can be reached now.
+    fn assert_directory(&self, unreachable: &[&str]) {
+        let rows = self.daemon.status().participants;
+        assert_eq!(rows.len(), self.agents.len(), "one row per participant");
+        for a in &self.agents {
+            let r = rows.iter().find(|r| r.name == a.name).unwrap_or_else(|| panic!("no row for {}", a.name));
+            assert_eq!(r.product.as_deref(), Some(a.product.token()), "{}", a.name);
+            assert!(r.tier.is_some(), "{} has a tier", a.name);
+            let (transport, watching) = match a.product {
+                Product::Codex => ("push", 0),
+                Product::Claude => ("pull", if unreachable.contains(&a.name.as_str()) { 0 } else { 1 }),
+            };
+            assert_eq!(r.transport, transport, "{}", a.name);
+            assert_eq!(r.expected_transport.as_deref(), Some(transport), "{}", a.name);
+            assert_eq!(r.watchers, watching, "{}", a.name);
+            assert_eq!(r.reachable, !unreachable.contains(&a.name.as_str()), "{} reachable", a.name);
+        }
+    }
+
     fn received(&self, name: &str) -> usize {
         self.agent(name).seen.lock().unwrap().ids.len()
     }
@@ -325,6 +357,7 @@ impl Graph {
 fn mesh(claudes: usize, codexes: usize) {
     let mut g = Graph::new(claudes, codexes);
     g.run_all();
+    g.assert_directory(&[]);
     let names: Vec<String> = g.agents.iter().map(|a| a.name.clone()).collect();
     let n = names.len();
     for a in &names {
@@ -411,8 +444,15 @@ fn lapsed_pull_agent(claudes: usize, codexes: usize) {
     std::thread::sleep(Duration::from_millis(500));
     let waiting = g.daemon.status();
     assert_eq!(waiting.unacknowledged_total as usize, names.len() - 1, "every request for the lapsed agent waits");
-    assert!(waiting.watchers.iter().all(|w| w.participant != lapsed), "the directory shows no watcher for {lapsed}");
+    assert!(waiting.watchers.iter().all(|w| w.participant != lapsed), "no watcher is attached for {lapsed}");
+    g.assert_directory(&[&lapsed]);
     g.run(&lapsed);
+    let t0 = Instant::now();
+    while g.daemon.status().participants.iter().any(|p| !p.reachable) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the lapsed agent never became reachable again");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    g.assert_directory(&[]);
     g.settle(Duration::from_secs(30));
     assert_eq!(g.received(&lapsed), names.len() - 1, "the backlog arrives when it returns");
 }
@@ -476,8 +516,7 @@ mod lapse_all {
 /// delivering, so a commit that happened during a delivery was missed and waited out the poll.)
 #[test]
 fn a_push_is_not_delayed_by_a_delivery_in_progress() {
-    let names = vec!["c1".to_string(), "x1".to_string()];
-    let daemon = Daemon::start(&names);
+    let daemon = Daemon::start(&[("c1".to_string(), Product::Claude), ("x1".to_string(), Product::Codex)]);
     let fake = write_fake_queue(&daemon.dir, "0.4");
     let registered =
         daemon.call(Request::EndpointRegister { name: "x1".into(), session: "x1".into(), exe: fake.to_string_lossy().into_owned() });

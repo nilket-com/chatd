@@ -111,3 +111,13 @@ What it found:
   report in-flight attempts separately from uncertain or failed ones.
 - **Fan-in is one push per message.** Three senders into one push agent produce three pushes; nothing
   coalesces. Pinned by the fan-in test so a coalescing change is deliberate.
+
+## Cut 4: participant records and the directory (done)
+
+`[participant.<name>]` in the config carries `product` and `tier` (short lowercase tokens, validated at
+start; metadata, never routing). `status` returns a `participants` directory and `chatctl peers` prints it:
+product, tier, transport (push with an endpoint, else pull), expected transport for the product,
+watchers, oldest watcher, and `reachable`. The harness asserts the directory for every mix, including a
+lapsed pull agent shown unreachable and reachable again on return. The attributes live in the config, so
+there is no store schema change; a participant added only under `[participant.*]` is migrated in like any
+other. Not done here: group send, per-request owner, and any change to routing based on product.

@@ -151,6 +151,8 @@ enum Cmd {
         #[arg(long)]
         unanswered_after: Option<i64>,
     },
+    /// The directory: each participant's product and tier, how it is reached, and whether it is reachable now.
+    Peers,
     /// The durable event log.
     Log {
         #[arg(long)]
@@ -901,6 +903,45 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                     w.conversation.as_deref().unwrap_or("*"),
                     age(now_ms() - w.connected_at_ms),
                     w.last_event_seq
+                );
+            }
+        }
+        Cmd::Peers => {
+            let Response::Status(s) =
+                call(Request::Status { as_: None, conversation: None, limit: 1, unacknowledged_after: None, unanswered_after: None })?
+            else {
+                return Err(ExitCode::FAILURE);
+            };
+            if s.participants.is_empty() {
+                eprintln!(
+                    "chatctl: this chatd predates the participant directory (it reported none); restart chatd to pick up the new binary"
+                );
+                return Err(ExitCode::from(EXIT_REFUSED));
+            }
+            if json {
+                print_json(&s.participants);
+                return Ok(());
+            }
+            println!("{:<12} {:<8} {:<10} {:<9} {:<10} {:<9} NOTE", "PARTICIPANT", "PRODUCT", "TIER", "TRANSPORT", "REACHABLE", "WATCHING");
+            for p in &s.participants {
+                let note = match (&p.expected_transport, p.reachable) {
+                    (Some(e), _) if *e != p.transport => format!(
+                        "{} normally uses {e}; no {}",
+                        p.product.as_deref().unwrap_or("?"),
+                        if e == "push" { "endpoint registered" } else { "watcher" }
+                    ),
+                    (_, false) if p.transport == "pull" => "no watcher attached".to_string(),
+                    _ => String::new(),
+                };
+                println!(
+                    "{:<12} {:<8} {:<10} {:<9} {:<10} {:<9} {}",
+                    p.name,
+                    p.product.as_deref().unwrap_or("-"),
+                    p.tier.as_deref().unwrap_or("-"),
+                    p.transport,
+                    if p.reachable { "yes" } else { "no" },
+                    p.watching_since_ms.map(|t| age(now_ms() - t)).unwrap_or_else(|| "-".into()),
+                    note
                 );
             }
         }

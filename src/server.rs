@@ -1,7 +1,7 @@
 //! The daemon: one writer connection behind a mutex, a thread per client connection, server-pushed
 //! watches, and the delivery adapter. External processes never run while the store lock is held.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufReader, BufWriter};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -15,7 +15,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::proto::{
-    ClientFrame, ErrorCode, EventView, MAX_PAGE, PROTOCOL_VERSION, Request, Response, ServerFrame, WatcherView, read_frame, write_frame,
+    ClientFrame, EndpointView, ErrorCode, EventView, MAX_PAGE, PROTOCOL_VERSION, ParticipantView, Request, Response, ServerFrame,
+    WatcherView, read_frame, write_frame,
 };
 use crate::store::{Store, StoreError, now_ms};
 use crate::{adapter, hub::Hub, journal, legacy, notify};
@@ -28,6 +29,10 @@ pub const WATCH_BATCH: u32 = 256;
 pub struct Config {
     #[serde(default = "default_participants")]
     pub participants: Vec<String>,
+    /// Optional metadata per participant: `[participant.c1]` with `product` and `tier`. A name that
+    /// appears only here is a participant too. Nothing here changes routing; it describes the agent.
+    #[serde(default)]
+    pub participant: BTreeMap<String, ParticipantConf>,
     /// Watch heartbeat interval.
     #[serde(default = "default_heartbeat_ms")]
     pub heartbeat_ms: u64,
@@ -62,6 +67,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             participants: default_participants(),
+            participant: BTreeMap::new(),
             heartbeat_ms: default_heartbeat_ms(),
             write_deadline_ms: default_write_deadline_ms(),
             adapter_timeout_ms: default_adapter_timeout_ms(),
@@ -73,11 +79,95 @@ impl Default for Config {
 impl Config {
     pub fn load(path: &Path) -> Result<Config, String> {
         match std::fs::read_to_string(path) {
-            Ok(s) => toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display())),
+            Ok(s) => {
+                let config: Config = toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
+                config.validate().map_err(|e| format!("{}: {e}", path.display()))?;
+                Ok(config)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParticipantConf {
+    /// The agent's product, a short lowercase token (`claude`, `codex`, ...). It decides how the agent
+    /// is expected to be woken, nothing else.
+    pub product: Option<String>,
+    /// The model tier, a short lowercase token. Metadata only; never used for routing.
+    pub tier: Option<String>,
+}
+
+/// A short lowercase token: letters, digits, `-` and `_`, starting with a letter or digit, at most 32.
+fn valid_token(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.len() <= 32
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+impl Config {
+    /// The participant list plus any name that only appears under `[participant.*]`, in that order.
+    pub fn participant_names(&self) -> Vec<String> {
+        let mut names = self.participants.clone();
+        for n in self.participant.keys() {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        names
+    }
+
+    pub fn knows(&self, who: &str) -> bool {
+        self.participants.iter().any(|p| p == who) || self.participant.contains_key(who)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for (name, conf) in &self.participant {
+            for (field, value) in [("product", &conf.product), ("tier", &conf.tier)] {
+                if let Some(v) = value
+                    && !valid_token(v)
+                {
+                    return Err(format!(
+                        "participant.{name}.{field} = {v:?} must be a short lowercase token (a-z, 0-9, '-' and '_', at most 32)"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The directory: every participant, how it is configured, and whether a message can reach it now.
+pub fn directory(config: &Config, endpoints: &[EndpointView], watchers: &[WatcherView]) -> Vec<ParticipantView> {
+    config
+        .participant_names()
+        .into_iter()
+        .map(|name| {
+            let conf = config.participant.get(&name).cloned().unwrap_or_default();
+            let endpoint = endpoints.iter().find(|e| e.name == name);
+            let mine: Vec<&WatcherView> = watchers.iter().filter(|w| w.participant == name).collect();
+            let transport = if endpoint.is_some() { "push" } else { "pull" };
+            let expected = match conf.product.as_deref() {
+                Some("codex") => Some("push".to_string()),
+                Some("claude") => Some("pull".to_string()),
+                _ => None,
+            };
+            ParticipantView {
+                reachable: if endpoint.is_some() { true } else { !mine.is_empty() },
+                watchers: mine.len() as u32,
+                watching_since_ms: mine.iter().map(|w| w.connected_at_ms).min(),
+                session: endpoint.map(|e| e.session.clone()),
+                transport: transport.to_string(),
+                expected_transport: expected,
+                product: conf.product,
+                tier: conf.tier,
+                name,
+            }
+        })
+        .collect()
 }
 
 pub struct Shared {
@@ -170,7 +260,7 @@ pub fn prepare(config: Config, state_dir: &Path, socket: &Path) -> Result<(Arc<S
     }
     let db_path = state_dir.join("chat.db");
     let mut store = Store::open(&db_path).map_err(|e| e.to_string())?;
-    store.migrate(&config.participants).map_err(|e| e.to_string())?;
+    store.migrate(&config.participant_names()).map_err(|e| e.to_string())?;
     store.write_check().map_err(|e| e.to_string())?;
     let interrupted = store.mark_interrupted_attempts().map_err(|e| e.to_string())?;
     if interrupted > 0 {
@@ -337,6 +427,7 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
             match store.status(as_.as_deref(), conversation.as_deref(), limit, unacknowledged_after, unanswered_after) {
                 Ok(mut s) => {
                     s.watchers = shared.watchers.lock().map(|w| w.values().cloned().collect()).unwrap_or_default();
+                    s.participants = directory(&shared.config, &s.endpoints, &s.watchers);
                     Response::Status(s)
                 }
                 Err(e) => err(e),
@@ -434,7 +525,7 @@ fn watch<W: io::Write>(
         Ok(s) => s,
         Err(e) => return send(w, err(e)),
     };
-    if !shared.config.participants.iter().any(|p| p == who) {
+    if !shared.config.knows(who) {
         return send(w, Response::Error { code: ErrorCode::UnknownParticipant, message: format!("unknown participant {who:?}") });
     }
     let filter = filter_hash(who, conversation);
@@ -623,5 +714,65 @@ mod overlap_tests {
         assert!(filters_overlap(Some("a"), None));
         assert!(filters_overlap(Some("a"), Some("a")));
         assert!(!filters_overlap(Some("a"), Some("b")));
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+
+    fn config(toml_text: &str) -> Config {
+        let c: Config = toml::from_str(toml_text).unwrap();
+        c.validate().unwrap();
+        c
+    }
+
+    fn endpoint(name: &str) -> EndpointView {
+        EndpointView { name: name.into(), session: format!("s-{name}"), exe: "/x".into(), generation: 1, registered_at_ms: 0 }
+    }
+
+    fn watcher(who: &str, at: i64) -> WatcherView {
+        WatcherView { participant: who.into(), conversation: None, connected_at_ms: at, last_event_seq: 0 }
+    }
+
+    #[test]
+    fn a_name_only_under_participant_is_a_participant_and_the_list_keeps_its_order() {
+        let c = config("participants = [\"b\", \"a\"]\n[participant.z]\nproduct = \"codex\"\n[participant.a]\ntier = \"luna\"\n");
+        assert_eq!(c.participant_names(), vec!["b", "a", "z"]);
+        assert!(c.knows("z") && c.knows("a") && !c.knows("q"));
+    }
+
+    #[test]
+    fn tokens_are_short_lowercase_words() {
+        for ok in ["claude", "codex", "luna", "gpt-6_luna", "a", "0x"] {
+            assert!(valid_token(ok), "{ok}");
+        }
+        for bad in ["", "Claude", "-lead", "has space", "ü", &"x".repeat(33)] {
+            assert!(!valid_token(bad), "{bad:?}");
+        }
+        let bad: Config = toml::from_str("[participant.c1]\nproduct = \"Claude\"\n").unwrap();
+        assert!(bad.validate().unwrap_err().contains("participant.c1.product"));
+        assert!(toml::from_str::<Config>("[participant.c1]\nmodel = \"x\"\n").is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn push_is_reachable_with_an_endpoint_and_pull_with_a_watcher() {
+        let c = config(
+            "participants = [\"c1\", \"x1\", \"x2\", \"c2\"]\n[participant.c1]\nproduct = \"claude\"\ntier = \"luna\"\n[participant.x1]\nproduct = \"codex\"\n[participant.x2]\nproduct = \"codex\"\n",
+        );
+        let rows = directory(&c, &[endpoint("x1")], &[watcher("c1", 50), watcher("c1", 10)]);
+        let by = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+        let (c1, x1, x2, c2) = (by("c1"), by("x1"), by("x2"), by("c2"));
+        assert!(c1.reachable && c1.transport == "pull" && c1.watchers == 2 && c1.watching_since_ms == Some(10));
+        assert_eq!(
+            (c1.product.as_deref(), c1.tier.as_deref(), c1.expected_transport.as_deref()),
+            (Some("claude"), Some("luna"), Some("pull"))
+        );
+        assert!(x1.reachable && x1.transport == "push" && x1.session.as_deref() == Some("s-x1"));
+        assert!(
+            !x2.reachable && x2.transport == "pull" && x2.expected_transport.as_deref() == Some("push"),
+            "a codex with no endpoint is unreachable"
+        );
+        assert!(!c2.reachable && c2.product.is_none() && c2.expected_transport.is_none());
     }
 }

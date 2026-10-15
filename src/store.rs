@@ -609,6 +609,7 @@ impl Store {
         ))?;
         let attempts = stmt.query_map(params![who, conversation, limit], attempt_row)?.collect::<std::result::Result<_, _>>()?;
         Ok(StatusView {
+            participants: Vec::new(),
             store_id: self.store_id()?,
             head_seq: self.head_seq()?,
             unacknowledged: unack,
