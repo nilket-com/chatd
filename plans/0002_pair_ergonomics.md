@@ -75,3 +75,24 @@ Decision (Codex review of 01e6ea9, P2): `exclusive` binds only the watch that re
 registration. A later plain watch is still admitted and warns, because refusing it would block a
 one-shot manual `wait` next to a standing exclusive Monitor. If a stronger guarantee is wanted, track
 the bit in WatcherView and refuse overlapping registrations while it is set.
+
+## Spike: is a `codex queue` equivalent for Claude patchable from outside? (2026-10-15)
+
+Throwaway background session (`claude --bg`, Haiku, text only), driven three ways:
+
+- `claude --bg --resume <session-id> "msg"` does NOT append to a live session. With the short id or
+  the full id, on an idle background session, it starts a COPY ("session ... is already running in
+  the background, so this started a copy"). Not a queue equivalent. (Stray copies were stopped and
+  removed.)
+- `SendMessage` from another Claude session DOES wake an idle session: the idle background session
+  took the message, answered, and its reply arrived in the sender's conversation as a cross-session
+  message while the sender was mid-turn. `notify_when_idle` is available. Sender must be a Claude
+  session; chatd is not one.
+- Transport: each session listens on a Unix socket under `/run/user/<uid>/cc-socks/<pid>.sock`
+  (the reply's `from` was `uds:/run/user/1000/cc-socks/<pid>.sock`). Its protocol is undocumented
+  and was NOT probed. A chatd adapter that wrote to it would depend on a private interface and would
+  inject text into a session as a trusted "teammate" message, so it needs an explicit decision, not an
+  incidental one.
+
+Consequence for graphs: two Claude sessions can already wake each other natively. chatd still adds
+durability, acks, retry-safe keys and Codex in the same conversation, which SendMessage does not.
