@@ -106,15 +106,22 @@ enum Cmd {
         /// Refuse to start (exit 7) if another watcher of this participant overlaps this one.
         #[arg(long)]
         exclusive: bool,
-        /// Print one compact JSON line per message with its body (sender, conversation, kind, summary,
-        /// body, ...) instead of a notification line, so no follow-up `receive` is needed. Bodies over
-        /// 16 KiB are cut and flagged `truncated`; the line names the `take` command for the rest.
+        /// Print one compact JSON line per message with its body (id, seq, from, conversation, kind,
+        /// reply_to, summary, truncated, body_bytes, body) instead of a notification line, so no
+        /// follow-up `receive` is needed. The whole line is kept within --max-line bytes: a longer body is
+        /// cut and `truncated` is set (it comes before the body, so a consumer that cuts the tail still
+        /// sees it); fetch the rest with `chatctl take --as X --id ID`.
         #[arg(long)]
         full: bool,
-        /// With --full: acknowledge each message only after its line has been written and flushed. Without
-        /// it nothing is acknowledged and a reconnect replays unacknowledged messages.
+        /// With --full: acknowledge each message only after its line has been written and flushed, and
+        /// only when it was shown whole (a truncated message stays unacknowledged for an explicit `take`).
+        /// Without it nothing is acknowledged and a reconnect replays unacknowledged messages.
         #[arg(long, requires = "full")]
         take: bool,
+        /// With --full: the longest line to print, in bytes. Claude Code's Monitor shows 500 characters per
+        /// event and cuts the rest, hence the default.
+        #[arg(long, requires = "full", default_value_t = 480, value_parser = clap::value_parser!(u32).range(300..=65536))]
+        max_line: u32,
     },
     /// Stream this participant's events as JSON lines (server-pushed; resumable).
     Watch {
@@ -383,10 +390,8 @@ fn emit(line: &str) {
 #[derive(Clone, Copy)]
 enum Announce {
     Line,
-    Full { take: bool },
+    Full { take: bool, max_line: usize },
 }
-
-const MAX_FULL_BODY: usize = 16 * 1024;
 
 /// The longest prefix of `s` that is at most `max` bytes and ends on a character boundary.
 fn cut(s: &str, max: usize) -> &str {
@@ -397,24 +402,64 @@ fn cut(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// Field order matters: a consumer that cuts a line cuts its tail, so everything that says how to read
+/// the message comes before the body.
 #[derive(serde::Serialize)]
 struct FullLine<'a> {
     id: &'a str,
     seq: i64,
     from: &'a str,
-    to: &'a str,
     conversation: &'a str,
     kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reply_to: Option<&'a str>,
     summary: &'a str,
-    created_at_ms: i64,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+    body_bytes: Option<usize>,
     /// None when the body could not be fetched (see `error`).
     body: Option<&'a str>,
-    truncated: bool,
-    body_bytes: Option<usize>,
-    error: Option<String>,
-    /// The command that returns the whole message (and acknowledges it).
-    take: String,
+}
+
+/// The line for `m` within `max_line` bytes, and whether the BODY was cut to fit. The summary (up to 160
+/// characters, by default a prefix of the body) is shown to at most 100 characters and is not part of
+/// that: `truncated` says whether the message itself was seen whole, and decides whether `--take` may ack. The body shrinks until
+/// the whole serialized line (escaping included) fits; if even an empty body does not fit, the line is
+/// returned as is with `truncated` set.
+fn fit(m: &MessageView, error: Option<&str>, body: Option<&str>, max_line: usize) -> (String, bool) {
+    let summary = cut(&m.summary, 100);
+    let make = |text: Option<&str>, truncated: bool| {
+        let line = FullLine {
+            id: &m.id,
+            seq: m.seq,
+            from: &m.sender,
+            conversation: &m.conversation,
+            kind: m.kind.as_str(),
+            reply_to: m.reply_to.as_deref(),
+            summary,
+            truncated,
+            error,
+            body_bytes: body.map(str::len),
+            body: text,
+        };
+        serde_json::to_string(&line).unwrap_or_default()
+    };
+    let Some(b) = body else { return (make(None, false), false) };
+    let whole = make(Some(b), false);
+    if whole.len() <= max_line {
+        return (whole, false);
+    }
+    let mut keep = cut(b, max_line).to_string();
+    loop {
+        let line = make(Some(&keep), true);
+        if line.len() <= max_line || keep.is_empty() {
+            return (line, true);
+        }
+        // Escaping can grow one character up to six bytes, so shed a sixth of the excess at least.
+        let shed = (line.len() - max_line).div_ceil(6).max(1);
+        keep = cut(&keep, keep.len().saturating_sub(shed)).to_string();
+    }
 }
 
 /// A message's body, fetched over its own short connection (the watch connection is a stream).
@@ -430,36 +475,20 @@ fn fetch(who: &str, id: &str) -> Result<MessageView, String> {
 
 /// Report one message. Returns an exit code only when the output itself is broken: then nothing more
 /// is printed or acknowledged. In `--take` mode the acknowledgement follows a successful flush and
-/// only when the body was fetched. An acknowledgement whose result is unknown (the response may have been
+/// only when the body was fetched and shown whole: a message that was cut, or whose body could not be
+/// fetched, stays unacknowledged. An acknowledgement whose result is unknown (the response may have been
 /// lost after the commit) is reported and the message may replay: delivery is at-least-once.
 fn announce(who: &str, m: &MessageView, mode: Announce) -> Option<ExitCode> {
-    let Announce::Full { take } = mode else {
+    let Announce::Full { take, max_line } = mode else {
         emit(&text::notification(m, who, now_ms()));
         return None;
     };
     let fetched = fetch(who, &m.id);
     let (body, error) = match &fetched {
         Ok(full) => (full.body.as_deref(), None),
-        Err(e) => (None, Some(e.clone())),
+        Err(e) => (None, Some(e.as_str())),
     };
-    let shown = body.map(|b| cut(b, MAX_FULL_BODY));
-    let line = FullLine {
-        id: &m.id,
-        seq: m.seq,
-        from: &m.sender,
-        to: who,
-        conversation: &m.conversation,
-        kind: m.kind.as_str(),
-        reply_to: m.reply_to.as_deref(),
-        summary: &m.summary,
-        created_at_ms: m.created_at_ms,
-        body: shown,
-        truncated: matches!((body, shown), (Some(b), Some(s)) if s.len() < b.len()),
-        body_bytes: body.map(str::len),
-        error,
-        take: format!("chatctl take --as {who} --id {}", m.id),
-    };
-    let mut out = serde_json::to_string(&line).unwrap_or_default();
+    let (mut out, truncated) = fit(m, error, body, max_line);
     out.push('\n');
     let written = {
         let mut stdout = io::stdout().lock();
@@ -469,11 +498,12 @@ fn announce(who: &str, m: &MessageView, mode: Announce) -> Option<ExitCode> {
         eprintln!("chatctl: could not write the message ({e}); not acknowledged");
         return Some(ExitCode::FAILURE);
     }
-    if take && fetched.is_ok() {
-        match call_quiet(Request::Ack { as_: who.to_string(), ids: vec![m.id.clone()] }) {
-            Ok(()) => {}
-            Err(e) => eprintln!("chatctl: could not confirm the acknowledgement of {} ({e}); it may replay, check `chatctl status`", m.id),
-        }
+    if take
+        && fetched.is_ok()
+        && !truncated
+        && let Err(e) = call_quiet(Request::Ack { as_: who.to_string(), ids: vec![m.id.clone()] })
+    {
+        eprintln!("chatctl: could not confirm the acknowledgement of {} ({e}); it may replay, check `chatctl status`", m.id);
     }
     None
 }
@@ -790,8 +820,8 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                 println!("acknowledged {} (already {})", acknowledged.len(), already.len());
             }
         }
-        Cmd::Wait { who, conversation, timeout, follow, exclusive, full, take } => {
-            let mode = if full { Announce::Full { take } } else { Announce::Line };
+        Cmd::Wait { who, conversation, timeout, follow, exclusive, full, take, max_line } => {
+            let mode = if full { Announce::Full { take, max_line: max_line as usize } } else { Announce::Line };
             return match wait(&who, conversation, timeout, follow, exclusive, mode) {
                 c if c == ExitCode::SUCCESS => Ok(()),
                 c => Err(c),
@@ -938,7 +968,60 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_watchers, cut, wait_seconds};
+    use super::{check_watchers, cut, fit, wait_seconds};
+    use chatd::proto::{Kind, MessageView};
+
+    fn view(summary: &str) -> MessageView {
+        MessageView {
+            id: "01a14144-fc6c-71d9-9a24-89df2b141369".into(),
+            seq: 123,
+            conversation: "chatd-ergonomics-pairs".into(),
+            sender: "codex".into(),
+            recipient: "claude".into(),
+            kind: Kind::Request,
+            reply_to: Some("01a14144-fc6c-71d9-9a24-89df2b141000".into()),
+            summary: summary.into(),
+            created_at_ms: 0,
+            idempotency_key: String::new(),
+            body: None,
+            received_at_ms: None,
+            answered_by: None,
+        }
+    }
+
+    #[test]
+    fn fit_keeps_every_line_within_its_budget_whatever_the_body() {
+        let m = view("a summary");
+        for body in ["", "short", &"é".repeat(5000), &"\"\n\\".repeat(5000), &"\u{1F600}".repeat(3000), &"\u{1}".repeat(3000)] {
+            // The fixed fields come first and are never cut, so a line exceeds its budget only when they alone do.
+            let fixed = fit(&m, None, Some(""), usize::MAX).0.len();
+            for max in [300usize, 480, 1000, 65536] {
+                let (line, truncated) = fit(&m, None, Some(body), max);
+                assert!(line.len() <= max.max(fixed), "{} > {max} (fixed fields {fixed})", line.len());
+                let v: serde_json::Value = serde_json::from_str(&line).expect("always valid JSON");
+                assert_eq!(v["truncated"], truncated);
+                assert!(body.starts_with(v["body"].as_str().unwrap()), "prefix only");
+                if !truncated {
+                    assert_eq!(v["body"], body);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_message_is_whole_and_a_missing_body_is_reported() {
+        let (line, truncated) = fit(&view("s"), None, Some("hi"), 480);
+        assert!(!truncated && line.contains(r#""body":"hi""#));
+        let (line, truncated) = fit(&view("s"), Some("NotFound: gone"), None, 480);
+        assert!(!truncated && line.contains(r#""error":"NotFound: gone""#) && line.contains(r#""body":null"#));
+    }
+
+    #[test]
+    fn a_long_summary_is_shortened_but_does_not_make_the_message_truncated() {
+        let (line, truncated) = fit(&view(&"s".repeat(160)), None, Some("hi"), 480);
+        assert!(!truncated, "the body was shown whole");
+        assert!(line.len() <= 480 && line.contains(&"s".repeat(100)) && !line.contains(&"s".repeat(101)));
+    }
 
     #[test]
     fn cut_never_splits_a_character() {

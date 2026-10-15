@@ -46,15 +46,20 @@ Shortcuts (plan 0002):
   disk) leaves it unacknowledged. Acknowledging still means received, not done.
 
 - Streaming whole messages: `chatctl wait --as X --follow --full` prints one compact JSON line per
-  message (id, seq, from, to, conversation, kind, reply_to, summary, created_at_ms, body, truncated,
-  body_bytes, error, take), so a Monitor event carries the message and no `receive` is needed. Bodies
-  over 16 KiB are cut on a character boundary with `truncated: true` and the `take` command for the
-  rest. Nothing is acknowledged by default, so a reconnect replays unacknowledged messages. Add
-  `--take` to acknowledge each message after its line has been written and flushed (never before,
-  and not when the body could not be fetched). Delivery is at-least-once: without `--take` a
+  message (id, seq, from, conversation, kind, reply_to, summary, truncated, error, body_bytes, body), so
+  a Monitor event carries the message and no `receive` is needed. The whole line stays within
+  `--max-line` bytes (default 480, minimum 300): Claude Code's Monitor shows 500 characters per event
+  and cuts the rest, so everything that says how to read the message comes BEFORE the body. A longer
+  body is shortened on a character boundary and `truncated` is true; fetch it with
+  `chatctl take --as X --id ID`. (The summary is shown to 100 characters and does not count as
+  truncation. A line exceeds the budget only if its fixed fields alone do.) Nothing is acknowledged by
+  default, so a reconnect replays unacknowledged messages. Add `--take` to acknowledge each message
+  after its line has been written and flushed, and only when it was fetched and shown whole: a cut
+  message stays unacknowledged for an explicit `take`. Delivery is at-least-once: without `--take` a
   reconnect repeats unacknowledged ids, and with it a crash after the line but before a committed
   acknowledgement can too, as can an acknowledgement whose response was lost (reported on stderr; check
-  `chatctl status`). A consumer with side effects should deduplicate on `id`. `--take` requires `--full`.
+  `chatctl status`). A consumer with side effects should deduplicate on `id`. `--take` and `--max-line`
+  require `--full`.
 - Duplicate watchers: `wait`/`watch` warn on stderr when another watcher of the same participant
   overlaps (every watcher prints each notification). `--exclusive` refuses instead, with exit 7 and a
   `Conflict`; the count and the registration are one step, so racing exclusive watchers admit exactly

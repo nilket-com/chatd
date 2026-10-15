@@ -105,3 +105,9 @@ message (the watch stream carries none). Acknowledgement stays opt-in and happen
 line is flushed, the same ordering as `take`, so a crash between seeing and handling a message
 leaves it unacknowledged and replayed. Motivation: the Monitor is the only way events reach Claude
 between tool calls, and one line per event means a body must be a single line.
+
+Correction to cut 3 (found live, 2026-10-15): the Claude Code Monitor shows only 500 characters of an
+event, not 16 KiB. The first `--full` put `truncated`, `body_bytes` and the `take` hint AFTER the body,
+so a cut line hid them, and `--take` would have acknowledged a message whose tail was never seen. Fixed:
+the line is built to fit `--max-line` (default 480 bytes), flags precede the body, and `--take`
+acknowledges only messages shown whole.

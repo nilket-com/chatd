@@ -1730,11 +1730,16 @@ fn the_first_watch_reports_zero_other_watchers_on_the_wire() {
 
 // ---- plan 0002: wait --follow --full [--take] ----
 
-fn first_json_line(child: &mut Child) -> serde_json::Value {
+fn first_raw_line(child: &mut Child) -> String {
     let mut line = String::new();
     std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.as_mut().unwrap()), &mut line).unwrap();
     assert!(!line.is_empty(), "the stream ended before a message");
-    serde_json::from_str(line.trim_end()).unwrap_or_else(|e| panic!("not one JSON line ({e}): {line:?}"))
+    line.trim_end().to_string()
+}
+
+fn first_json_line(child: &mut Child) -> serde_json::Value {
+    let line = first_raw_line(child);
+    serde_json::from_str(&line).unwrap_or_else(|e| panic!("not one JSON line ({e}): {line:?}"))
 }
 
 #[test]
@@ -1747,12 +1752,10 @@ fn full_streams_the_whole_message_as_one_line_and_acknowledges_nothing() {
     let v = first_json_line(&mut w);
     assert_eq!(v["id"], id.as_str());
     assert_eq!(v["from"], "codex");
-    assert_eq!(v["to"], "claude");
     assert_eq!(v["conversation"], "conv");
     assert_eq!(v["kind"], "request");
     assert_eq!(v["body"], "line one\nline two \"quoted\" ünïcode");
     assert_eq!(v["truncated"], false);
-    assert_eq!(v["take"], format!("chatctl take --as claude --id {id}"));
     assert_eq!(e.status(Some("claude")).unacknowledged.len(), 1, "without --take nothing is acknowledged");
     let _ = finish(w);
     let mut again = e.spawn_wait(&["--full"]);
@@ -1780,19 +1783,62 @@ fn full_with_take_acknowledges_after_the_line_is_written() {
 }
 
 #[test]
-fn a_long_body_is_cut_on_a_character_boundary_and_flagged() {
+fn a_line_always_fits_its_budget_and_says_it_was_cut_before_the_body() {
     let mut e = Env::standard();
     e.start();
-    let body = "é".repeat(40_000); // 80,000 bytes
+    // Escape-heavy and multi-byte: every quote and newline doubles in JSON, every é is two bytes.
+    let body = "é\"\n".repeat(20_000);
     let id = e.send("codex", "claude", "conv", Kind::Info, "big", &body);
     let mut w = e.spawn_wait(&["--full"]);
-    let v = first_json_line(&mut w);
+    let raw = first_raw_line(&mut w);
+    let _ = finish(w);
+    assert!(raw.len() <= 480, "{} bytes", raw.len());
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(v["id"], id.as_str());
     assert_eq!(v["truncated"], true);
-    assert_eq!(v["body_bytes"], 80_000);
-    let shown = v["body"].as_str().unwrap();
-    assert!(shown.len() <= 16 * 1024 && shown.chars().all(|c| c == 'é'), "{} bytes", shown.len());
-    assert!(v["take"].as_str().unwrap().contains(&id));
+    assert_eq!(v["body_bytes"], body.len());
+    assert!(raw.find("\"truncated\"").unwrap() < raw.find("\"body\":").unwrap(), "the flag survives a cut tail: {raw}");
+    assert!(body.starts_with(v["body"].as_str().unwrap()), "the body shown is a prefix");
+}
+
+#[test]
+fn max_line_widens_or_narrows_the_budget() {
+    let mut e = Env::standard();
+    e.start();
+    let body = "x".repeat(2_000);
+    e.send("codex", "claude", "conv", Kind::Info, "m1", &body);
+    let mut wide = e.spawn_wait(&["--full", "--max-line", "4000"]);
+    let v = first_json_line(&mut wide);
+    assert_eq!(v["truncated"], false);
+    assert_eq!(v["body"].as_str().unwrap().len(), 2_000);
+    let _ = finish(wide);
+    let mut narrow = e.spawn_wait(&["--full", "--max-line", "300"]);
+    let raw = first_raw_line(&mut narrow);
+    let _ = finish(narrow);
+    assert!(raw.len() <= 300, "{} bytes", raw.len());
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap()["truncated"], true);
+}
+
+#[test]
+fn take_acknowledges_only_messages_shown_whole() {
+    let mut e = Env::standard();
+    e.start();
+    let long = e.send("codex", "claude", "conv", Kind::Request, "tl", &"y".repeat(5_000));
+    let short = e.send("codex", "claude", "conv", Kind::Request, "ts", "short");
+    let mut w = e.spawn_wait(&["--full", "--take"]);
+    let (a, b) = (first_json_line(&mut w), first_json_line(&mut w));
+    let (cut_one, whole_one) = if a["id"] == long.as_str() { (a, b) } else { (b, a) };
+    assert_eq!(cut_one["truncated"], true);
+    assert_eq!(whole_one["id"], short.as_str());
+    let t0 = Instant::now();
+    while e.status(Some("claude")).unacknowledged.len() != 1 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "the whole message was never acknowledged");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let left = e.status(Some("claude")).unacknowledged;
+    assert_eq!(left.len(), 1, "only the cut message remains");
+    assert_eq!(left[0].id, long);
     let _ = finish(w);
 }
 
