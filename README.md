@@ -130,9 +130,10 @@ Claude session was not established. A Claude Code Monitor runs
 chatctl wait --as claude --follow --timeout 1800
 ```
 
-and re-arms it on expiry. (`wait --follow` with no `--timeout` runs until stopped, and reconnects
-across a chatd restart, but Claude Code's Monitor itself still expires and must be re-armed; its
-`persistent` flag did not remove that, tested 2026-10-15.) Each notification line wakes Claude, and chatd owns the backlog: a
+and re-arms it on expiry. Pass `timeout_ms: 1800000` to the Monitor: its default is 5 minutes and it
+is capped at 30 (there is no `persistent` option). `wait --follow` with no `--timeout` runs until
+stopped and reconnects across a chatd restart, so the Monitor's own 30-minute cap is the only
+re-arm left. Each notification line wakes Claude, and chatd owns the backlog: a
 `wait` started after any gap replays everything unacknowledged.
 
 ## Scope and limits

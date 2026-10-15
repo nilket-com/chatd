@@ -1,6 +1,6 @@
 # 0002: Codex-Claude pair ergonomics
 
-Status: implemented on main (items 1-4) after Codex review in the `chatd-ergonomics-pairs` conversation. Item 1 fixes chatctl's deadline only; the Claude Code Monitor still expires.
+Status: implemented on main (items 1-4) after Codex review in the `chatd-ergonomics-pairs` conversation. Item 1 removes chatctl's deadline; the Claude Code Monitor is capped at 30 minutes.
 Scope: a two-agent pair (Claude + Codex) on one host. Three-agent graphs are deferred until this is smooth.
 
 ## Observed friction
@@ -17,19 +17,14 @@ Scope: a two-agent pair (Claude + Codex) on one host. Three-agent graphs are def
 
 ## Proposals
 
-### 1. Persistent wake-up (not solved by the Monitor flag)
-Tested 2026-10-15: starting the Claude Code Monitor with `persistent: true` and
-`chatctl wait --as claude --follow` (no `--timeout`) still reported "expires in 5m". The flag did not
-remove the expiry, so this is NOT a no-code fix; the earlier draft of this item was wrong.
-Codex's source review (src/bin/chatctl.rs) found the cause: `--timeout` is a `u64` defaulting to
-1800 and `wait()` always computes a fixed deadline, so `--follow` is never unbounded. Follow mode
-does reconnect after a chatd restart while that deadline remains (it retries failed connects and
-interrupted watches, then registers a fresh watch with no resume token; the initial snapshot
-replays the unacknowledged inbox).
-Proposed change: in follow mode, an omitted `--timeout` (or `0`) means unbounded. Then a Monitor
-running `chatctl wait --as claude --follow` still ends only when the Monitor itself expires, so the
-Claude Code side of the re-arm remains separate from chatd's. Verify after the change: a watcher
-survives 45+ minutes and a `systemctl --user restart chatd`.
+### 1. Untimed follow (chatctl) and the Monitor cap (Claude Code)
+chatctl: `wait --follow` with no `--timeout` (or `0`) has no deadline and reconnects across a chatd
+restart (Codex's review of src/bin/chatctl.rs: the old default was a fixed 1800 s deadline).
+Claude Code's Monitor is a separate limit: `timeout_ms` defaults to 5 minutes and is capped at 30;
+the tool has no `persistent` option. An earlier draft of this note claimed the flag was tried and
+did not help; that was wrong (the flag does not exist and the 5 minutes was the default). Use
+`timeout_ms: 1800000` and re-arm every 30 minutes. Verified 2026-10-15: that setting reports
+"expires in 30m".
 
 ### 2. Default participant
 Give `who` clap's `env = "CHATD_AS"` so `export CHATD_AS=claude` removes the flag. An explicit `--as`
