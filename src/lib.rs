@@ -2,6 +2,7 @@
 
 pub mod adapter;
 pub mod client;
+pub mod health;
 pub mod hub;
 pub mod journal;
 pub mod legacy;

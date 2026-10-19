@@ -57,8 +57,10 @@ impl Daemon {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("run")).unwrap();
         let list = names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
-        let mut config =
-            format!("participants = [{list}]\nheartbeat_ms = 300\nadapter_timeout_ms = 3000\nretry_backoff_ms = [100, 100, 100]\n");
+        // Health notices would be extra traffic in the inboxes these scenarios count; health has its own tests.
+        let mut config = format!(
+            "participants = [{list}]\nheartbeat_ms = 300\nadapter_timeout_ms = 3000\nretry_backoff_ms = [100, 100, 100]\nhealth_interval_ms = 0\n"
+        );
         for (i, (name, product)) in specs.iter().enumerate() {
             config.push_str(&format!("[participant.{name}]\nproduct = \"{}\"\ntier = \"{}\"\n", product.token(), TIERS[i % TIERS.len()]));
         }

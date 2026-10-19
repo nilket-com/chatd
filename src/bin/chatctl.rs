@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 
 use chatd::client::{Client, ClientError};
-use chatd::proto::{ErrorCode, EventView, Kind, MessageView, Request, Response, SendReq};
+use chatd::proto::{ErrorCode, EventView, HealthState, Kind, MessageView, Request, Response, SendReq};
 use chatd::store::now_ms;
 use chatd::{journal, paths, pending, text};
 
@@ -293,7 +293,20 @@ fn print_receipt(r: &chatd::proto::Receipt, json: bool) -> io::Result<()> {
     out.push('\n');
     let mut stdout = io::stdout().lock();
     stdout.write_all(out.as_bytes())?;
-    stdout.flush()
+    stdout.flush()?;
+    if let Some(w) = &r.warning {
+        eprintln!("chatctl: warning: {w}");
+    }
+    Ok(())
+}
+
+/// `FILTERED (cyber_policy)` with how long it has lasted, or `-` when the participant is not inspected.
+fn health_cell(p: &chatd::proto::ParticipantView) -> String {
+    match &p.health {
+        Some(h) if h.state == HealthState::Ok => "OK".into(),
+        Some(h) => format!("{} {}", h.label(), age(now_ms() - h.since_ms)),
+        None => "-".into(),
+    }
 }
 
 /// Print the receipt, and only then forget the pending key. If the receipt cannot be written the
@@ -905,6 +918,17 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                     w.last_event_seq
                 );
             }
+            if let Some(participants) = &s.participants {
+                println!("health:");
+                for p in participants {
+                    println!(
+                        "  {:<12} {}{}",
+                        p.name,
+                        health_cell(p),
+                        p.health.as_ref().map(|h| format!("  (checked {} ago)", age(now_ms() - h.checked_at_ms))).unwrap_or_default()
+                    );
+                }
+            }
         }
         Cmd::Peers => {
             let Response::Status(s) =
@@ -920,7 +944,10 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                 print_json(&participants);
                 return Ok(());
             }
-            println!("{:<12} {:<8} {:<10} {:<9} {:<5} {:<9} NOTE", "PARTICIPANT", "PRODUCT", "TIER", "TRANSPORT", "PATH", "WATCHING");
+            println!(
+                "{:<12} {:<8} {:<10} {:<9} {:<5} {:<9} {:<28} NOTE",
+                "PARTICIPANT", "PRODUCT", "TIER", "TRANSPORT", "PATH", "WATCHING", "HEALTH"
+            );
             for p in &participants {
                 let note = match (&p.expected_transport, p.path_ready) {
                     (Some(e), _) if *e != p.transport => format!(
@@ -932,13 +959,14 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                     _ => String::new(),
                 };
                 println!(
-                    "{:<12} {:<8} {:<10} {:<9} {:<5} {:<9} {}",
+                    "{:<12} {:<8} {:<10} {:<9} {:<5} {:<9} {:<28} {}",
                     p.name,
                     p.product.as_deref().unwrap_or("-"),
                     p.tier.as_deref().unwrap_or("-"),
                     p.transport,
                     if p.path_ready { "yes" } else { "no" },
                     p.watching_since_ms.map(|t| age(now_ms() - t)).unwrap_or_else(|| "-".into()),
+                    health_cell(p),
                     note
                 );
             }

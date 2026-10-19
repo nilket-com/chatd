@@ -15,11 +15,11 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::proto::{
-    ClientFrame, EndpointView, ErrorCode, EventView, MAX_PAGE, PROTOCOL_VERSION, ParticipantView, Request, Response, ServerFrame,
-    WatcherView, read_frame, write_frame,
+    ClientFrame, EndpointView, ErrorCode, EventView, HealthView, MAX_PAGE, PROTOCOL_VERSION, ParticipantView, Request, Response,
+    ServerFrame, WatcherView, read_frame, write_frame,
 };
-use crate::store::{Store, StoreError, now_ms};
-use crate::{adapter, hub::Hub, journal, legacy, notify};
+use crate::store::{SYSTEM_SENDER, Store, StoreError, now_ms};
+use crate::{adapter, health, hub::Hub, journal, legacy, notify};
 
 pub const MAX_CONNECTIONS: usize = 64;
 pub const WATCH_BATCH: u32 = 256;
@@ -45,6 +45,16 @@ pub struct Config {
     /// Backoff after the 1st, 2nd, ... failed submission of one message.
     #[serde(default = "default_retry_backoff_ms")]
     pub retry_backoff_ms: Vec<u64>,
+    /// How often each inspected participant's session log is checked (`health.rs`); 0 turns the check off.
+    #[serde(default = "default_health_interval_ms")]
+    pub health_interval_ms: u64,
+    /// A participant whose log has not been written for this long while requests addressed to it are
+    /// unanswered is STALLED.
+    #[serde(default = "default_health_stall_ms")]
+    pub health_stall_ms: u64,
+    /// Where Codex keeps its session logs; default `$CODEX_HOME/sessions`, else `~/.codex/sessions`.
+    #[serde(default)]
+    pub codex_sessions_dir: Option<PathBuf>,
 }
 
 fn default_participants() -> Vec<String> {
@@ -62,6 +72,12 @@ fn default_adapter_timeout_ms() -> u64 {
 fn default_retry_backoff_ms() -> Vec<u64> {
     crate::store::RETRY_BACKOFF_MS.to_vec()
 }
+fn default_health_interval_ms() -> u64 {
+    5 * 60_000
+}
+fn default_health_stall_ms() -> u64 {
+    30 * 60_000
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -72,6 +88,9 @@ impl Default for Config {
             write_deadline_ms: default_write_deadline_ms(),
             adapter_timeout_ms: default_adapter_timeout_ms(),
             retry_backoff_ms: default_retry_backoff_ms(),
+            health_interval_ms: default_health_interval_ms(),
+            health_stall_ms: default_health_stall_ms(),
+            codex_sessions_dir: None,
         }
     }
 }
@@ -120,11 +139,25 @@ impl Config {
         names
     }
 
+    /// The Codex sessions directory (see `codex_sessions_dir`).
+    pub fn codex_sessions(&self) -> PathBuf {
+        if let Some(d) = &self.codex_sessions_dir {
+            return d.clone();
+        }
+        match std::env::var_os("CODEX_HOME") {
+            Some(h) if !h.is_empty() => PathBuf::from(h).join("sessions"),
+            _ => PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into())).join(".codex").join("sessions"),
+        }
+    }
+
     pub fn knows(&self, who: &str) -> bool {
         self.participants.iter().any(|p| p == who) || self.participant.contains_key(who)
     }
 
     fn validate(&self) -> Result<(), String> {
+        if self.participant_names().iter().any(|n| n == SYSTEM_SENDER) {
+            return Err(format!("{SYSTEM_SENDER:?} is reserved for the daemon's own notices and cannot be a participant"));
+        }
         for (name, conf) in &self.participant {
             for (field, value) in [("product", &conf.product), ("tier", &conf.tier)] {
                 if let Some(v) = value
@@ -141,7 +174,12 @@ impl Config {
 }
 
 /// The directory: every participant, how it is configured, and whether a delivery path is in place now.
-pub fn directory(config: &Config, endpoints: &[EndpointView], watchers: &[WatcherView]) -> Vec<ParticipantView> {
+pub fn directory(
+    config: &Config,
+    endpoints: &[EndpointView],
+    watchers: &[WatcherView],
+    health: &BTreeMap<String, HealthView>,
+) -> Vec<ParticipantView> {
     config
         .participant_names()
         .into_iter()
@@ -160,6 +198,7 @@ pub fn directory(config: &Config, endpoints: &[EndpointView], watchers: &[Watche
                 watchers: mine.len() as u32,
                 watching_since_ms: mine.iter().map(|w| w.connected_at_ms).min(),
                 session: endpoint.map(|e| e.session.clone()),
+                health: health.get(&name).cloned(),
                 transport: transport.to_string(),
                 expected_transport: expected,
                 product: conf.product,
@@ -179,6 +218,8 @@ pub struct Shared {
     pub connections: AtomicUsize,
     pub watchers: Mutex<HashMap<u64, WatcherView>>,
     pub next_watcher: AtomicU64,
+    /// The last health observation per inspected participant (`health.rs`).
+    pub health: Mutex<BTreeMap<String, HealthView>>,
     /// The running adapter child's pid, so shutdown can stop it.
     pub adapter_child: Mutex<Option<u32>>,
     /// Held (flock) for the daemon's lifetime.
@@ -286,6 +327,7 @@ pub fn prepare(config: Config, state_dir: &Path, socket: &Path) -> Result<(Arc<S
         connections: AtomicUsize::new(0),
         watchers: Mutex::new(HashMap::new()),
         next_watcher: AtomicU64::new(1),
+        health: Mutex::new(BTreeMap::new()),
         adapter_child: Mutex::new(None),
         state_lock: lock,
     });
@@ -297,6 +339,10 @@ pub fn serve(shared: Arc<Shared>, listener: UnixListener) -> io::Result<()> {
     {
         let s = shared.clone();
         std::thread::Builder::new().name("adapter".into()).spawn(move || adapter::run(s))?;
+    }
+    if shared.config.health_interval_ms > 0 {
+        let s = shared.clone();
+        std::thread::Builder::new().name("health".into()).spawn(move || health::run(s))?;
     }
     let my_uid = unsafe { libc::getuid() };
     let accept_shared = shared.clone();
@@ -378,7 +424,24 @@ fn handle(shared: &Arc<Shared>, stream: UnixStream) -> io::Result<()> {
     }
 }
 
+/// The name a client used that is reserved for the daemon, if any.
+fn reserved_name(req: &Request) -> Option<&str> {
+    let names: Vec<&str> = match req {
+        Request::Send(r) => [Some(r.from.as_str()), r.to.as_deref()].into_iter().flatten().collect(),
+        Request::Receive { as_, .. } | Request::Ack { as_, .. } => vec![as_.as_str()],
+        Request::EndpointRegister { name, .. } => vec![name.as_str()],
+        _ => Vec::new(),
+    };
+    names.into_iter().find(|n| *n == SYSTEM_SENDER)
+}
+
 fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
+    if let Some(name) = reserved_name(&req) {
+        return Response::Error {
+            code: ErrorCode::BadRequest,
+            message: format!("{name:?} is reserved for the daemon's own notices; it cannot send, receive or be addressed"),
+        };
+    }
     let mut store = match shared.store.lock() {
         Ok(s) => s,
         Err(_) => return Response::Error { code: ErrorCode::Storage, message: "store lock poisoned".into() },
@@ -392,10 +455,12 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
             (Err(e), _) | (_, Err(e)) => err(e),
         },
         Request::Send(req) => match store.send(&req) {
-            Ok(r) => {
+            Ok(mut r) => {
                 wrote = !r.duplicate;
+                let to = store.receive(&req.from, &r.id).map(|m| m.recipient).unwrap_or_default();
+                // Never refuses: a recipient whose last turn failed is still sent to, and the sender is told.
+                r.warning = shared.health.lock().ok().and_then(|h| h.get(&to).and_then(|v| health::send_warning(&to, v)));
                 if !r.duplicate {
-                    let to = store.receive(&req.from, &r.id).map(|m| m.recipient).unwrap_or_default();
                     journal::log(
                         journal::PRIORITY_INFO,
                         &format!("stored {} {} {}->{}", req.kind.as_str(), r.id, req.from, to),
@@ -427,7 +492,8 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
             match store.status(as_.as_deref(), conversation.as_deref(), limit, unacknowledged_after, unanswered_after) {
                 Ok(mut s) => {
                     s.watchers = shared.watchers.lock().map(|w| w.values().cloned().collect()).unwrap_or_default();
-                    s.participants = Some(directory(&shared.config, &s.endpoints, &s.watchers));
+                    let health = shared.health.lock().map(|h| h.clone()).unwrap_or_default();
+                    s.participants = Some(directory(&shared.config, &s.endpoints, &s.watchers, &health));
                     Response::Status(s)
                 }
                 Err(e) => err(e),
@@ -758,10 +824,22 @@ mod directory_tests {
     }
 
     #[test]
+    fn the_system_sender_cannot_be_configured() {
+        for text in ["participants = [\"claude\", \"chatd\"]\n", "[participant.chatd]\nproduct = \"codex\"\n"] {
+            let c: Config = toml::from_str(text).unwrap();
+            assert!(c.validate().unwrap_err().contains("reserved"), "{text}");
+        }
+        let c = config("health_interval_ms = 0\nhealth_stall_ms = 5\ncodex_sessions_dir = \"/x/sessions\"\n");
+        assert_eq!((c.health_interval_ms, c.health_stall_ms, c.codex_sessions()), (0, 5, PathBuf::from("/x/sessions")));
+        let d = Config::default();
+        assert_eq!((d.health_interval_ms, d.health_stall_ms), (300_000, 1_800_000));
+    }
+
+    #[test]
     fn a_duplicate_in_the_list_does_not_make_two_rows() {
         let c = config("participants = [\"a\", \"b\", \"a\"]\n[participant.b]\nproduct = \"claude\"\n");
         assert_eq!(c.participant_names(), vec!["a", "b"]);
-        assert_eq!(directory(&c, &[], &[]).len(), 2);
+        assert_eq!(directory(&c, &[], &[], &BTreeMap::new()).len(), 2);
     }
 
     #[test]
@@ -782,7 +860,7 @@ mod directory_tests {
         let c = config(
             "participants = [\"c1\", \"x1\", \"x2\", \"c2\"]\n[participant.c1]\nproduct = \"claude\"\ntier = \"luna\"\n[participant.x1]\nproduct = \"codex\"\n[participant.x2]\nproduct = \"codex\"\n",
         );
-        let rows = directory(&c, &[endpoint("x1")], &[watcher("c1", 50), watcher("c1", 10)]);
+        let rows = directory(&c, &[endpoint("x1")], &[watcher("c1", 50), watcher("c1", 10)], &BTreeMap::new());
         let by = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
         let (c1, x1, x2, c2) = (by("c1"), by("x1"), by("x2"), by("c2"));
         assert!(c1.path_ready && c1.transport == "pull" && c1.watchers == 2 && c1.watching_since_ms == Some(10));

@@ -26,7 +26,9 @@ impl Env {
         let dir = std::env::temp_dir().join(format!("chatd-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("run")).unwrap();
-        std::fs::write(dir.join("config.toml"), config).unwrap();
+        // Health has its own tests (tests/health.rs); here its notices would be extra inbox traffic and the
+        // check would read the real ~/.codex. Prepended, so the key stays top-level ahead of any table.
+        std::fs::write(dir.join("config.toml"), format!("health_interval_ms = 0\n{config}")).unwrap();
         Env { dir, daemon: None }
     }
 

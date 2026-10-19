@@ -155,6 +155,10 @@ pub struct Receipt {
     pub idempotency_key: String,
     /// True when an identical earlier send was found: the original id is returned.
     pub duplicate: bool,
+    /// Set when the recipient's last observed health is FILTERED or ERRORED. Delivery is never
+    /// refused for it; the sender is told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -240,6 +244,62 @@ pub struct ParticipantView {
     pub watching_since_ms: Option<i64>,
     /// The endpoint's session, for a push participant.
     pub session: Option<String>,
+    /// The last health observation of the participant's session log. Absent when it is not inspected
+    /// (no session to locate, no inspector for its product, or a daemon that predates health).
+    #[serde(default)]
+    pub health: Option<HealthView>,
+}
+
+/// What a participant's session log says, as seen by the daemon's health check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthState {
+    /// The log was found and nothing below applies.
+    Ok,
+    /// The last turn ended with the provider's content filter (`cyber_policy`).
+    Filtered,
+    /// The last turn ended with another error; `detail` names it.
+    Errored,
+    /// No log write for the stall threshold while requests addressed to the participant are unanswered.
+    Stalled,
+    /// The session log was not found.
+    Unknown,
+}
+
+impl HealthState {
+    pub fn label(self) -> &'static str {
+        match self {
+            HealthState::Ok => "OK",
+            HealthState::Filtered => "FILTERED",
+            HealthState::Errored => "ERRORED",
+            HealthState::Stalled => "STALLED",
+            HealthState::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthView {
+    pub state: HealthState,
+    /// The error name for FILTERED and ERRORED (`cyber_policy`, ...); absent otherwise.
+    pub detail: Option<String>,
+    /// When this state began: the failed turn's end, the last log write for STALLED, otherwise when
+    /// the daemon first saw it.
+    pub since_ms: i64,
+    pub checked_at_ms: i64,
+    /// The session log that was read, when one was found.
+    pub log: Option<String>,
+    pub log_modified_ms: Option<i64>,
+}
+
+impl HealthView {
+    /// `FILTERED (cyber_policy)`, `STALLED`, ...
+    pub fn label(&self) -> String {
+        match &self.detail {
+            Some(d) => format!("{} ({d})", self.state.label()),
+            None => self.state.label().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

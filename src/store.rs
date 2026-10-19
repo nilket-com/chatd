@@ -19,6 +19,12 @@ pub const SCHEMA_VERSION: i64 = 1;
 pub const MAX_FAILED_ATTEMPTS: i64 = 3;
 /// Default backoff after the n-th failed submission (1-based), in milliseconds.
 pub const RETRY_BACKOFF_MS: [u64; 3] = [5_000, 30_000, 120_000];
+/// The reserved sender of the daemon's own notices (participant health). It is recorded as a
+/// participant so its messages satisfy the schema, but it is never configured, listed or usable by a
+/// client: no one sends as it, to it, or registers it.
+pub const SYSTEM_SENDER: &str = "chatd";
+/// The conversation the daemon's health notices are stored in.
+pub const HEALTH_CONVERSATION: &str = "health";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreError {
@@ -198,6 +204,7 @@ impl Store {
             }
             tx.execute("INSERT OR IGNORE INTO participants (name) VALUES (?1)", [p])?;
         }
+        tx.execute("INSERT OR IGNORE INTO participants (name) VALUES (?1)", [SYSTEM_SENDER])?;
         tx.commit()?;
         Ok(())
     }
@@ -297,7 +304,7 @@ impl Store {
             None => Ok(None),
             Some(id) => {
                 let m = self.message_row(&id)?.ok_or_else(|| StoreError::new(ErrorCode::Storage, "message vanished"))?;
-                Ok(Some((Receipt { id: m.id.clone(), seq: m.seq, idempotency_key: key.to_string(), duplicate: true }, m)))
+                Ok(Some((Receipt { id: m.id.clone(), seq: m.seq, idempotency_key: key.to_string(), duplicate: true, warning: None }, m)))
             }
         }
     }
@@ -388,33 +395,20 @@ impl Store {
         let id = uuid::Uuid::now_v7().to_string();
         let now = now_ms();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT INTO events (at_ms, kind, audience, message_id, conversation, detail) VALUES (?1, 'message_stored', ?2, ?3, ?4, ?5)",
-            params![
-                now,
-                recipient,
-                id,
-                conversation,
-                json!({"sender": req.from, "kind": req.kind.as_str(), "summary": summary, "reply_to": req.reply_to}).to_string()
-            ],
-        )?;
-        let seq = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO messages (id, seq, conversation, sender, recipient, kind, reply_to, summary, body, idempotency_key, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                id,
-                seq,
-                conversation,
-                req.from,
-                recipient,
-                req.kind.as_str(),
-                req.reply_to,
-                summary,
-                req.body,
-                req.idempotency_key,
-                now
-            ],
+        let seq = insert_message(
+            &tx,
+            &NewMessage {
+                id: &id,
+                from: &req.from,
+                recipient: &recipient,
+                conversation: &conversation,
+                kind: req.kind,
+                reply_to: req.reply_to.as_deref(),
+                summary: &summary,
+                body: &req.body,
+                idempotency_key: &req.idempotency_key,
+            },
+            now,
         )?;
         if let Some(target) = &req.reply_to {
             // A reply acknowledges receipt of the request it answers (idempotent).
@@ -434,7 +428,7 @@ impl Store {
             }
         }
         tx.commit()?;
-        Ok(Receipt { id, seq, idempotency_key: req.idempotency_key.clone(), duplicate: false })
+        Ok(Receipt { id, seq, idempotency_key: req.idempotency_key.clone(), duplicate: false, warning: None })
     }
 
     pub fn lookup(&self, sender: &str, key: &str) -> Result<Receipt> {
@@ -851,10 +845,95 @@ impl Store {
         &mut self.conn
     }
 
+    /// Requests addressed to `recipient` without a stored final reply.
+    pub fn unanswered_to(&self, recipient: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM messages m WHERE m.kind = 'request' AND m.recipient = ?1
+               AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.reply_to = m.id AND r.kind = 'final')",
+            [recipient],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The last health state reported for `subject` (an opaque record written by `health_transition`).
+    pub fn health_record(&self, subject: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT value FROM meta WHERE key = ?1", [format!("health.{subject}")], |r| r.get(0)).optional()?)
+    }
+
+    /// Records `subject`'s new health and stores one info message from SYSTEM_SENDER per notice
+    /// (recipient, summary, body), all in one transaction: a crash never leaves a notice without its
+    /// record (which would repeat it after a restart) or a record without its notices.
+    pub fn health_transition(&mut self, subject: &str, record: &str, notices: &[(String, String, String)]) -> Result<Vec<Receipt>> {
+        let now = now_ms();
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![format!("health.{subject}"), record],
+        )?;
+        let mut receipts = Vec::new();
+        for (recipient, summary, body) in notices {
+            let id = uuid::Uuid::now_v7().to_string();
+            let key = format!("health-{}", uuid::Uuid::new_v4());
+            let summary = text::summary_of(Some(summary), body);
+            let seq = insert_message(
+                &tx,
+                &NewMessage {
+                    id: &id,
+                    from: SYSTEM_SENDER,
+                    recipient,
+                    conversation: HEALTH_CONVERSATION,
+                    kind: Kind::Info,
+                    reply_to: None,
+                    summary: &summary,
+                    body,
+                    idempotency_key: &key,
+                },
+                now,
+            )?;
+            receipts.push(Receipt { id, seq, idempotency_key: key, duplicate: false, warning: None });
+        }
+        tx.commit()?;
+        Ok(receipts)
+    }
+
     pub fn participants(&self) -> Result<BTreeSet<String>> {
         let mut stmt = self.conn.prepare("SELECT name FROM participants")?;
         Ok(stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?)
     }
+}
+
+struct NewMessage<'a> {
+    id: &'a str,
+    from: &'a str,
+    recipient: &'a str,
+    conversation: &'a str,
+    kind: Kind,
+    reply_to: Option<&'a str>,
+    summary: &'a str,
+    body: &'a str,
+    idempotency_key: &'a str,
+}
+
+/// Inserts a validated message and the event that announces it, inside the caller's transaction.
+/// Returns its sequence number.
+fn insert_message(tx: &rusqlite::Transaction<'_>, m: &NewMessage<'_>, now: i64) -> Result<i64> {
+    tx.execute(
+        "INSERT INTO events (at_ms, kind, audience, message_id, conversation, detail) VALUES (?1, 'message_stored', ?2, ?3, ?4, ?5)",
+        params![
+            now,
+            m.recipient,
+            m.id,
+            m.conversation,
+            json!({"sender": m.from, "kind": m.kind.as_str(), "summary": m.summary, "reply_to": m.reply_to}).to_string()
+        ],
+    )?;
+    let seq = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO messages (id, seq, conversation, sender, recipient, kind, reply_to, summary, body, idempotency_key, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![m.id, seq, m.conversation, m.from, m.recipient, m.kind.as_str(), m.reply_to, m.summary, m.body, m.idempotency_key, now],
+    )?;
+    Ok(seq)
 }
 
 /// The retry policy for one message and endpoint (see `Store::due_deliveries`).

@@ -92,6 +92,34 @@ Shortcuts (plan 0002):
   does not use the transport its product normally does (a codex with no endpoint). Name the instance, not
   the model or role, so a model can be swapped and roles can change (plan 0003).
 
+## Participant health
+
+chatd reads the tail of each inspected participant's session log every `health_interval_ms`
+(default 5 minutes; 0 turns it off) and derives a state:
+
+| State | Meaning |
+| --- | --- |
+| OK | the log was found and nothing below applies |
+| FILTERED | the last turn ended with `codex_error_info` `cyber_policy` (the provider's content filter); the agent stays silent after that |
+| ERRORED | the last turn ended with another error, named in the column (`ERRORED (context_window_exceeded)`) |
+| STALLED | no log write for `health_stall_ms` (default 30 minutes) while requests addressed to it have no final reply |
+| UNKNOWN | the session log was not found or could not be read |
+
+A participant is inspected when it has a registered endpoint (its session id locates the log) and an
+inspector exists for its product. Today that is Codex: `rollout-*-<session>.jsonl` under
+`codex_sessions_dir` (default `$CODEX_HOME/sessions`, else `~/.codex/sessions`). Only the last few
+megabytes of a log are ever read; no network or model is involved. Claude participants pull and register no
+session, so they show `-` (see `src/health.rs` for adding another product).
+
+On a change of state, chatd stores one `info` message in conversation `health` from the reserved sender
+`chatd` to every other participant, for example `codex FILTERED (cyber_policy) since 2026-10-19T13:16:36Z`.
+Recovery is reported once (`codex OK since ... (was FILTERED (cyber_policy))`); an unchanged state is never
+repeated, across restarts too (the last reported state is kept in the store). A first observation that is
+OK is not reported. `chatctl peers` and `chatctl status` show a HEALTH column (`health` in `--json`).
+Sending to a FILTERED or ERRORED participant still stores and delivers the message; the receipt carries a
+`warning` and chatctl prints it on stderr. The name `chatd` is reserved: it cannot be configured as a
+participant, sent as or sent to.
+
 ## The states of a message
 
 | State | Meaning |
