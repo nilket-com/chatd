@@ -274,3 +274,36 @@ fn a_session_without_a_log_is_unknown_and_the_system_sender_is_reserved() {
         }
     }
 }
+
+#[test]
+fn a_notice_to_a_push_participant_waits_for_its_next_wake() {
+    let mut e = Env::new(30 * 60_000);
+    let mut config = std::fs::read_to_string(e.dir.join("config.toml")).unwrap();
+    config.insert_str(0, "participants = [\"claude\", \"codex\", \"codex2\"]\n");
+    std::fs::write(e.dir.join("config.toml"), config).unwrap();
+    e.append(OK_TURN);
+    e.start();
+    let log = e.dir.join("codex2-argv.log");
+    let exe = e.dir.join("fake-codex2");
+    std::fs::write(&exe, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\n", log.display())).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = e.call(Request::EndpointRegister { name: "codex2".into(), session: "s2".into(), exe: exe.to_string_lossy().into() });
+    assert!(matches!(r, Response::Registered(_)), "{r:?}");
+    e.register_codex();
+    wait_for("the first check", || e.codex_health() == Some(HealthState::Ok));
+
+    e.append(FILTERED_TURN);
+    wait_for("the FILTERED notice to claude", || e.notices().len() == 1);
+    let queued = || e.status(None).participants.unwrap().into_iter().find(|p| p.name == "codex2").unwrap().queued_for_wake;
+    wait_for("the notice queued for codex2", || queued() == Some(1));
+    several_checks();
+    assert!(!log.exists(), "a health notice (kind info) does not wake a push participant by default");
+
+    let Response::Stored(req) = e.send("claude", "codex2", "wake") else { panic!() };
+    wait_for("the waking push", || std::fs::read_to_string(&log).is_ok_and(|t| t.contains("codex FILTERED (cyber_policy)")));
+    let argv = std::fs::read_to_string(&log).unwrap();
+    assert!(argv.contains(&format!("chatctl receive --as codex2 --id {}", req.id)));
+    assert!(argv.contains("[chatd digest for codex2: 1 queued"), "{argv}");
+    assert!(argv.contains(" chatd health info "), "{argv}");
+    wait_for("the digest recorded", || queued() == Some(0));
+}

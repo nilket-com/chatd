@@ -2,6 +2,10 @@
 //! notification through its queue command. The attempt is persisted before the command starts; the
 //! command runs with direct arguments (no shell), a deadline, and is killed and reaped on expiry or
 //! shutdown. Submission is not receipt: only the recipient's explicit ack is.
+//!
+//! Only messages of a kind in the participant's `wake_kinds` are pushed (each push is a model turn for
+//! the agent). The rest wait, unacknowledged; the next waking push carries them in a digest below its
+//! notification line.
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -31,7 +35,7 @@ pub fn run(shared: Arc<Shared>) {
         // moves the counter past this value, so the wait at the bottom returns at once instead of
         // sleeping through a message the snapshot could not include.
         let head = shared.hub.head();
-        let due = match shared.store.lock().map(|s| s.due_deliveries(now_ms())) {
+        let due = match shared.store.lock().map(|s| s.due_deliveries(now_ms(), &|name| shared.config.wake_kinds(name))) {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
                 journal::log(journal::PRIORITY_ERR, &format!("adapter could not read due deliveries: {e}"), &[]);
@@ -67,9 +71,33 @@ fn deliver(shared: &Arc<Shared>, d: &Delivery) {
         &format!("submitting {} to {} (attempt {attempt}, generation {})", d.message.id, d.endpoint.name, d.endpoint.generation),
         &[fields[0], fields[1], fields[2], ("EVENT", "submission_started")],
     );
-    let line = text::notification(&d.message, &d.endpoint.name, now_ms());
+    // Read after the attempt is recorded, so a digest carried by an earlier push in this pass is not repeated.
+    let kinds = shared.config.wake_kinds(&d.endpoint.name);
+    let queued = match shared
+        .store
+        .lock()
+        .map(|s| s.queued_for_wake(&d.endpoint.name, &kinds, Some(&d.message.id), text::DIGEST_MAX_ITEMS as u32))
+    {
+        Ok(Ok(q)) => q,
+        Ok(Err(e)) => {
+            journal::log(journal::PRIORITY_ERR, &format!("could not read the digest for {}: {e}", d.endpoint.name), &[]);
+            (Vec::new(), 0)
+        }
+        Err(_) => return,
+    };
+    let now = now_ms();
+    let mut line = text::notification(&d.message, &d.endpoint.name, now);
+    let (digest, listed) = text::digest(&queued.0, queued.1, &d.endpoint.name, now);
+    if !digest.is_empty() {
+        line.push('\n');
+        line.push_str(&digest);
+    }
+    let digested: Vec<String> = queued.0.iter().take(listed).map(|m| m.id.clone()).collect();
     let (state, code, error) = run_child(shared, &d.endpoint.exe, &d.endpoint.session, &line);
-    let result = shared.store.lock().map(|mut s| s.finish_attempt(attempt, state, code, error.as_deref(), &shared.config.retry_backoff_ms));
+    let result = shared
+        .store
+        .lock()
+        .map(|mut s| s.finish_attempt(attempt, state, code, error.as_deref(), &shared.config.retry_backoff_ms, &digested));
     if let Ok(Err(e)) = result {
         journal::log(journal::PRIORITY_ERR, &format!("could not record attempt {attempt}'s result: {e}"), &[]);
     }
@@ -77,7 +105,13 @@ fn deliver(shared: &Arc<Shared>, d: &Delivery) {
     let prio = if state == "submitted" { journal::PRIORITY_INFO } else { journal::PRIORITY_WARNING };
     journal::log(
         prio,
-        &format!("submission of {} to {}: {state}{}", d.message.id, d.endpoint.name, error.map(|e| format!(" ({e})")).unwrap_or_default()),
+        &format!(
+            "submission of {} to {}: {state}{}{}",
+            d.message.id,
+            d.endpoint.name,
+            if digested.is_empty() { String::new() } else { format!(" with a digest of {}", digested.len()) },
+            error.map(|e| format!(" ({e})")).unwrap_or_default()
+        ),
         &[fields[0], fields[1], fields[2], ("EVENT", "submission")],
     );
 }

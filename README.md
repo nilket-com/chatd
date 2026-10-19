@@ -196,6 +196,36 @@ A successful `codex queue` means **submitted**, not received. Codex's acknowledg
 receipt. A timeout or a stop mid-submission leaves an **uncertain** attempt, which is never
 repeated automatically (`chatctl redeliver <id>` is explicit).
 
+### Which messages wake a push participant
+
+Every push is a model turn for the agent, so only messages that need action are pushed. By default
+that is `request`. Every other message (progress and final replies, info notes, chatd's health
+notices, which are `info`) is stored and stays unacknowledged, and the next waking push carries it
+in a digest under its usual notification line:
+
+```text
+[chatd 019a… claude->codex adr628 request 0s] Review the patch | chatctl receive --as codex --id 019a…
+[chatd digest for codex: 3 queued, oldest first; not acknowledged: chatctl take --as codex --id ID, or chatctl ack --as codex ID...]
+  0199f… chatd health info 312s: x2 OK since 2026-10-19T13:16:36Z (was STALLED)
+  0199f… claude adr628 final 40s: Accepted; merged
+  019a0… claude adr628 info 5s: FYI the bench numbers are in
+```
+
+A digest lists at most 20 messages and 4 KB, then `+N more (chatctl status --as codex)`; the rest wait
+for the following wake. A message is listed in one submitted digest only; it is not acknowledged by
+it. `chatctl status` shows each push participant's policy and `queued for next wake: N`
+(`wake_kinds` and `queued_for_wake` in `--json`). `chatctl redeliver <id>` pushes a queued message on
+its own. Set the policy per participant:
+
+```toml
+[participant.codex]
+product = "codex"
+wake_kinds = ["request"]   # the default; ["all"] (or every kind listed) pushes everything, as before
+```
+
+The tokens are `request`, `info`, `progress`, `final` and `all`; anything else stops the daemon at
+start. Pull participants are not affected: a watcher sees every message.
+
 ## Connecting Claude (wake-up)
 
 The tested Claude setup uses a Monitor for wake-up. A native injection path into an existing

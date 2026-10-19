@@ -928,6 +928,19 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                         p.health.as_ref().map(|h| format!("  (checked {} ago)", age(now_ms() - h.checked_at_ms))).unwrap_or_default()
                     );
                 }
+                let pushed: Vec<_> = participants.iter().filter(|p| p.wake_kinds.is_some()).collect();
+                if !pushed.is_empty() {
+                    println!("push wake policy:");
+                    for p in pushed {
+                        let kinds: Vec<&str> = p.wake_kinds.iter().flatten().map(|k| k.as_str()).collect();
+                        println!(
+                            "  {:<12} wakes on {}  queued for next wake: {}",
+                            p.name,
+                            kinds.join(","),
+                            p.queued_for_wake.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+                        );
+                    }
+                }
             }
         }
         Cmd::Peers => {

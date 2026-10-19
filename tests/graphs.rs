@@ -63,6 +63,11 @@ impl Daemon {
         );
         for (i, (name, product)) in specs.iter().enumerate() {
             config.push_str(&format!("[participant.{name}]\nproduct = \"{}\"\ntier = \"{}\"\n", product.token(), TIERS[i % TIERS.len()]));
+            // These scenarios measure transport: every message a push agent must handle is pushed. (By default
+            // only requests wake one; the digest of the rest has its own tests in tests/broker.rs.)
+            if *product == Product::Codex {
+                config.push_str("wake_kinds = [\"all\"]\n");
+            }
         }
         std::fs::write(dir.join("config.toml"), config).unwrap();
         let notify = dir.join("notify.sock");

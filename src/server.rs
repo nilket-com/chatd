@@ -15,7 +15,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::proto::{
-    ClientFrame, EndpointView, ErrorCode, EventView, HealthView, MAX_PAGE, PROTOCOL_VERSION, ParticipantView, Request, Response,
+    ClientFrame, EndpointView, ErrorCode, EventView, HealthView, Kind, MAX_PAGE, PROTOCOL_VERSION, ParticipantView, Request, Response,
     ServerFrame, WatcherView, read_frame, write_frame,
 };
 use crate::store::{SYSTEM_SENDER, Store, StoreError, now_ms};
@@ -29,8 +29,9 @@ pub const WATCH_BATCH: u32 = 256;
 pub struct Config {
     #[serde(default = "default_participants")]
     pub participants: Vec<String>,
-    /// Optional metadata per participant: `[participant.c1]` with `product` and `tier`. A name that
-    /// appears only here is a participant too. Nothing here changes routing; it describes the agent.
+    /// Optional settings per participant: `[participant.c1]` with `product`, `tier` and `wake_kinds`. A
+    /// name that appears only here is a participant too. Nothing here changes routing; `wake_kinds`
+    /// decides which messages wake a push participant.
     #[serde(default)]
     pub participant: BTreeMap<String, ParticipantConf>,
     /// Watch heartbeat interval.
@@ -117,7 +118,16 @@ pub struct ParticipantConf {
     pub product: Option<String>,
     /// The model tier, a short lowercase token. Metadata only; never used for routing.
     pub tier: Option<String>,
+    /// The message kinds that are pushed to the participant while it has an endpoint (`request`, `info`,
+    /// `progress`, `final`, or `all`). Every other message is stored and stays unacknowledged, and the next
+    /// waking push carries it in a digest. Default `["request"]`. A pull participant sees every message.
+    pub wake_kinds: Option<Vec<String>>,
 }
+
+/// The `wake_kinds` token that stands for every kind.
+pub const WAKE_ALL: &str = "all";
+/// What a push participant is woken for when `wake_kinds` is not set.
+pub const DEFAULT_WAKE_KINDS: [Kind; 1] = [Kind::Request];
 
 /// A short lowercase token: letters, digits, `-` and `_`, starting with a letter or digit, at most 32.
 fn valid_token(s: &str) -> bool {
@@ -150,6 +160,17 @@ impl Config {
         }
     }
 
+    /// The kinds that wake `name` when it is pushed to (see `ParticipantConf::wake_kinds`).
+    pub fn wake_kinds(&self, name: &str) -> Vec<Kind> {
+        let Some(tokens) = self.participant.get(name).and_then(|c| c.wake_kinds.as_ref()) else {
+            return DEFAULT_WAKE_KINDS.to_vec();
+        };
+        if tokens.iter().any(|t| t == WAKE_ALL) {
+            return Kind::ALL.to_vec();
+        }
+        Kind::ALL.into_iter().filter(|k| tokens.iter().any(|t| t == k.as_str())).collect()
+    }
+
     pub fn knows(&self, who: &str) -> bool {
         self.participants.iter().any(|p| p == who) || self.participant.contains_key(who)
     }
@@ -165,6 +186,18 @@ impl Config {
                 {
                     return Err(format!(
                         "participant.{name}.{field} = {v:?} must be a short lowercase token (a-z, 0-9, '-' and '_', at most 32)"
+                    ));
+                }
+            }
+            if let Some(tokens) = &conf.wake_kinds {
+                if tokens.is_empty() {
+                    return Err(format!(
+                        "participant.{name}.wake_kinds is empty: nothing would ever wake it; use [\"request\"] (the default) or [\"all\"]"
+                    ));
+                }
+                if let Some(bad) = tokens.iter().find(|t| *t != WAKE_ALL && Kind::parse(t).is_none()) {
+                    return Err(format!(
+                        "participant.{name}.wake_kinds: {bad:?} is not a message kind (request, info, progress, final, or all)"
                     ));
                 }
             }
@@ -188,6 +221,7 @@ pub fn directory(
             let endpoint = endpoints.iter().find(|e| e.name == name);
             let mine: Vec<&WatcherView> = watchers.iter().filter(|w| w.participant == name).collect();
             let transport = if endpoint.is_some() { "push" } else { "pull" };
+            let wake_kinds = endpoint.map(|_| config.wake_kinds(&name));
             let expected = match conf.product.as_deref() {
                 Some("codex") => Some("push".to_string()),
                 Some("claude") => Some("pull".to_string()),
@@ -199,6 +233,8 @@ pub fn directory(
                 watching_since_ms: mine.iter().map(|w| w.connected_at_ms).min(),
                 session: endpoint.map(|e| e.session.clone()),
                 health: health.get(&name).cloned(),
+                wake_kinds,
+                queued_for_wake: None,
                 transport: transport.to_string(),
                 expected_transport: expected,
                 product: conf.product,
@@ -493,7 +529,13 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
                 Ok(mut s) => {
                     s.watchers = shared.watchers.lock().map(|w| w.values().cloned().collect()).unwrap_or_default();
                     let health = shared.health.lock().map(|h| h.clone()).unwrap_or_default();
-                    s.participants = Some(directory(&shared.config, &s.endpoints, &s.watchers, &health));
+                    let mut rows = directory(&shared.config, &s.endpoints, &s.watchers, &health);
+                    for row in rows.iter_mut() {
+                        if let Some(kinds) = &row.wake_kinds {
+                            row.queued_for_wake = store.queued_for_wake(&row.name, kinds, None, 0).ok().map(|(_, total)| total);
+                        }
+                    }
+                    s.participants = Some(rows);
                     Response::Status(s)
                 }
                 Err(e) => err(e),
@@ -853,6 +895,33 @@ mod directory_tests {
         let bad: Config = toml::from_str("[participant.c1]\nproduct = \"Claude\"\n").unwrap();
         assert!(bad.validate().unwrap_err().contains("participant.c1.product"));
         assert!(toml::from_str::<Config>("[participant.c1]\nmodel = \"x\"\n").is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn wake_kinds_default_to_requests_accept_kinds_or_all_and_refuse_anything_else() {
+        let c = config(
+            "[participant.x1]\nproduct = \"codex\"\n[participant.x2]\nwake_kinds = [\"final\", \"request\"]\n[participant.x3]\nwake_kinds = [\"all\"]\n",
+        );
+        assert_eq!(c.wake_kinds("x1"), vec![Kind::Request], "the default");
+        assert_eq!(c.wake_kinds("claude"), vec![Kind::Request], "a name with no table gets the default too");
+        assert_eq!(c.wake_kinds("x2"), vec![Kind::Request, Kind::Final]);
+        assert_eq!(c.wake_kinds("x3"), Kind::ALL.to_vec());
+        let same = config("[participant.x]\nwake_kinds = [\"request\", \"info\", \"progress\", \"final\"]\n");
+        assert_eq!(same.wake_kinds("x"), Kind::ALL.to_vec(), "listing every kind is the same as all");
+        for (text, needle) in [
+            ("[participant.x]\nwake_kinds = [\"request\", \"reply\"]\n", "participant.x.wake_kinds: \"reply\" is not a message kind"),
+            ("[participant.x]\nwake_kinds = [\"Request\"]\n", "\"Request\" is not a message kind"),
+            ("[participant.x]\nwake_kinds = []\n", "participant.x.wake_kinds is empty"),
+        ] {
+            let bad: Config = toml::from_str(text).unwrap();
+            let e = bad.validate().unwrap_err();
+            assert!(e.contains(needle), "{e}");
+        }
+        assert!(toml::from_str::<Config>("[participant.x]\nwake_kinds = \"all\"\n").is_err(), "a list, not a string");
+        let rows = directory(&c, &[endpoint("x2")], &[], &BTreeMap::new());
+        let by = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+        assert_eq!(by("x2").wake_kinds, Some(vec![Kind::Request, Kind::Final]));
+        assert_eq!(by("x1").wake_kinds, None, "only a push participant has a wake policy");
     }
 
     #[test]

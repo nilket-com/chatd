@@ -1922,3 +1922,157 @@ fn a_bad_product_token_stops_the_daemon_with_a_clear_error() {
     }
     assert!(err.contains("participant.claude.product"), "{err}");
 }
+
+// ---------------------------------------------------------------- wake policy and digests
+
+fn codex_row(e: &Env) -> chatd::proto::ParticipantView {
+    e.status(None).participants.unwrap().into_iter().find(|p| p.name == "codex").unwrap()
+}
+
+fn argv_log(e: &Env) -> String {
+    std::fs::read_to_string(e.dir.join("argv.log")).unwrap_or_default()
+}
+
+fn stored_id(r: Response) -> String {
+    match r {
+        Response::Stored(r) => r.id,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn only_requests_wake_a_push_participant_and_its_next_push_carries_the_rest_as_a_digest() {
+    let mut e = Env::standard();
+    e.start();
+    let exe = fake_codex(&e, "exit 0");
+    register(&e, &exe, "s1");
+    let asked = e.send("codex", "claude", "c", Kind::Request, "q", "codex asks");
+    let progress = stored_id(e.reply("claude", &asked, Kind::Progress, "p"));
+    let fin = stored_id(e.reply("claude", &asked, Kind::Final, "f"));
+    let info = e.send("claude", "codex", "c", Kind::Info, "i", "for your information");
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(argv_log(&e), "", "progress, final and info replies do not wake codex");
+    assert!(attempts(&e, &info).is_empty() && attempts(&e, &fin).is_empty());
+    let row = codex_row(&e);
+    assert_eq!((row.wake_kinds, row.queued_for_wake), (Some(vec![Kind::Request]), Some(3)));
+    let text = stdout(&e.cli(&["status"], None));
+    assert!(text.contains("codex        wakes on request  queued for next wake: 3"), "{text}");
+
+    let req = e.send("claude", "codex", "c", Kind::Request, "r1", "please act");
+    wait_for("the waking push", Duration::from_secs(5), || attempts(&e, &req) == vec!["submitted"]);
+    let argv = argv_log(&e);
+    let lines: Vec<&str> = argv.lines().collect();
+    assert_eq!(lines[..4], ["queue", "--thread", "s1", "--message"]);
+    assert!(
+        lines[4].starts_with(&format!("[chatd {req} claude->codex c request ")),
+        "the waking line comes first, unchanged: {}",
+        lines[4]
+    );
+    assert!(lines[4].ends_with(&format!("please act | chatctl receive --as codex --id {req}")), "{}", lines[4]);
+    assert!(lines[5].starts_with("[chatd digest for codex: 3 queued, oldest first;"), "{}", lines[5]);
+    let at = |id: &str| argv.find(id).unwrap_or_else(|| panic!("{id} is not in the digest: {argv}"));
+    assert!(at(&progress) < at(&fin) && at(&fin) < at(&info), "oldest first, newest last");
+    assert!(argv.contains(&format!("  {info} claude c info ")), "{argv}");
+    assert!(!argv.contains("more ("), "nothing beyond the cap");
+
+    assert_eq!(codex_row(&e).queued_for_wake, Some(0), "a digest is delivered once");
+    let s = e.status(Some("codex"));
+    for id in [&progress, &fin, &info] {
+        assert!(s.unacknowledged.iter().any(|l| l.id == *id), "a digest does not acknowledge {id}");
+    }
+    let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
+    let digested: Vec<&str> = events.iter().filter(|ev| ev.kind == "digested").filter_map(|ev| ev.message_id.as_deref()).collect();
+    assert_eq!(digested, vec![progress.as_str(), fin.as_str(), info.as_str()]);
+
+    let again = e.send("claude", "codex", "c", Kind::Request, "r2", "and this");
+    wait_for("the second push", Duration::from_secs(5), || attempts(&e, &again) == vec!["submitted"]);
+    assert_eq!(argv_log(&e).matches("[chatd digest").count(), 1, "nothing new was queued, so no digest");
+
+    // An explicit redelivery pushes a non-waking message on its own.
+    assert!(matches!(e.call(Request::Redeliver { id: info.clone() }), Response::Redelivery { .. }));
+    wait_for("the redelivered info", Duration::from_secs(5), || attempts(&e, &info) == vec!["submitted"]);
+    assert!(argv_log(&e).contains(&format!("chatctl receive --as codex --id {info}")));
+}
+
+#[test]
+fn a_digest_is_capped_and_the_rest_waits_for_the_next_wake() {
+    let mut e = Env::standard();
+    e.start();
+    let exe = fake_codex(&e, "exit 0");
+    register(&e, &exe, "s1");
+    let infos: Vec<String> = (0..25).map(|i| e.send("claude", "codex", "c", Kind::Info, &format!("i{i}"), &format!("note {i}"))).collect();
+    wait_for("all queued", Duration::from_secs(5), || codex_row(&e).queued_for_wake == Some(25));
+    let first = e.send("claude", "codex", "c", Kind::Request, "r1", "first");
+    wait_for("the first push", Duration::from_secs(5), || attempts(&e, &first) == vec!["submitted"]);
+    let argv = argv_log(&e);
+    assert!(argv.contains("[chatd digest for codex: 25 queued"), "{argv}");
+    assert!(argv.contains("\n  +5 more (chatctl status --as codex)"), "{argv}");
+    assert!(infos[..20].iter().all(|id| argv.contains(id.as_str())) && !infos[20..].iter().any(|id| argv.contains(id.as_str())));
+    let digest_bytes = argv.split_once("[chatd digest").unwrap().1.len();
+    assert!(digest_bytes <= chatd::text::DIGEST_MAX_BYTES, "{digest_bytes}");
+    assert_eq!(codex_row(&e).queued_for_wake, Some(5), "unlisted messages stay queued");
+
+    let second = e.send("claude", "codex", "c", Kind::Request, "r2", "second");
+    wait_for("the second push", Duration::from_secs(5), || attempts(&e, &second) == vec!["submitted"]);
+    let tail = argv_log(&e).split_once(&format!("--id {second}")).unwrap().1.to_string();
+    assert!(tail.contains("[chatd digest for codex: 5 queued"), "{tail}");
+    assert!(infos[20..].iter().all(|id| tail.contains(id.as_str())) && !tail.contains("more ("), "{tail}");
+    assert_eq!(codex_row(&e).queued_for_wake, Some(0));
+}
+
+#[test]
+fn a_failed_push_leaves_its_digest_queued() {
+    let mut e = Env::standard();
+    e.start();
+    let exe = fake_codex(&e, "echo 'session not found' >&2; exit 2");
+    register(&e, &exe, "s1");
+    e.send("claude", "codex", "c", Kind::Info, "i", "fyi");
+    let req = e.send("claude", "codex", "c", Kind::Request, "r", "act");
+    wait_for("the retry bound", Duration::from_secs(10), || attempts(&e, &req) == vec!["failed", "failed", "failed"]);
+    assert!(argv_log(&e).contains("[chatd digest for codex: 1 queued"));
+    assert_eq!(codex_row(&e).queued_for_wake, Some(1), "only a submitted push delivers its digest");
+}
+
+#[test]
+fn wake_kinds_all_keeps_pushing_every_message() {
+    let mut e = Env::new(
+        "heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\n[participant.codex]\nproduct = \"codex\"\nwake_kinds = [\"all\"]\n",
+    );
+    e.start();
+    let exe = fake_codex(&e, "exit 0");
+    register(&e, &exe, "s1");
+    let info = e.send("claude", "codex", "c", Kind::Info, "i", "fyi");
+    wait_for("the info push", Duration::from_secs(5), || attempts(&e, &info) == vec!["submitted"]);
+    let row = codex_row(&e);
+    assert_eq!((row.wake_kinds, row.queued_for_wake), (Some(Kind::ALL.to_vec()), Some(0)));
+    assert!(!argv_log(&e).contains("digest"));
+}
+
+#[test]
+fn pull_participants_see_every_kind_whatever_their_wake_kinds() {
+    let mut e = Env::new("heartbeat_ms = 300\n[participant.claude]\nproduct = \"claude\"\nwake_kinds = [\"request\"]\n");
+    e.start();
+    let asked = e.send("claude", "codex", "c", Kind::Request, "q", "claude asks");
+    let fin = stored_id(e.reply("codex", &asked, Kind::Final, "f"));
+    let info = e.send("codex", "claude", "c", Kind::Info, "i", "fyi");
+    let req = e.send("codex", "claude", "c", Kind::Request, "r", "act");
+    let out = e.cli(&["wait", "--as", "claude", "--follow", "--timeout", "1"], None);
+    let text = stdout(&out);
+    for id in [&fin, &info, &req] {
+        assert!(text.contains(id.as_str()), "{id} missing from: {text}");
+    }
+    let row = e.status(None).participants.unwrap().into_iter().find(|p| p.name == "claude").unwrap();
+    assert_eq!((row.wake_kinds, row.queued_for_wake), (None, None), "no push policy for a pull participant");
+}
+
+#[test]
+fn an_unknown_wake_kind_stops_the_daemon_with_a_clear_error() {
+    let mut e = Env::new("[participant.codex]\nwake_kinds = [\"request\", \"reply\"]\n");
+    assert!(e.try_start(false).is_none(), "the daemon must refuse an unknown kind");
+    let mut err = String::new();
+    if let Some(mut d) = e.daemon.take() {
+        use std::io::Read;
+        let _ = d.stderr.take().unwrap().read_to_string(&mut err);
+    }
+    assert!(err.contains("participant.codex.wake_kinds") && err.contains("\"reply\""), "{err}");
+}

@@ -136,6 +136,16 @@ CREATE TABLE legacy_blocks (
 ) STRICT;
 ";
 
+/// Messages that a waking push carried in its digest (see `Store::queued_for_wake`). A row is written
+/// only when that push was submitted; it is never an acknowledgement.
+const DIGESTS: &str = "
+CREATE TABLE IF NOT EXISTS digests (
+    message_id TEXT PRIMARY KEY REFERENCES messages (id),
+    attempt INTEGER NOT NULL REFERENCES attempts (id),
+    at_ms INTEGER NOT NULL
+) STRICT;
+";
+
 pub struct Store {
     conn: Connection,
 }
@@ -198,6 +208,8 @@ impl Store {
                 format!("schema version {version} is not supported (this build: {SCHEMA_VERSION}); the database is left untouched"),
             ));
         }
+        // Added after schema 1 shipped; additive, so an older build still opens a store that has it.
+        tx.execute_batch(DIGESTS)?;
         for p in participants {
             if !valid_name(p) {
                 return Err(StoreError::new(ErrorCode::BadRequest, format!("participant name {p:?} is not valid")));
@@ -683,21 +695,28 @@ impl Store {
 
     /// Messages due a submission attempt now, per the declared policy:
     /// - addressed to a participant with a registered endpoint, and not yet acknowledged;
+    /// - of a kind in `waking(participant)`, or explicitly redelivered (other kinds wait for the digest
+    ///   of the next waking push, see `queued_for_wake`);
     /// - considering only attempts after the last explicit redelivery: none yet; or the latest
     ///   failed under the CURRENT generation, fewer than MAX_FAILED_ATTEMPTS failures, and its
     ///   backoff elapsed. A submitted, started or uncertain latest attempt, or a failure under an
     ///   older generation, is never retried automatically.
-    pub fn due_deliveries(&self, now: i64) -> Result<Vec<Delivery>> {
+    pub fn due_deliveries(&self, now: i64, waking: &dyn Fn(&str) -> Vec<Kind>) -> Result<Vec<Delivery>> {
         let mut out = Vec::new();
         for ep in self.endpoints()? {
+            let kinds = waking(&ep.name);
             let mut stmt = self.conn.prepare(
-                "SELECT m.id FROM messages m
+                "SELECT m.id, m.kind, EXISTS (SELECT 1 FROM redeliveries r WHERE r.message_id = m.id) FROM messages m
                  WHERE m.recipient = ?1
                    AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
                  ORDER BY m.seq",
             )?;
-            let ids: Vec<String> = stmt.query_map([&ep.name], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-            for id in ids {
+            let rows: Vec<(String, String, bool)> =
+                stmt.query_map([&ep.name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+            for (id, kind, redelivered) in rows {
+                if !redelivered && !kinds.contains(&kind_of(&kind)?) {
+                    continue;
+                }
                 if is_due(&self.conn, &id, &ep, now)? {
                     out.push(Delivery { message: self.view_without_body(&id)?, endpoint: ep.clone() });
                 }
@@ -749,8 +768,32 @@ impl Store {
         Ok(Some(attempt))
     }
 
+    /// Unacknowledged messages to `recipient` whose kind is not in `waking`, that no push has carried
+    /// (no digest row, and no attempt of their own other than failed ones), except `exclude`: oldest
+    /// first, at most `limit` (<= MAX_PAGE), with the total.
+    pub fn queued_for_wake(&self, recipient: &str, waking: &[Kind], exclude: Option<&str>, limit: u32) -> Result<(Vec<MessageView>, i64)> {
+        const QUEUED: &str = "FROM messages m
+             WHERE m.recipient = ?1 AND (?2 IS NULL OR m.id <> ?2)
+               AND ((m.kind = 'request' AND ?3) OR (m.kind = 'info' AND ?4) OR (m.kind = 'progress' AND ?5) OR (m.kind = 'final' AND ?6))
+               AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
+               AND NOT EXISTS (SELECT 1 FROM digests d WHERE d.message_id = m.id)
+               AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.message_id = m.id AND t.state <> 'failed')";
+        let queued = |k: Kind| !waking.contains(&k);
+        let (q, i, p, f) = (queued(Kind::Request), queued(Kind::Info), queued(Kind::Progress), queued(Kind::Final));
+        let total: i64 =
+            self.conn.query_row(&format!("SELECT count(*) {QUEUED}"), params![recipient, exclude, q, i, p, f], |r| r.get(0))?;
+        let mut stmt = self.conn.prepare(&format!("SELECT m.id {QUEUED} ORDER BY m.seq LIMIT ?7"))?;
+        let ids: Vec<String> = stmt
+            .query_map(params![recipient, exclude, q, i, p, f, limit.min(MAX_PAGE)], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let items = ids.iter().map(|id| self.view_without_body(id)).collect::<Result<_>>()?;
+        Ok((items, total))
+    }
+
     /// Records an attempt's result: `submitted` (the adapter returned success; not receipt),
-    /// `failed` (a confirmed failure; retried per policy) or `uncertain` (timeout or crash).
+    /// `failed` (a confirmed failure; retried per policy) or `uncertain` (timeout or crash). When it was
+    /// submitted, the messages its digest carried (`digested`) are recorded as delivered by digest; they
+    /// stay unacknowledged.
     pub fn finish_attempt(
         &mut self,
         attempt: i64,
@@ -758,6 +801,7 @@ impl Store {
         exit_code: Option<i32>,
         error: Option<&str>,
         backoff_ms: &[u64],
+        digested: &[String],
     ) -> Result<()> {
         if !["submitted", "failed", "uncertain"].contains(&state) {
             return Err(StoreError::new(ErrorCode::BadRequest, format!("attempt state {state:?}")));
@@ -804,6 +848,22 @@ impl Store {
                 .to_string()
             ],
         )?;
+        if state == "submitted" {
+            for id in digested {
+                let row: Option<(String, String)> = tx
+                    .query_row("SELECT sender, conversation FROM messages WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                let Some((sender, conversation)) = row else { continue };
+                let fresh = tx
+                    .execute("INSERT OR IGNORE INTO digests (message_id, attempt, at_ms) VALUES (?1, ?2, ?3)", params![id, attempt, now])?;
+                if fresh == 1 {
+                    tx.execute(
+                        "INSERT INTO events (at_ms, kind, audience, message_id, conversation, detail) VALUES (?1, 'digested', ?2, ?3, ?4, ?5)",
+                        params![now, sender, id, conversation, json!({"attempt": attempt, "endpoint": endpoint, "with": message_id}).to_string()],
+                    )?;
+                }
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -815,7 +875,7 @@ impl Store {
             stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
         };
         for id in &ids {
-            self.finish_attempt(*id, "uncertain", None, Some("the daemon stopped while this submission was in flight"), &[])?;
+            self.finish_attempt(*id, "uncertain", None, Some("the daemon stopped while this submission was in flight"), &[], &[])?;
         }
         Ok(ids.len() as u64)
     }
@@ -1020,7 +1080,7 @@ mod tests {
         let (mut s, dir) = store();
         s.endpoint_register("codex", "old", "/bin/true").unwrap();
         let id = send(&mut s, "k");
-        let due = s.due_deliveries(now_ms()).unwrap();
+        let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         assert_eq!(due.len(), 1);
         s.ack("codex", std::slice::from_ref(&id)).unwrap();
         assert_eq!(s.begin_attempt(&due[0]).unwrap(), None);
@@ -1033,10 +1093,10 @@ mod tests {
         let (mut s, dir) = store();
         s.endpoint_register("codex", "old", "/bin/true").unwrap();
         let id = send(&mut s, "k");
-        let due = s.due_deliveries(now_ms()).unwrap();
+        let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         s.endpoint_register("codex", "new", "/bin/true").unwrap();
         assert_eq!(s.begin_attempt(&due[0]).unwrap(), None, "the old binding's selection is fenced");
-        let fresh = s.due_deliveries(now_ms()).unwrap();
+        let fresh = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         assert_eq!(fresh[0].endpoint.session, "new");
         assert!(s.begin_attempt(&fresh[0]).unwrap().is_some());
         assert_eq!(s.attempts_for(&id).unwrap()[0].generation, 2);
@@ -1050,7 +1110,7 @@ mod tests {
         let first = send(&mut s, "k1");
         let second = send(&mut s, "k2");
         s.endpoint_register("codex", "old-session", "/bin/true").unwrap();
-        let due = s.due_deliveries(now_ms()).unwrap();
+        let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         assert_eq!(due.len(), 2);
         assert!(s.begin_attempt(&due[0]).unwrap().is_some(), "the first old-session attempt is genuinely in flight");
         if rebind {
@@ -1063,7 +1123,7 @@ mod tests {
         assert!(s.attempts_for(&second).unwrap().is_empty());
         let first_attempts = s.attempts_for(&first).unwrap();
         assert_eq!((first_attempts.len(), first_attempts[0].generation, first_attempts[0].state.as_str()), (1, 1, "started"));
-        let fresh = s.due_deliveries(now_ms()).unwrap();
+        let fresh = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         if ack {
             assert!(fresh.iter().all(|d| d.message.id != second));
         } else {
@@ -1093,7 +1153,7 @@ mod tests {
         let (mut s, dir) = store();
         s.endpoint_register("codex", "old", "/bin/true").unwrap();
         let id = send(&mut s, "k");
-        let due = s.due_deliveries(now_ms()).unwrap();
+        let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         assert!(s.begin_attempt(&due[0]).unwrap().is_some());
         assert_eq!(s.begin_attempt(&due[0]).unwrap(), None);
         assert_eq!(s.attempts_for(&id).unwrap().len(), 1);

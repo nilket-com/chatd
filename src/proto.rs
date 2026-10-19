@@ -32,6 +32,8 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub const ALL: [Kind; 4] = [Kind::Request, Kind::Info, Kind::Progress, Kind::Final];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Request => "request",
@@ -248,6 +250,14 @@ pub struct ParticipantView {
     /// (no session to locate, no inspector for its product, or a daemon that predates health).
     #[serde(default)]
     pub health: Option<HealthView>,
+    /// The kinds that wake the participant when it is pushed to (`wake_kinds` in the configuration).
+    /// Absent for a pull participant, which sees every message, and from a daemon that predates it.
+    #[serde(default)]
+    pub wake_kinds: Option<Vec<Kind>>,
+    /// For a push participant: unacknowledged messages of a non-waking kind that no push has carried
+    /// yet. They go out in the digest of the next waking push.
+    #[serde(default)]
+    pub queued_for_wake: Option<i64>,
 }
 
 /// What a participant's session log says, as seen by the daemon's health check.
