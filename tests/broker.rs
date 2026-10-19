@@ -2076,3 +2076,135 @@ fn an_unknown_wake_kind_stops_the_daemon_with_a_clear_error() {
     }
     assert!(err.contains("participant.codex.wake_kinds") && err.contains("\"reply\""), "{err}");
 }
+
+// ---------------------------------------------------------------- endpoint unregister
+
+fn unregister(e: &Env, who: &str) -> Response {
+    e.call(Request::EndpointUnregister { name: who.into() })
+}
+
+#[test]
+fn unregister_makes_the_participant_pull_and_stops_pushes_and_its_inbox_stays_readable() {
+    let mut e = Env::new(
+        "heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\n[participant.codex]\nproduct = \"codex\"\n",
+    );
+    e.start();
+    let exe = fake_codex(&e, "exit 0");
+    register(&e, &exe, "s1");
+    let pushed = e.send("claude", "codex", "c", Kind::Request, "before", "pushed while bound");
+    wait_for("the push", Duration::from_secs(5), || attempts(&e, &pushed) == vec!["submitted"]);
+    let queued = e.send("claude", "codex", "c", Kind::Info, "queued", "waits for a wake");
+    assert_eq!(codex_row(&e).queued_for_wake, Some(1));
+
+    let out = e.cli(&["endpoint", "unregister", "--as", "codex"], None);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("unregistered codex's endpoint (session s1, generation 1); codex now pulls"), "{}", stdout(&out));
+    let row = codex_row(&e);
+    assert_eq!((row.transport.as_str(), row.path_ready, row.session.as_deref()), ("pull", false, None));
+    assert_eq!((row.wake_kinds, row.queued_for_wake, row.health), (None, None, None), "no push policy and no inspection");
+    assert!(e.status(None).endpoints.is_empty());
+    let peers = stdout(&e.cli(&["peers"], None));
+    let line = peers.lines().find(|l| l.starts_with("codex")).unwrap();
+    assert!(line.contains("pull") && line.contains("no endpoint registered"), "{peers}");
+
+    let after = e.send("claude", "codex", "c", Kind::Request, "after", "sent after unregister");
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(attempts(&e, &after).is_empty() && attempts(&e, &queued).is_empty(), "nothing is pushed after unregister");
+    assert_eq!(argv_log(&e).matches("queue").count(), 1, "only the push made while bound");
+
+    let s = e.status(Some("codex"));
+    for id in [&pushed, &queued, &after] {
+        assert!(s.unacknowledged.iter().any(|l| l.id == *id && !l.received), "{id} stays unacknowledged");
+    }
+    let take = e.cli(&["take", "--as", "codex", "--id", &after], None);
+    assert_eq!(code(&take), 0, "{}", stderr(&take));
+    assert!(stdout(&take).contains("sent after unregister"));
+    let w = e.cli(&["wait", "--as", "codex", "--timeout", "5"], None);
+    assert_eq!(code(&w), 0, "{}", stderr(&w));
+    assert!(stdout(&w).contains(&pushed), "the oldest unacknowledged message is pulled: {}", stdout(&w));
+
+    let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
+    let ev = events.iter().find(|ev| ev.kind == "endpoint_unregistered").expect("an endpoint_unregistered event");
+    assert_eq!((ev.audience.as_str(), ev.detail["generation"].as_i64(), ev.detail["session"].as_str()), ("codex", Some(1), Some("s1")));
+}
+
+#[test]
+fn unregister_is_idempotent_and_refuses_unknown_and_reserved_names() {
+    let mut e = Env::standard();
+    e.start();
+    register(&e, Path::new("/bin/true"), "s1");
+    assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), in_flight: 0, .. }));
+    let Response::Unregistered { name, removed, in_flight } = unregister(&e, "codex") else { panic!() };
+    assert_eq!((name.as_str(), removed, in_flight), ("codex", None, 0), "a second unregister changes nothing");
+    let out = e.cli(&["endpoint", "unregister", "--as", "codex"], None);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("codex has no endpoint; nothing to unregister"), "{}", stdout(&out));
+    let out = e.cli(&["--json", "endpoint", "unregister", "--as", "claude"], None);
+    assert_eq!(code(&out), 0, "a participant that never had an endpoint: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!((v["r"].as_str(), v["removed"].is_null()), (Some("unregistered"), true), "{v}");
+    let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
+    assert_eq!(events.iter().filter(|ev| ev.kind == "endpoint_unregistered").count(), 1, "a no-op writes no event");
+
+    match unregister(&e, "nobody") {
+        Response::Error { code, .. } => assert_eq!(code, ErrorCode::UnknownParticipant),
+        other => panic!("{other:?}"),
+    }
+    let out = e.cli(&["endpoint", "unregister", "--as", "nobody"], None);
+    assert_eq!(code(&out), 5, "{}", stderr(&out));
+    match unregister(&e, "chatd") {
+        Response::Error { code, message } => assert!(code == ErrorCode::BadRequest && message.contains("reserved"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn re_registering_after_unregister_gets_a_higher_generation_and_pushes_again() {
+    let mut e = Env::standard();
+    e.start();
+    let exe = fake_codex(&e, "exit 0");
+    assert_eq!(register(&e, &exe, "s1"), 1);
+    assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), .. }));
+    // No attempt was ever made under generation 1, so only the recorded generation keeps this monotonic.
+    assert_eq!(register(&e, &exe, "s2"), 2);
+    assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), .. }));
+    let waiting = e.send("claude", "codex", "c", Kind::Request, "waiting", "sent while pulling");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(attempts(&e, &waiting).is_empty());
+    assert_eq!(register(&e, &exe, "s3"), 3);
+    assert_eq!(codex_row(&e).transport, "push");
+    wait_for("the push to the new session", Duration::from_secs(5), || attempts(&e, &waiting) == vec!["submitted"]);
+    assert!(argv_log(&e).contains("s3"));
+    // Generations survive a restart too.
+    assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), .. }));
+    e.term();
+    e.start();
+    assert_eq!(register(&e, &exe, "s4"), 4);
+}
+
+#[test]
+fn a_submission_in_flight_during_unregister_finishes_fenced_and_is_never_retried() {
+    let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 5000\nretry_backoff_ms = [200, 200, 200]\n");
+    e.start();
+    let exe = fake_codex(&e, "sleep 1; exit 1");
+    register(&e, &exe, "s1");
+    let id = e.send("claude", "codex", "c", Kind::Request, "inflight", "in flight");
+    wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
+    let Response::Unregistered { removed, in_flight, .. } = unregister(&e, "codex") else { panic!() };
+    assert_eq!((removed.map(|r| r.generation), in_flight), (Some(1), 1));
+    wait_for("the in-flight attempt's result", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed"]);
+    let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
+    let last = events.iter().rev().find(|ev| ev.kind == "submission" && ev.message_id.as_deref() == Some(&id)).unwrap();
+    assert_eq!((last.detail["state"].as_str(), last.detail["stale_generation"].as_bool()), (Some("failed"), Some(true)));
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(attempts(&e, &id), vec!["failed"], "a failure under the removed binding is not retried");
+    let ok = fake_codex(&e, "exit 0");
+    assert_eq!(register(&e, &ok, "s2"), 2);
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(attempts(&e, &id), vec!["failed"], "nor against the next binding (fenced, like a rebind)");
+    assert!(e.status(Some("codex")).unacknowledged.iter().any(|l| l.id == id), "the message stays in the inbox");
+    let Response::Message(m) = e.call(Request::Receive { as_: "codex".into(), id: id.clone() }) else { panic!() };
+    assert_eq!(m.body.as_deref(), Some("in flight"));
+    e.call(Request::Redeliver { id: id.clone() });
+    wait_for("an explicit redelivery under generation 2", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed", "submitted"]);
+}

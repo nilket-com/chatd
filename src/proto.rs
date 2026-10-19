@@ -105,6 +105,10 @@ pub enum Request {
         session: String,
         exe: String,
     },
+    /// Removes a participant's endpoint: it becomes a pull participant. Idempotent.
+    EndpointUnregister {
+        name: String,
+    },
     Redeliver {
         id: String,
     },
@@ -367,6 +371,14 @@ pub enum Response {
         events: Vec<EventView>,
     },
     Registered(EndpointView),
+    /// `removed` is the binding that was removed, absent when there was none (nothing changed).
+    /// `in_flight` counts its submissions still running: they finish and are recorded under the removed
+    /// generation, and are never retried automatically.
+    Unregistered {
+        name: String,
+        removed: Option<EndpointView>,
+        in_flight: i64,
+    },
     Redelivery {
         message_id: String,
     },

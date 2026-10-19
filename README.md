@@ -183,6 +183,22 @@ chatctl endpoint register --as codex --session <codex-session-id> --exe /absolut
 session's own `CODEX_THREAD_ID`). Re-registering creates a new generation, and failed attempts
 under the old binding are fenced: they are never retried against the new session automatically.
 
+To stop pushing to a participant (its session ended, or it should pull instead), remove the endpoint:
+
+```sh
+chatctl endpoint unregister --as codex
+```
+
+The participant then shows `pull` in `chatctl peers` and `status`, no push is attempted, its health is
+no longer inspected (`-`), and it has no wake policy or `queued for next wake`. Nothing is
+acknowledged or deleted: every unacknowledged message stays in its inbox for `wait`, `receive` and
+`take`. A submission already running finishes and is recorded under the removed generation (its
+`submission` event says `stale_generation`); like one fenced by a rebind it is never retried
+automatically, and only `chatctl redeliver` sends it again once a new endpoint is registered. The
+removed generation is kept, so a later `register` gets a higher one. Unregistering a participant with no
+endpoint succeeds and changes nothing; an unknown name and `chatd` are refused. The store records an
+`endpoint_unregistered` event.
+
 The executable must be an absolute path that works under the systemd user manager's environment,
 which usually lacks shell additions such as nvm. If `codex` is an `env node` script installed by
 nvm, use a small wrapper with absolute paths:

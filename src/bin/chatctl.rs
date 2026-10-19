@@ -217,6 +217,12 @@ enum EndpointCmd {
         #[arg(long)]
         exe: PathBuf,
     },
+    /// Remove a participant's endpoint: pushes stop and it pulls (wait, receive, take). Unacknowledged
+    /// messages stay in its inbox. Succeeds when there is no endpoint.
+    Unregister {
+        #[arg(long = "as")]
+        who: String,
+    },
 }
 
 fn body(file: &Option<PathBuf>) -> Result<String, String> {
@@ -1004,6 +1010,29 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
         Cmd::Endpoint { cmd: EndpointCmd::Register { who, session, exe } } => {
             let r = call(Request::EndpointRegister { name: who, session, exe: exe.to_string_lossy().into_owned() })?;
             print_json(&r);
+        }
+        Cmd::Endpoint { cmd: EndpointCmd::Unregister { who } } => {
+            let r = call(Request::EndpointUnregister { name: who })?;
+            if json {
+                print_json(&r);
+            } else if let Response::Unregistered { name, removed, in_flight } = r {
+                match removed {
+                    Some(ep) => {
+                        println!(
+                            "unregistered {name}'s endpoint (session {}, generation {}); {name} now pulls (chatctl wait --as {name})",
+                            ep.session, ep.generation
+                        );
+                        if in_flight > 0 {
+                            println!(
+                                "{in_flight} submission(s) were in flight; they finish under the removed generation and are not retried (chatctl status)"
+                            );
+                        }
+                    }
+                    None => println!("{name} has no endpoint; nothing to unregister"),
+                }
+            } else {
+                print_json(&r);
+            }
         }
         Cmd::Redeliver { id } => {
             let r = call(Request::Redeliver { id })?;

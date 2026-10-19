@@ -654,9 +654,16 @@ impl Store {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let generation: i64 =
             tx.query_row("SELECT coalesce(max(generation), 0) + 1 FROM endpoints WHERE name = ?1", [name], |r| r.get(0))?;
-        // Generations only grow, even across a deleted row.
+        // Generations only grow, even across a deleted row: the attempts made under it and the generation
+        // recorded when it was unregistered both raise the floor.
         let floor: i64 = tx.query_row("SELECT coalesce(max(generation), 0) + 1 FROM attempts WHERE endpoint = ?1", [name], |r| r.get(0))?;
-        let generation = generation.max(floor);
+        let retired: i64 = tx
+            .query_row("SELECT value FROM meta WHERE key = ?1", [retired_generation_key(name)], |r| r.get::<_, String>(0))
+            .optional()?
+            .map(|v| v.parse().map_err(|_| StoreError::new(ErrorCode::Storage, format!("retired generation of {name} is not an integer"))))
+            .transpose()?
+            .unwrap_or(0);
+        let generation = generation.max(floor).max(retired + 1);
         tx.execute(
             "INSERT INTO endpoints (name, session, exe, generation, registered_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (name) DO UPDATE SET session = excluded.session, exe = excluded.exe, generation = excluded.generation, registered_at_ms = excluded.registered_at_ms",
@@ -668,6 +675,43 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(EndpointView { name: name.into(), session: session.into(), exe: exe.into(), generation, registered_at_ms: now })
+    }
+
+    /// Removes a participant's endpoint, making it a pull participant. Returns the removed binding and
+    /// how many of its submissions are still in flight, or `None` when it had no endpoint (nothing is
+    /// written). Messages are untouched: everything unacknowledged stays in the inbox for `wait`,
+    /// `receive` and `take`. The removed generation is kept, so a later registration gets a higher
+    /// one; an attempt still running under it is fenced like one after a rebind (`begin_attempt`
+    /// refuses queued selections, and its result is recorded with `stale_generation` and never retried
+    /// automatically).
+    pub fn endpoint_unregister(&mut self, name: &str) -> Result<Option<(EndpointView, i64)>> {
+        self.require_participant(name)?;
+        let now = now_ms();
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<EndpointView> = tx
+            .query_row("SELECT name, session, exe, generation, registered_at_ms FROM endpoints WHERE name = ?1", [name], |r| {
+                Ok(EndpointView { name: r.get(0)?, session: r.get(1)?, exe: r.get(2)?, generation: r.get(3)?, registered_at_ms: r.get(4)? })
+            })
+            .optional()?;
+        let Some(ep) = current else {
+            return Ok(None);
+        };
+        let in_flight: i64 = tx.query_row(
+            "SELECT count(*) FROM attempts WHERE endpoint = ?1 AND generation = ?2 AND state = 'started'",
+            params![name, ep.generation],
+            |r| r.get(0),
+        )?;
+        tx.execute("DELETE FROM endpoints WHERE name = ?1", [name])?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![retired_generation_key(name), ep.generation.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO events (at_ms, kind, audience, message_id, conversation, detail) VALUES (?1, 'endpoint_unregistered', ?2, NULL, NULL, ?3)",
+            params![now, name, json!({"session": ep.session, "exe": ep.exe, "generation": ep.generation, "in_flight": in_flight}).to_string()],
+        )?;
+        tx.commit()?;
+        Ok(Some((ep, in_flight)))
     }
 
     /// Explicit operator redelivery: later attempts start a fresh retry budget under the current
@@ -962,6 +1006,11 @@ impl Store {
     }
 }
 
+/// The meta key holding the generation of `name`'s last unregistered endpoint.
+fn retired_generation_key(name: &str) -> String {
+    format!("endpoint_generation.{name}")
+}
+
 struct NewMessage<'a> {
     id: &'a str,
     from: &'a str,
@@ -1157,6 +1206,25 @@ mod tests {
         assert!(s.begin_attempt(&due[0]).unwrap().is_some());
         assert_eq!(s.begin_attempt(&due[0]).unwrap(), None);
         assert_eq!(s.attempts_for(&id).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unregister_fences_a_queued_selection_and_generations_stay_monotonic() {
+        let (mut s, dir) = store();
+        assert_eq!(s.endpoint_register("codex", "a", "/bin/true").unwrap().generation, 1);
+        let id = send(&mut s, "k");
+        let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
+        let (removed, in_flight) = s.endpoint_unregister("codex").unwrap().unwrap();
+        assert_eq!((removed.generation, in_flight), (1, 0));
+        assert_eq!(s.begin_attempt(&due[0]).unwrap(), None, "a selection made before unregister is not attempted");
+        assert!(s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap().is_empty());
+        assert!(s.endpoint_unregister("codex").unwrap().is_none(), "idempotent");
+        assert_eq!(s.endpoint_unregister("nobody").unwrap_err().code, ErrorCode::UnknownParticipant);
+        assert_eq!(s.unacknowledged_page("codex", None, 0, 10).unwrap()[0].id, id, "the message stays for pull");
+        assert_eq!(s.endpoint_register("codex", "b", "/bin/true").unwrap().generation, 2);
+        s.endpoint_unregister("codex").unwrap();
+        assert_eq!(s.endpoint_register("codex", "c", "/bin/true").unwrap().generation, 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

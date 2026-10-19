@@ -465,7 +465,7 @@ fn reserved_name(req: &Request) -> Option<&str> {
     let names: Vec<&str> = match req {
         Request::Send(r) => [Some(r.from.as_str()), r.to.as_deref()].into_iter().flatten().collect(),
         Request::Receive { as_, .. } | Request::Ack { as_, .. } => vec![as_.as_str()],
-        Request::EndpointRegister { name, .. } => vec![name.as_str()],
+        Request::EndpointRegister { name, .. } | Request::EndpointUnregister { name } => vec![name.as_str()],
         _ => Vec::new(),
     };
     names.into_iter().find(|n| *n == SYSTEM_SENDER)
@@ -554,6 +554,28 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
                 );
                 Response::Registered(v)
             }
+            Err(e) => err(e),
+        },
+        Request::EndpointUnregister { name } => match store.endpoint_unregister(&name) {
+            Ok(Some((removed, in_flight))) => {
+                wrote = true;
+                // Under the store lock, as the health check's own update is: a check that read the old
+                // binding cannot put its observation back afterwards (see `health::check`).
+                if let Ok(mut h) = shared.health.lock() {
+                    h.remove(&name);
+                }
+                journal::log(
+                    journal::PRIORITY_NOTICE,
+                    &format!(
+                        "endpoint {name} unregistered, generation {}{}",
+                        removed.generation,
+                        if in_flight > 0 { format!(" ({in_flight} submission(s) still in flight)") } else { String::new() }
+                    ),
+                    &[("SENDER", &name), ("EVENT", "endpoint")],
+                );
+                Response::Unregistered { name, removed: Some(removed), in_flight }
+            }
+            Ok(None) => Response::Unregistered { name, removed: None, in_flight: 0 },
             Err(e) => err(e),
         },
         Request::Redeliver { id } => match store.redeliver(&id) {

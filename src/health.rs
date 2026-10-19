@@ -371,10 +371,24 @@ pub fn check(shared: &Arc<Shared>, now: i64) {
         let prev = shared.health.lock().ok().and_then(|h| h.get(name).cloned());
         let waiting = unanswered.get(name).copied().unwrap_or(0);
         let view = classify(&obs, waiting, now, config.health_stall_ms, prev.as_ref());
-        if let Ok(mut h) = shared.health.lock() {
-            h.insert(name.clone(), view.clone());
+        // The endpoint may have been unregistered or rebound while the log was read. Checked and recorded
+        // under the store lock, which unregistering holds while it clears the entry, so a stale
+        // observation is never put back.
+        let current = {
+            let Ok(store) = shared.store.lock() else { return };
+            let bound = store.endpoints().is_ok_and(|eps| eps.iter().any(|e| &e.name == name && e.session == session));
+            if let Ok(mut h) = shared.health.lock() {
+                if bound {
+                    h.insert(name.clone(), view.clone());
+                } else {
+                    h.remove(name);
+                }
+            }
+            bound
+        };
+        if current {
+            report(shared, name, &view, waiting);
         }
-        report(shared, name, &view, waiting);
     }
 }
 

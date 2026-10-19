@@ -307,3 +307,21 @@ fn a_notice_to_a_push_participant_waits_for_its_next_wake() {
     assert!(argv.contains(" chatd health info "), "{argv}");
     wait_for("the digest recorded", || queued() == Some(0));
 }
+
+#[test]
+fn unregistering_stops_the_inspection_at_once() {
+    let mut e = Env::new(30 * 60_000);
+    e.append(OK_TURN);
+    e.start();
+    e.register_codex();
+    wait_for("the first check", || e.codex_health() == Some(HealthState::Ok));
+    assert!(matches!(e.call(Request::EndpointUnregister { name: "codex".into() }), Response::Unregistered { removed: Some(_), .. }));
+    assert_eq!(e.codex().health, None, "health is cleared with the endpoint, not at the next check");
+    e.append(FILTERED_TURN);
+    several_checks();
+    assert_eq!(e.codex().health, None, "the session log is no longer read");
+    assert!(e.notices().is_empty(), "nothing is reported about an unregistered session");
+    let peers = String::from_utf8_lossy(&e.cli(&["peers"], "").stdout).into_owned();
+    let row = peers.lines().find(|l| l.starts_with("codex")).unwrap();
+    assert!(row.contains("pull") && !row.contains("OK") && !row.contains("FILTERED"), "{peers}");
+}
