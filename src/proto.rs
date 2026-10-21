@@ -74,6 +74,24 @@ pub struct SendReq {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Health,
+    Current {
+        as_: Option<String>,
+        conversation: Option<String>,
+        limit: u32,
+        after: Option<i64>,
+        history: bool,
+    },
+    Supersede {
+        as_: String,
+        id: String,
+        by: String,
+        reason: String,
+    },
+    ClassifyRehearsal {
+        as_: String,
+        id: String,
+        reason: String,
+    },
     Send(SendReq),
     Receive {
         as_: String,
@@ -189,6 +207,25 @@ pub struct AttemptView {
     pub finished_at_ms: Option<i64>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CurrentLine {
+    pub seq: i64,
+    pub message: StatusLine,
+    pub state: String,
+    pub delivery_state: Option<String>,
+    pub annotation_reason: Option<String>,
+    pub superseded_by: Option<String>,
+    pub rehearsal_reason: Option<String>,
+    pub latest_progress: Option<StatusLine>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CurrentView {
+    pub endpoints: Vec<EndpointView>,
+    pub rows: Vec<CurrentLine>,
+    pub total: i64,
+    pub next_after: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -367,6 +404,10 @@ pub enum Response {
     },
     Found(Receipt),
     Status(StatusView),
+    Current(CurrentView),
+    Annotated {
+        id: String,
+    },
     Log {
         events: Vec<EventView>,
     },

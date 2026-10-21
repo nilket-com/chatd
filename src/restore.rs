@@ -74,7 +74,7 @@ fn prepare_candidate(state_dir: &Path, backup: &Path) -> Result<(PathBuf, String
     let version: String = src
         .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
         .map_err(|e| format!("{}: not a chatd store ({e})", backup.display()))?;
-    if version != SCHEMA_VERSION.to_string() {
+    if version != "1" && version != SCHEMA_VERSION.to_string() {
         return Err(format!("{}: schema version {version} is not supported by this build", backup.display()));
     }
     let old_id: String = src

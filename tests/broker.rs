@@ -189,7 +189,7 @@ fn readiness_is_sent_only_with_a_serving_socket_and_health() {
     e.start();
     match e.call(Request::Health) {
         Response::Health { schema_version, head_seq, .. } => {
-            assert_eq!(schema_version, 1);
+            assert_eq!(schema_version, 2);
             assert!(head_seq >= 0);
         }
         other => panic!("{other:?}"),
@@ -2207,4 +2207,46 @@ fn a_submission_in_flight_during_unregister_finishes_fenced_and_is_never_retried
     assert_eq!(m.body.as_deref(), Some("in flight"));
     e.call(Request::Redeliver { id: id.clone() });
     wait_for("an explicit redelivery under generation 2", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed", "submitted"]);
+}
+
+#[test]
+fn current_work_cli_retains_received_requests_and_explicit_history() {
+    let mut e = Env::standard();
+    e.start();
+    let old = e.send("claude", "codex", "current-work", Kind::Request, "old", "old task");
+    let new = e.send("claude", "codex", "current-work", Kind::Request, "new", "new task");
+    assert_eq!(code(&e.cli(&["ack", "--as", "codex", &old], None)), 0);
+    let text = stdout(&e.cli(&["status", "--current", "--as", "codex"], None));
+    assert!(text.starts_with("endpoints / threads:"));
+    assert!(text.contains("[received-pending]"));
+    assert_eq!(code(&e.cli(&["supersede", "--as", "codex", "--id", &old, "--by", &new, "--reason", "new request"], None)), 5);
+    assert_eq!(code(&e.cli(&["supersede", "--as", "claude", "--id", &old, "--by", &new, "--reason", "new request"], None)), 0);
+    let out = e.cli(&["--json", "status", "--current", "--as", "codex"], None);
+    let current: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(current["total"], 1);
+    assert_eq!(current["rows"][0]["message"]["id"], new);
+    let text = stdout(&e.cli(&["status", "--current", "--history", "--as", "codex"], None));
+    assert!(text.contains("[superseded]"));
+    assert!(text.contains("new request"));
+    assert_eq!(e.status(Some("codex")).unanswered_total, 2);
+    assert_eq!(code(&e.cli(&["rehearsal", "--as", "claude", "--id", &new, "--reason", "synthetic probe"], None)), 0);
+    let out = e.cli(&["--json", "status", "--current"], None);
+    let current: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(current["total"], 0);
+}
+
+#[test]
+fn schema_one_backup_restores_then_migrates_without_touching_the_backup() {
+    let mut e = Env::standard();
+    let (backup, _, _) = restore_fixture(&mut e);
+    {
+        let c = rusqlite::Connection::open(&backup).unwrap();
+        c.execute_batch("DROP TABLE work_annotations; UPDATE meta SET value='1' WHERE key='schema_version'").unwrap();
+    }
+    let original = std::fs::read(&backup).unwrap();
+    assert!(run_restore(&e, &backup, None).status.success());
+    e.start();
+    assert_eq!(facts(&e).1, 1);
+    assert!(matches!(e.call(Request::Health), Response::Health { schema_version: 2, .. }));
+    assert_eq!(std::fs::read(&backup).unwrap(), original);
 }

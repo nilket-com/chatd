@@ -464,7 +464,10 @@ fn handle(shared: &Arc<Shared>, stream: UnixStream) -> io::Result<()> {
 fn reserved_name(req: &Request) -> Option<&str> {
     let names: Vec<&str> = match req {
         Request::Send(r) => [Some(r.from.as_str()), r.to.as_deref()].into_iter().flatten().collect(),
-        Request::Receive { as_, .. } | Request::Ack { as_, .. } => vec![as_.as_str()],
+        Request::Receive { as_, .. }
+        | Request::Ack { as_, .. }
+        | Request::Supersede { as_, .. }
+        | Request::ClassifyRehearsal { as_, .. } => vec![as_.as_str()],
         Request::EndpointRegister { name, .. } | Request::EndpointUnregister { name } => vec![name.as_str()],
         _ => Vec::new(),
     };
@@ -520,6 +523,23 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
                     );
                 }
                 Response::Acked { acknowledged, already }
+            }
+            Err(e) => err(e),
+        },
+        Request::Current { as_, conversation, limit, after, history } => {
+            store.current(as_.as_deref(), conversation.as_deref(), limit, after, history).map(Response::Current).unwrap_or_else(err)
+        }
+        Request::Supersede { as_, id, by, reason } => match store.annotate_work(&as_, &id, Some(&by), &reason) {
+            Ok(()) => {
+                wrote = true;
+                Response::Annotated { id }
+            }
+            Err(e) => err(e),
+        },
+        Request::ClassifyRehearsal { as_, id, reason } => match store.annotate_work(&as_, &id, None, &reason) {
+            Ok(()) => {
+                wrote = true;
+                Response::Annotated { id }
             }
             Err(e) => err(e),
         },

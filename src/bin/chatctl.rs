@@ -137,8 +137,37 @@ enum Cmd {
         #[arg(long)]
         exclusive: bool,
     },
+    /// Explicitly retire a request in favor of a newer request in the same conversation.
+    Supersede {
+        #[arg(long = "as")]
+        who: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Explicitly classify a sender-owned request as a rehearsal (retains history).
+    Rehearsal {
+        #[arg(long = "as")]
+        who: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Unacknowledged messages, unanswered requests, submissions, endpoints and watchers.
     Status {
+        /// Concise active request view; never hides unfinished work just because it is old.
+        #[arg(long)]
+        current: bool,
+        /// Include final, superseded and explicitly classified rehearsal requests (with --current).
+        #[arg(long, requires = "current")]
+        history: bool,
+        /// Continue the current-work page after this message sequence.
+        #[arg(long, requires = "current")]
+        after: Option<i64>,
         #[arg(long = "as")]
         who: Option<String>,
         #[arg(long)]
@@ -851,7 +880,82 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
         Cmd::Watch { who, conversation, resume_token, timeout, exclusive } => {
             return Err(watch(&who, conversation, resume_token, timeout, exclusive));
         }
-        Cmd::Status { who, conversation, limit, unacknowledged_after, unanswered_after } => {
+        Cmd::Supersede { who, id, by, reason } => {
+            let r = call(Request::Supersede { as_: who, id, by, reason })?;
+            if json {
+                print_json(&r);
+            } else {
+                println!("request superseded (history retained)");
+            }
+        }
+        Cmd::Rehearsal { who, id, reason } => {
+            let r = call(Request::ClassifyRehearsal { as_: who, id, reason })?;
+            if json {
+                print_json(&r);
+            } else {
+                println!("request classified as rehearsal (history retained)");
+            }
+        }
+        Cmd::Status { current, history, after, who, conversation, limit, unacknowledged_after, unanswered_after } => {
+            if current {
+                let Response::Current(s) = call(Request::Current { as_: who, conversation, limit, after, history })? else {
+                    return Err(ExitCode::FAILURE);
+                };
+                if json {
+                    print_json(&s);
+                    return Ok(());
+                }
+                println!("endpoints / threads:");
+                for e in &s.endpoints {
+                    println!("  {} session {} generation {}", e.name, e.session, e.generation);
+                }
+                println!("requests ({} shown of {}):", s.rows.len(), s.total);
+                for state in [
+                    "uncertain-submission",
+                    "failed-delivery",
+                    "submission-in-flight",
+                    "unreceived",
+                    "received-pending",
+                    "final",
+                    "superseded",
+                    "rehearsal",
+                ] {
+                    for r in s.rows.iter().filter(|r| {
+                        let group = if matches!(r.state.as_str(), "final" | "superseded" | "rehearsal") || r.message.received {
+                            r.state.as_str()
+                        } else {
+                            match r.delivery_state.as_deref() {
+                                Some("uncertain") => "uncertain-submission",
+                                Some("failed") => "failed-delivery",
+                                Some("started") => "submission-in-flight",
+                                _ => r.state.as_str(),
+                            }
+                        };
+                        group == state
+                    }) {
+                        let m = &r.message;
+                        println!("  [{}] {} {}->{} {}: {}", state, m.id, m.sender, m.recipient, m.conversation, m.summary);
+                        if let Some(submission) = &m.submission {
+                            println!("    submission: {submission}");
+                        }
+                        if let Some(p) = &r.latest_progress {
+                            println!("    progress {}: {}", p.id, p.summary);
+                        }
+                        if let Some(by) = &r.superseded_by {
+                            println!("    replaced by {by}: {}", text::sanitize_line(r.annotation_reason.as_deref().unwrap_or(""), 1024));
+                        }
+                        if let Some(reason) = &r.rehearsal_reason {
+                            println!("    rehearsal: {}", text::sanitize_line(reason, 1024));
+                        }
+                    }
+                }
+                if let Some(after) = s.next_after {
+                    println!("more: repeat filters with --after {after}");
+                }
+                println!("full history: chatctl status --current --history (repeat filters)");
+                return Ok(());
+            }
+
             let Response::Status(s) = call(Request::Status { as_: who, conversation, limit, unacknowledged_after, unanswered_after })?
             else {
                 return Err(ExitCode::FAILURE);

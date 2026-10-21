@@ -313,3 +313,42 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
 the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
 any additional terms or conditions.
+
+### Current work without losing history
+
+`chatctl status --current` is an opt-in request triage view. It prints endpoint
+session/thread identifiers first, then unreceived requests and requests received
+but still lacking a final reply. It does not infer completion from acknowledgement,
+message age, an unrelated progress message, or a successful adapter submission.
+The latest linked progress reply and latest submission state are shown separately.
+Use `--as NAME`, `--conversation NAME`, `--limit N` and the returned `--after SEQ`
+cursor to inspect bounded pages. Repeat filters when continuing a page.
+
+```sh
+chatctl status --current --as codex
+chatctl status --current --history --as codex
+chatctl supersede --as alice --id OLD --by NEW --reason 'Replacement request'
+chatctl rehearsal --as alice --id ID --reason 'Synthetic delivery probe'
+```
+
+Only a request's sender may annotate it (like other `--as` operations, this is a
+local participant assertion, not authentication against another OS user). A
+replacement must be a strictly newer request between the same participants in
+the same conversation. This makes cycles impossible. An annotation is immutable;
+repeating the exact action is idempotent, conflicting changes are refused. Each
+annotation and its audit events are committed together. Supersession does not
+acknowledge, delete, or manufacture a final reply; annotations retire future
+automatic pushes/digests and pull-watch replay, and refuse explicit redelivery. Already running adapters
+are not cancelled and their submitted/failed/uncertain outcomes remain recorded.
+Rehearsals are classified
+only by explicit action, never by guessing from their text.
+
+`--current --history` includes final, superseded and rehearsal requests with their
+explicit states. Ordinary `status` and its JSON format retain their existing full
+report semantics, including non-request messages and delivery failures. `log`
+retains the durable audit. Current view uses a new protocol operation; an older
+daemon refuses it rather than silently returning an incomplete legacy view.
+The schema-1 to schema-2 migration adds an annotation table without rewriting
+messages. Old binaries refuse schema 2, preventing them from ignoring retirement
+and delivering retired work. Legacy status still lists superseded requests as
+unanswered when no real final reply exists. Back up before upgrading.

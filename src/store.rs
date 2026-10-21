@@ -9,12 +9,12 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 
 use crate::proto::{
-    AttemptView, EndpointView, ErrorCode, EventView, Kind, MAX_BODY, MAX_CONVERSATION_LEN, MAX_KEY_LEN, MAX_LOG_PAGE, MAX_PAGE,
-    MessageView, Receipt, SendReq, StatusLine, StatusView,
+    AttemptView, CurrentLine, CurrentView, EndpointView, ErrorCode, EventView, Kind, MAX_BODY, MAX_CONVERSATION_LEN, MAX_KEY_LEN,
+    MAX_LOG_PAGE, MAX_PAGE, MessageView, Receipt, SendReq, StatusLine, StatusView,
 };
 use crate::text;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 /// Failed submissions per message (since its last explicit redelivery) before giving up.
 pub const MAX_FAILED_ATTEMPTS: i64 = 3;
 /// Default backoff after the n-th failed submission (1-based), in milliseconds.
@@ -202,14 +202,24 @@ impl Store {
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get::<_, String>(0))?
             .parse()
             .map_err(|_| StoreError::new(ErrorCode::Storage, "schema_version is not an integer"))?;
-        if version != SCHEMA_VERSION {
+        if version != 1 && version != SCHEMA_VERSION {
             return Err(StoreError::new(
                 ErrorCode::Storage,
                 format!("schema version {version} is not supported (this build: {SCHEMA_VERSION}); the database is left untouched"),
             ));
         }
-        // Added after schema 1 shipped; additive, so an older build still opens a store that has it.
+        // Digests were an additive schema-1 extension. Schema 2 adds retirement semantics;
+        // schema-1 daemons must refuse it rather than silently deliver retired work.
         tx.execute_batch(DIGESTS)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS work_annotations (
+            message_id TEXT PRIMARY KEY REFERENCES messages(id),
+            by_request TEXT REFERENCES messages(id),
+            rehearsal INTEGER NOT NULL CHECK(rehearsal IN (0,1)),
+            actor TEXT NOT NULL REFERENCES participants(name), reason TEXT NOT NULL, at_ms INTEGER NOT NULL
+        ) STRICT;",
+        )?;
+        tx.execute("UPDATE meta SET value=?1 WHERE key='schema_version'", [SCHEMA_VERSION.to_string()])?;
         for p in participants {
             if !valid_name(p) {
                 return Err(StoreError::new(ErrorCode::BadRequest, format!("participant name {p:?} is not valid")));
@@ -505,6 +515,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT m.id FROM messages m
              WHERE m.recipient = ?1 AND (?2 IS NULL OR m.conversation = ?2) AND m.seq > ?3
+               AND NOT EXISTS (SELECT 1 FROM work_annotations w WHERE w.message_id=m.id)
                AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
              ORDER BY m.seq LIMIT ?4",
         )?;
@@ -518,6 +529,7 @@ impl Store {
         Ok(self.conn.query_row(
             "SELECT count(*) FROM messages m
              WHERE m.recipient = ?1 AND (?2 IS NULL OR m.conversation = ?2)
+               AND NOT EXISTS (SELECT 1 FROM work_annotations w WHERE w.message_id=m.id)
                AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.reader = m.recipient AND a.message_id = m.id)",
             params![reader, conversation],
             |r| r.get(0),
@@ -529,6 +541,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT seq, at_ms, kind, audience, message_id, conversation, detail FROM events
              WHERE audience = ?1 AND seq > ?2 AND (?3 IS NULL OR conversation IS NULL OR conversation = ?3)
+               AND (kind <> 'message_stored' OR NOT EXISTS (SELECT 1 FROM work_annotations w WHERE w.message_id=events.message_id))
              ORDER BY seq LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![audience, after_seq, conversation, limit], event_row)?;
@@ -631,6 +644,136 @@ impl Store {
         })
     }
 
+    /// Explicit annotations never acknowledge messages or synthesize replies.
+    pub fn annotate_work(&mut self, actor: &str, id: &str, by: Option<&str>, reason: &str) -> Result<()> {
+        self.require_participant(actor)?;
+        if reason.trim().is_empty() || reason.len() > 1024 {
+            return Err(StoreError::new(ErrorCode::BadRequest, "reason must contain 1-1024 bytes"));
+        }
+        let old = self.view_without_body(id)?;
+        if old.sender != actor || old.kind != Kind::Request {
+            return Err(StoreError::new(ErrorCode::BadRequest, "only the request sender may annotate it"));
+        }
+        if let Some(by) = by {
+            let new = self.view_without_body(by)?;
+            if new.kind != Kind::Request
+                || new.sender != actor
+                || new.recipient != old.recipient
+                || new.conversation != old.conversation
+                || new.seq <= old.seq
+            {
+                return Err(StoreError::new(
+                    ErrorCode::BadRequest,
+                    "replacement must be a newer request with the same participants and conversation",
+                ));
+            }
+        }
+        let now = now_ms();
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // One immutable annotation; conflicting rewrites are refused rather than silently changing history.
+        let previous: Option<(Option<String>, String, String)> = tx
+            .query_row("SELECT by_request,actor,reason FROM work_annotations WHERE message_id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        if let Some(previous) = previous {
+            if previous == (by.map(str::to_owned), actor.to_owned(), reason.to_owned()) {
+                return Ok(());
+            }
+            return Err(StoreError::new(ErrorCode::Conflict, "request already has a different annotation"));
+        }
+        tx.execute(
+            "INSERT INTO work_annotations VALUES (?1,?2,?3,?4,?5,?6)",
+            params![id, by, i64::from(by.is_none()), actor, reason, now],
+        )?;
+        for audience in BTreeSet::from([old.sender.as_str(), old.recipient.as_str()]) {
+            tx.execute(
+                "INSERT INTO events (at_ms,kind,audience,message_id,conversation,detail) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    now,
+                    if by.is_some() { "superseded" } else { "rehearsal" },
+                    audience,
+                    id,
+                    old.conversation,
+                    json!({"by":by,"actor":actor,"reason":reason}).to_string()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn current(
+        &self,
+        who: Option<&str>,
+        conversation: Option<&str>,
+        limit: u32,
+        after: Option<i64>,
+        history: bool,
+    ) -> Result<CurrentView> {
+        if let Some(who) = who {
+            self.require_participant(who)?;
+        }
+        let filter = "FROM messages m LEFT JOIN work_annotations w ON w.message_id=m.id
+            WHERE m.kind='request' AND (?1 IS NULL OR m.sender=?1 OR m.recipient=?1)
+            AND (?2 IS NULL OR m.conversation=?2)
+            AND (?3 OR (w.message_id IS NULL AND NOT EXISTS(SELECT 1 FROM messages r WHERE r.reply_to=m.id AND r.kind='final')))";
+        let total = self.conn.query_row(&format!("SELECT count(*) {filter}"), params![who, conversation, history], |r| r.get(0))?;
+        let limit = limit.clamp(1, MAX_PAGE) as usize;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT m.id,m.seq,w.by_request,w.reason,w.rehearsal {filter} AND m.seq>?4 ORDER BY m.seq LIMIT ?5"))?;
+        let records = stmt
+            .query_map(params![who, conversation, history, after.unwrap_or(0), limit as i64 + 1], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<bool>>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let more = records.len() > limit;
+        let mut rows = Vec::new();
+        for (id, seq, superseded_by, reason, rehearsal) in records.into_iter().take(limit) {
+            let message = self.status_line(&self.view_without_body(&id)?, now_ms())?;
+            let progress: Option<String> = self
+                .conn
+                .query_row("SELECT id FROM messages WHERE reply_to=?1 AND kind='progress' ORDER BY seq DESC LIMIT 1", [&id], |r| r.get(0))
+                .optional()?;
+            let latest_progress = progress.map(|id| self.status_line(&self.view_without_body(&id)?, now_ms())).transpose()?;
+            let state = if superseded_by.is_some() {
+                "superseded"
+            } else if rehearsal == Some(true) {
+                "rehearsal"
+            } else if message.answered_by.is_some() {
+                "final"
+            } else if message.received {
+                "received-pending"
+            } else {
+                "unreceived"
+            }
+            .to_owned();
+            let delivery_state = self
+                .conn
+                .query_row("SELECT state FROM attempts WHERE message_id=?1 ORDER BY id DESC LIMIT 1", [&id], |r| r.get(0))
+                .optional()?;
+            rows.push(CurrentLine {
+                delivery_state,
+                annotation_reason: reason.clone(),
+                seq,
+                message,
+                state,
+                superseded_by,
+                rehearsal_reason: if rehearsal == Some(true) { reason } else { None },
+                latest_progress,
+            });
+        }
+        let next_after = if more { rows.last().map(|r| r.seq) } else { None };
+        Ok(CurrentView { endpoints: self.endpoints()?, rows, total, next_after })
+    }
+
     pub fn endpoints(&self) -> Result<Vec<EndpointView>> {
         let mut stmt = self.conn.prepare("SELECT name, session, exe, generation, registered_at_ms FROM endpoints ORDER BY name")?;
         let rows = stmt.query_map([], |r| {
@@ -722,6 +865,10 @@ impl Store {
         let exists: i64 = tx.query_row("SELECT count(*) FROM messages WHERE id = ?1", [id], |r| r.get(0))?;
         if exists == 0 {
             return Err(StoreError::new(ErrorCode::NotFound, format!("no message {id}")));
+        }
+        let retired: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM work_annotations WHERE message_id=?1)", [id], |r| r.get(0))?;
+        if retired {
+            return Err(StoreError::new(ErrorCode::Conflict, "annotated request is retired; create a new request instead"));
         }
         let running: i64 = tx.query_row("SELECT count(*) FROM attempts WHERE message_id = ?1 AND state = 'started'", [id], |r| r.get(0))?;
         if running > 0 {
@@ -820,6 +967,7 @@ impl Store {
              WHERE m.recipient = ?1 AND (?2 IS NULL OR m.id <> ?2)
                AND ((m.kind = 'request' AND ?3) OR (m.kind = 'info' AND ?4) OR (m.kind = 'progress' AND ?5) OR (m.kind = 'final' AND ?6))
                AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
+               AND NOT EXISTS (SELECT 1 FROM work_annotations w WHERE w.message_id=m.id)
                AND NOT EXISTS (SELECT 1 FROM digests d WHERE d.message_id = m.id)
                AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.message_id = m.id AND t.state <> 'failed')";
         let queued = |k: Kind| !waking.contains(&k);
@@ -1047,6 +1195,10 @@ fn insert_message(tx: &rusqlite::Transaction<'_>, m: &NewMessage<'_>, now: i64) 
 
 /// The retry policy for one message and endpoint (see `Store::due_deliveries`).
 fn is_due(conn: &Connection, id: &str, ep: &EndpointView, now: i64) -> Result<bool> {
+    let retired: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM work_annotations WHERE message_id=?1)", [id], |r| r.get(0))?;
+    if retired {
+        return Ok(false);
+    }
     let after: i64 =
         conn.query_row("SELECT after_attempt FROM redeliveries WHERE message_id = ?1", [id], |r| r.get(0)).optional()?.unwrap_or(0);
     let latest: Option<(String, i64, Option<i64>)> = conn
