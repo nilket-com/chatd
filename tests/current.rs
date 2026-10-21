@@ -85,8 +85,9 @@ fn explicit_supersession_is_owned_causal_audited_and_durable() {
     let mut reopened = Store::open(&f.dir.join("db")).unwrap();
     reopened.migrate(&[]).unwrap();
     let h = reopened.current(None, Some("work"), 20, None, true).unwrap();
-    assert_eq!(h.rows[0].state, "superseded");
-    assert_eq!(h.rows[0].superseded_by.as_deref(), Some(b.as_str()));
+    let retired = h.rows.iter().find(|r| r.message.id == a).unwrap();
+    assert_eq!(retired.state, "superseded");
+    assert_eq!(retired.superseded_by.as_deref(), Some(b.as_str()));
     // A supersession is not a fabricated final and does not mutate legacy reporting.
     assert_eq!(reopened.status(None, Some("work"), 20, None, None).unwrap().unanswered_total, 2);
 }
@@ -152,4 +153,40 @@ fn schema_one_upgrade_is_atomic_and_preserves_source_messages() {
     assert_eq!(version, "2");
     // The same guard shipped in schema-1 binaries will reject the upgraded store.
     assert_ne!(version, "1");
+}
+
+#[test]
+fn current_activity_is_newest_first_and_snapshot_paging_keeps_old_pending() {
+    let mut f = Fixture::new();
+    let mut ids = Vec::new();
+    for _ in 0..65 {
+        ids.push(f.send("alice", "bob", "work", Kind::Request, None));
+    }
+    let progress = f.send("bob", "alice", "work", Kind::Progress, Some(&ids[0]));
+    let first = f.store.current(None, None, 10, None, false).unwrap();
+    assert_eq!(first.total, 65);
+    assert_eq!(first.rows[0].message.id, ids[0]);
+    assert_eq!(first.rows[0].latest_progress.as_ref().unwrap().id, progress);
+    assert_eq!(first.rows[1].message.id, ids[64]);
+    assert!(first.rows.windows(2).all(|w| w[0].activity_seq > w[1].activity_seq));
+    let snapshot = first.snapshot_seq;
+    // An unseen old request receives progress after page one. Its old activity
+    // remains inside this snapshot; it must not jump over the cursor and vanish.
+    f.send("bob", "alice", "work", Kind::Progress, Some(&ids[1]));
+    let mut seen: Vec<_> = first.rows.iter().map(|r| r.message.id.clone()).collect();
+    let mut cursor = first.next_after;
+    while let Some(after) = cursor {
+        let page = f.store.current(None, None, 10, Some(after), false).unwrap();
+        assert_eq!(page.total, 65);
+        assert_eq!(page.snapshot_seq, snapshot);
+        seen.extend(page.rows.iter().map(|r| r.message.id.clone()));
+        cursor = page.next_after;
+    }
+    assert_eq!(seen.len(), 65);
+    let unique: std::collections::BTreeSet<_> = seen.into_iter().collect();
+    assert_eq!(unique, ids.iter().cloned().collect());
+    let fresh = f.store.current(None, None, 10, None, false).unwrap();
+    assert_eq!(fresh.rows[0].message.id, ids[1]);
+    assert!(f.store.current(None, None, 10, Some("broken".into()), false).is_err());
+    assert!(f.store.current(None, None, 10, Some("1:2".into()), false).is_err());
 }

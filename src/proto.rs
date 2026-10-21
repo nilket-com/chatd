@@ -78,7 +78,7 @@ pub enum Request {
         as_: Option<String>,
         conversation: Option<String>,
         limit: u32,
-        after: Option<i64>,
+        after: Option<String>,
         history: bool,
     },
     Supersede {
@@ -212,6 +212,7 @@ pub struct AttemptView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CurrentLine {
     pub seq: i64,
+    pub activity_seq: i64,
     pub message: StatusLine,
     pub state: String,
     pub delivery_state: Option<String>,
@@ -225,7 +226,8 @@ pub struct CurrentView {
     pub endpoints: Vec<EndpointView>,
     pub rows: Vec<CurrentLine>,
     pub total: i64,
-    pub next_after: Option<i64>,
+    pub next_after: Option<String>,
+    pub snapshot_seq: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

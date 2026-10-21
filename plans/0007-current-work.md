@@ -6,8 +6,10 @@ receipt is not completion. Preserve the existing status wire response and offer
 an explicit concise view instead.
 
 Implemented scope:
-- `status --current`, request-only, bounded and sequence-paginated, with optional
+- `status --current`, request-only, bounded and newest-activity-paginated, with optional
   history, endpoint session IDs first, and linked progress/submission details.
+  Opaque snapshot/activity cursors keep pagination stable when new progress moves
+  older requests; every genuinely pending request remains reachable.
 - Sender-owned immutable supersession and rehearsal annotations in an additive
   schema-2 table with atomic migration from schema 1. Durable audience audit events are atomic with the annotation.
 - Forward-only same-conversation replacements prevent cycles without graph walks.

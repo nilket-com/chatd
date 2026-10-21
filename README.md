@@ -321,12 +321,19 @@ session/thread identifiers first, then unreceived requests and requests received
 but still lacking a final reply. It does not infer completion from acknowledgement,
 message age, an unrelated progress message, or a successful adapter submission.
 The latest linked progress reply and latest submission state are shown separately.
-Use `--as NAME`, `--conversation NAME`, `--limit N` and the returned `--after SEQ`
-cursor to inspect bounded pages. Repeat filters when continuing a page.
+Requests are ordered by newest activity: their request or latest linked progress
+reply. Older genuine pending requests remain counted and accessible through pages.
+Use `--as NAME`, `--conversation NAME`, `--limit N` and the returned `--after CURSOR`
+to inspect bounded pages. Repeat filters when continuing a page. The opaque cursor
+pins activity ordering to the first page's event-head snapshot; later progress
+cannot move unseen work across that cursor. Start without a cursor to see new
+activity. Completion/retirement can still remove work from the current view while
+paging; this is an ordering snapshot, not a historical snapshot of request state.
 
 ```sh
 chatctl status --current --as codex
 chatctl status --current --history --as codex
+chatctl status --current --as codex --limit 10 --after 812:754 # example returned cursor
 chatctl supersede --as alice --id OLD --by NEW --reason 'Replacement request'
 chatctl rehearsal --as alice --id ID --reason 'Synthetic delivery probe'
 ```

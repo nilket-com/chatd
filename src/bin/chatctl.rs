@@ -165,9 +165,9 @@ enum Cmd {
         /// Include final, superseded and explicitly classified rehearsal requests (with --current).
         #[arg(long, requires = "current")]
         history: bool,
-        /// Continue the current-work page after this message sequence.
+        /// Continue current work with its opaque snapshot/activity cursor.
         #[arg(long, requires = "current")]
-        after: Option<i64>,
+        after: Option<String>,
         #[arg(long = "as")]
         who: Option<String>,
         #[arg(long)]

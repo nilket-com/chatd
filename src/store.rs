@@ -708,39 +708,58 @@ impl Store {
         who: Option<&str>,
         conversation: Option<&str>,
         limit: u32,
-        after: Option<i64>,
+        after: Option<String>,
         history: bool,
     ) -> Result<CurrentView> {
         if let Some(who) = who {
             self.require_participant(who)?;
         }
+        // Pin ordering to the first page's head so later progress cannot move an
+        // unseen pending request across a continuation cursor.
+        let (snapshot, before) = match after {
+            None => (self.head_seq()?, i64::MAX),
+            Some(cursor) => {
+                let parsed = cursor.split_once(':').and_then(|(s, b)| Some((s.parse::<i64>().ok()?, b.parse::<i64>().ok()?)));
+                match parsed {
+                    Some((s, b)) if s >= 0 && b > 0 && b <= s => (s, b),
+                    _ => return Err(StoreError::new(ErrorCode::BadRequest, "invalid current-work cursor; repeat the original filters")),
+                }
+            }
+        };
         let filter = "FROM messages m LEFT JOIN work_annotations w ON w.message_id=m.id
-            WHERE m.kind='request' AND (?1 IS NULL OR m.sender=?1 OR m.recipient=?1)
+            WHERE m.kind='request' AND m.seq <= ?4 AND (?1 IS NULL OR m.sender=?1 OR m.recipient=?1)
             AND (?2 IS NULL OR m.conversation=?2)
             AND (?3 OR (w.message_id IS NULL AND NOT EXISTS(SELECT 1 FROM messages r WHERE r.reply_to=m.id AND r.kind='final')))";
-        let total = self.conn.query_row(&format!("SELECT count(*) {filter}"), params![who, conversation, history], |r| r.get(0))?;
+        let total =
+            self.conn.query_row(&format!("SELECT count(*) {filter}"), params![who, conversation, history, snapshot], |r| r.get(0))?;
         let limit = limit.clamp(1, MAX_PAGE) as usize;
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT m.id,m.seq,w.by_request,w.reason,w.rehearsal {filter} AND m.seq>?4 ORDER BY m.seq LIMIT ?5"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT * FROM (SELECT m.id,m.seq,w.by_request,w.reason,w.rehearsal,
+             max(m.seq,coalesce((SELECT max(p.seq) FROM messages p WHERE p.reply_to=m.id AND p.kind='progress' AND p.seq<=?4),m.seq)) AS activity_seq
+             {filter}) WHERE activity_seq < ?5 ORDER BY activity_seq DESC LIMIT ?6"))?;
         let records = stmt
-            .query_map(params![who, conversation, history, after.unwrap_or(0), limit as i64 + 1], |r| {
+            .query_map(params![who, conversation, history, snapshot, before, limit as i64 + 1], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<bool>>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let more = records.len() > limit;
         let mut rows = Vec::new();
-        for (id, seq, superseded_by, reason, rehearsal) in records.into_iter().take(limit) {
+        for (id, seq, superseded_by, reason, rehearsal, activity_seq) in records.into_iter().take(limit) {
             let message = self.status_line(&self.view_without_body(&id)?, now_ms())?;
             let progress: Option<String> = self
                 .conn
-                .query_row("SELECT id FROM messages WHERE reply_to=?1 AND kind='progress' ORDER BY seq DESC LIMIT 1", [&id], |r| r.get(0))
+                .query_row(
+                    "SELECT id FROM messages WHERE reply_to=?1 AND kind='progress' AND seq<=?2 ORDER BY seq DESC LIMIT 1",
+                    params![id, snapshot],
+                    |r| r.get(0),
+                )
                 .optional()?;
             let latest_progress = progress.map(|id| self.status_line(&self.view_without_body(&id)?, now_ms())).transpose()?;
             let state = if superseded_by.is_some() {
@@ -763,6 +782,7 @@ impl Store {
                 delivery_state,
                 annotation_reason: reason.clone(),
                 seq,
+                activity_seq,
                 message,
                 state,
                 superseded_by,
@@ -770,8 +790,8 @@ impl Store {
                 latest_progress,
             });
         }
-        let next_after = if more { rows.last().map(|r| r.seq) } else { None };
-        Ok(CurrentView { endpoints: self.endpoints()?, rows, total, next_after })
+        let next_after = if more { rows.last().map(|r| format!("{snapshot}:{}", r.activity_seq)) } else { None };
+        Ok(CurrentView { endpoints: self.endpoints()?, rows, total, next_after, snapshot_seq: snapshot })
     }
 
     pub fn endpoints(&self) -> Result<Vec<EndpointView>> {
