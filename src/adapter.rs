@@ -43,10 +43,29 @@ pub fn run(shared: Arc<Shared>) {
             }
             Err(_) => return,
         };
+        // At most one push per endpoint per pass, and only when its throttle allows; the rest wait and
+        // ride in a later push's digest.
+        let mut pushed: Vec<String> = Vec::new();
         for d in due {
             if shared.shutdown.load(Ordering::SeqCst) {
                 return;
             }
+            if pushed.contains(&d.endpoint.name) {
+                continue;
+            }
+            let allowed = shared.store.lock().map(|s| {
+                s.push_allowed(&d.endpoint, now_ms(), shared.config.push_min_interval_ms as i64, shared.config.push_inflight_ms as i64)
+            });
+            match allowed {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => continue,
+                Ok(Err(e)) => {
+                    journal::log(journal::PRIORITY_ERR, &format!("could not check the push throttle for {}: {e}", d.endpoint.name), &[]);
+                    continue;
+                }
+                Err(_) => return,
+            }
+            pushed.push(d.endpoint.name.clone());
             deliver(&shared, &d);
         }
         // Wake on the next commit, or after a second to honour retry backoff deadlines.
@@ -72,10 +91,11 @@ fn deliver(shared: &Arc<Shared>, d: &Delivery) {
         &[fields[0], fields[1], fields[2], ("EVENT", "submission_started")],
     );
     // Read after the attempt is recorded, so a digest carried by an earlier push in this pass is not repeated.
-    let kinds = shared.config.wake_kinds(&d.endpoint.name);
+    let kinds = if shared.config.push_coalesce { Vec::new() } else { shared.config.wake_kinds(&d.endpoint.name) };
     let queued = match shared
         .store
         .lock()
+        // Coalescing: every kind, waking ones included, so a request that would need its own push rides here.
         .map(|s| s.queued_for_wake(&d.endpoint.name, &kinds, Some(&d.message.id), text::DIGEST_MAX_ITEMS as u32))
     {
         Ok(Ok(q)) => q,

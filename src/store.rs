@@ -936,6 +936,25 @@ impl Store {
         Ok(out)
     }
 
+    /// Whether a push may go to `ep` now: none started within `min_interval_ms`, and no submitted,
+    /// started or uncertain push of a still-unacknowledged message within `inflight_ms`.
+    pub fn push_allowed(&self, ep: &EndpointView, now: i64, min_interval_ms: i64, inflight_ms: i64) -> Result<bool> {
+        let last: Option<i64> =
+            self.conn
+                .query_row("SELECT max(started_at_ms) FROM attempts WHERE endpoint = ?1 AND state <> 'failed'", [&ep.name], |r| r.get(0))?;
+        if last.is_some_and(|t| now - t < min_interval_ms) {
+            return Ok(false);
+        }
+        let inflight: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts t JOIN messages m ON m.id = t.message_id
+               WHERE t.endpoint = ?1 AND t.state IN ('started', 'submitted', 'uncertain') AND t.started_at_ms > ?2
+                 AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.reader = m.recipient AND a.message_id = m.id))",
+            params![ep.name, now - inflight_ms],
+            |r| r.get(0),
+        )?;
+        Ok(!inflight)
+    }
+
     /// Persists an attempt BEFORE the adapter runs. The selection is re-validated inside the same
     /// write transaction: if the message was acknowledged, redelivered or already attempted, or the
     /// endpoint was rebound (generation, session or executable changed) since `due_deliveries`,
@@ -1219,8 +1238,16 @@ fn is_due(conn: &Connection, id: &str, ep: &EndpointView, now: i64) -> Result<bo
     if retired {
         return Ok(false);
     }
-    let after: i64 =
-        conn.query_row("SELECT after_attempt FROM redeliveries WHERE message_id = ?1", [id], |r| r.get(0)).optional()?.unwrap_or(0);
+    let redelivery: Option<i64> =
+        conn.query_row("SELECT after_attempt FROM redeliveries WHERE message_id = ?1", [id], |r| r.get(0)).optional()?;
+    // A push's digest delivered it, so it is not pushed again on its own unless explicitly redelivered.
+    if redelivery.is_none() {
+        let digested: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM digests WHERE message_id = ?1)", [id], |r| r.get(0))?;
+        if digested {
+            return Ok(false);
+        }
+    }
+    let after = redelivery.unwrap_or(0);
     let latest: Option<(String, i64, Option<i64>)> = conn
         .query_row(
             "SELECT state, generation, next_retry_at_ms FROM attempts WHERE message_id = ?1 AND id > ?2 ORDER BY id DESC LIMIT 1",

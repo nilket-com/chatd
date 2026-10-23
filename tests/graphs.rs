@@ -59,7 +59,7 @@ impl Daemon {
         let list = names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
         // Health notices would be extra traffic in the inboxes these scenarios count; health has its own tests.
         let mut config = format!(
-            "participants = [{list}]\nheartbeat_ms = 300\nadapter_timeout_ms = 3000\nretry_backoff_ms = [100, 100, 100]\nhealth_interval_ms = 0\n"
+            "participants = [{list}]\nheartbeat_ms = 300\nadapter_timeout_ms = 3000\nretry_backoff_ms = [100, 100, 100]\nhealth_interval_ms = 0\npush_min_interval_ms = 0\npush_inflight_ms = 0\npush_coalesce = false\n"
         );
         for (i, (name, product)) in specs.iter().enumerate() {
             config.push_str(&format!("[participant.{name}]\nproduct = \"{}\"\ntier = \"{}\"\n", product.token(), TIERS[i % TIERS.len()]));

@@ -46,6 +46,19 @@ pub struct Config {
     /// Backoff after the 1st, 2nd, ... failed submission of one message.
     #[serde(default = "default_retry_backoff_ms")]
     pub retry_backoff_ms: Vec<u64>,
+    /// Minimum time between two pushes to one endpoint. Each push is a model turn for the agent, so
+    /// this bounds the wake rate whatever the senders do; messages arriving meanwhile ride in the
+    /// next push's digest.
+    #[serde(default = "default_push_min_interval_ms")]
+    pub push_min_interval_ms: u64,
+    /// While a submitted push is unacknowledged, no further push goes to that endpoint for up to this
+    /// long, so a busy agent's queue never fills with one prompt per message.
+    #[serde(default = "default_push_inflight_ms")]
+    pub push_inflight_ms: u64,
+    /// When true, a push's digest also carries waking messages that are due, so they need no push of
+    /// their own. False restores one push per waking message.
+    #[serde(default = "default_push_coalesce")]
+    pub push_coalesce: bool,
     /// How often each inspected participant's session log is checked (`health.rs`); 0 turns the check off.
     #[serde(default = "default_health_interval_ms")]
     pub health_interval_ms: u64,
@@ -73,6 +86,15 @@ fn default_adapter_timeout_ms() -> u64 {
 fn default_retry_backoff_ms() -> Vec<u64> {
     crate::store::RETRY_BACKOFF_MS.to_vec()
 }
+fn default_push_min_interval_ms() -> u64 {
+    60_000
+}
+fn default_push_inflight_ms() -> u64 {
+    15 * 60_000
+}
+fn default_push_coalesce() -> bool {
+    true
+}
 fn default_health_interval_ms() -> u64 {
     5 * 60_000
 }
@@ -89,6 +111,9 @@ impl Default for Config {
             write_deadline_ms: default_write_deadline_ms(),
             adapter_timeout_ms: default_adapter_timeout_ms(),
             retry_backoff_ms: default_retry_backoff_ms(),
+            push_min_interval_ms: default_push_min_interval_ms(),
+            push_inflight_ms: default_push_inflight_ms(),
+            push_coalesce: default_push_coalesce(),
             health_interval_ms: default_health_interval_ms(),
             health_stall_ms: default_health_stall_ms(),
             codex_sessions_dir: None,

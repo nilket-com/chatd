@@ -28,7 +28,9 @@ impl Env {
         std::fs::create_dir_all(dir.join("run")).unwrap();
         // Health has its own tests (tests/health.rs); here its notices would be extra inbox traffic and the
         // check would read the real ~/.codex. Prepended, so the key stays top-level ahead of any table.
-        std::fs::write(dir.join("config.toml"), format!("health_interval_ms = 0\n{config}")).unwrap();
+        // Tests of delivery mechanics run unthrottled unless they set the push throttle themselves.
+        let throttle = if config.contains("push_") { "" } else { "push_min_interval_ms = 0\npush_inflight_ms = 0\n" };
+        std::fs::write(dir.join("config.toml"), format!("health_interval_ms = 0\n{throttle}{config}")).unwrap();
         Env { dir, daemon: None }
     }
 
@@ -2249,4 +2251,30 @@ fn schema_one_backup_restores_then_migrates_without_touching_the_backup() {
     assert_eq!(facts(&e).1, 1);
     assert!(matches!(e.call(Request::Health), Response::Health { schema_version: 2, .. }));
     assert_eq!(std::fs::read(&backup).unwrap(), original);
+}
+
+#[test]
+fn a_burst_to_a_busy_agent_is_one_push_then_one_digest_after_the_interval() {
+    // The 2026-10-23 storm: sluice notices arrived as requests while Codex was mid-turn, and each became its
+    // own queued prompt. One push may be in flight; the rest ride in the next push's digest.
+    let mut e = Env::new(
+        "heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\npush_min_interval_ms = 1000\npush_inflight_ms = 60000\n",
+    );
+    e.start();
+    let exe = fake_codex(&e, "exit 0");
+    register(&e, &exe, "s1");
+    let ids: Vec<String> = (0..30).map(|i| e.send("claude", "codex", "c", Kind::Request, &format!("n{i}"), &format!("exit {i}"))).collect();
+    wait_for("the first push", Duration::from_secs(5), || attempts(&e, &ids[0]) == vec!["submitted"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(argv_log(&e).matches("--message").count(), 1, "an unacknowledged push blocks the next one");
+
+    e.call(Request::Ack { as_: "codex".into(), ids: vec![ids[0].clone()] });
+    wait_for("the second push", Duration::from_secs(5), || argv_log(&e).matches("--message").count() == 2);
+    let argv = argv_log(&e);
+    assert!(argv.contains("[chatd digest for codex:"), "the rest ride in a digest: {argv}");
+    assert!(argv.contains(&ids[29]) || argv.contains("more ("), "the digest reaches the newest or says how many remain");
+    let individually_pushed = ids.iter().filter(|id| !attempts(&e, id).is_empty()).count();
+    assert_eq!(individually_pushed, 2, "only the two waking messages were pushed on their own");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(argv_log(&e).matches("--message").count(), 2, "the second push is in flight, so nothing more is sent");
 }

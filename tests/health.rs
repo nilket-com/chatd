@@ -36,7 +36,7 @@ impl Env {
         std::fs::write(
             dir.join("config.toml"),
             format!(
-                "heartbeat_ms = 300\nadapter_timeout_ms = 1500\nhealth_interval_ms = {INTERVAL_MS}\nhealth_stall_ms = {stall_ms}\ncodex_sessions_dir = \"{}\"\n",
+                "heartbeat_ms = 300\nadapter_timeout_ms = 1500\npush_min_interval_ms = 0\npush_inflight_ms = 0\nhealth_interval_ms = {INTERVAL_MS}\nhealth_stall_ms = {stall_ms}\ncodex_sessions_dir = \"{}\"\n",
                 dir.join("sessions").display()
             ),
         )
