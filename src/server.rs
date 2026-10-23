@@ -47,12 +47,13 @@ pub struct Config {
     #[serde(default = "default_retry_backoff_ms")]
     pub retry_backoff_ms: Vec<u64>,
     /// Minimum time between two pushes to one endpoint. Each push is a model turn for the agent, so
-    /// this bounds the wake rate whatever the senders do; messages arriving meanwhile ride in the
-    /// next push's digest.
+    /// this is a safety ceiling on the wake rate whatever the senders do; messages arriving meanwhile
+    /// ride in the next push's digest. Routine notices should be non-waking kinds, not rely on it.
     #[serde(default = "default_push_min_interval_ms")]
     pub push_min_interval_ms: u64,
-    /// While a submitted push is unacknowledged, no further push goes to that endpoint for up to this
-    /// long, so a busy agent's queue never fills with one prompt per message.
+    /// While a submitted push is unacknowledged, no further push goes to that endpoint for this long,
+    /// so a busy agent's queue never fills with one prompt per message. After it, one more push may go
+    /// without an acknowledgement, so a lost ack cannot silence the endpoint forever.
     #[serde(default = "default_push_inflight_ms")]
     pub push_inflight_ms: u64,
     /// When true, a push's digest also carries waking messages that are due, so they need no push of
@@ -87,10 +88,10 @@ fn default_retry_backoff_ms() -> Vec<u64> {
     crate::store::RETRY_BACKOFF_MS.to_vec()
 }
 fn default_push_min_interval_ms() -> u64 {
-    60_000
+    5 * 60_000
 }
 fn default_push_inflight_ms() -> u64 {
-    15 * 60_000
+    60 * 60_000
 }
 fn default_push_coalesce() -> bool {
     true
