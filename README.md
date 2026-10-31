@@ -182,6 +182,10 @@ chatctl endpoint register --as codex --session <codex-session-id> --exe /absolut
 `<codex-session-id>` is the id of an existing Codex session you choose (for example, from the
 session's own `CODEX_THREAD_ID`). Re-registering creates a new generation, and failed attempts
 under the old binding are fenced: they are never retried against the new session automatically.
+The new generation starts with fresh push throttle windows and clears the previous session's
+cached health. A push submitted to an old session cannot hold the new session behind the
+minimum interval or unacknowledged-push timeout. Existing messages and acknowledgements are
+unchanged; registration does not replay already submitted messages.
 
 To stop pushing to a participant (its session ended, or it should pull instead), remove the endpoint:
 

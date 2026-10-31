@@ -2278,3 +2278,22 @@ fn a_burst_to_a_busy_agent_is_one_push_then_one_digest_after_the_interval() {
     std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(argv_log(&e).matches("--message").count(), 2, "the second push is in flight, so nothing more is sent");
 }
+
+#[test]
+fn a_rebound_endpoint_pushes_fresh_work_without_waiting_for_the_old_unacknowledged_push() {
+    let mut e = Env::new("push_min_interval_ms = 300000\npush_inflight_ms = 3600000\n");
+    e.start();
+    let exe = fake_codex(&e, "exit 0");
+    register(&e, &exe, "old-session");
+    let old = e.send("claude", "codex", "c", Kind::Request, "old", "old request");
+    wait_for("old submitted push", Duration::from_secs(5), || attempts(&e, &old) == vec!["submitted"]);
+    register(&e, &exe, "new-session");
+    let fresh = e.send("claude", "codex", "c", Kind::Request, "fresh", "fresh request");
+    wait_for("new-generation push", Duration::from_secs(5), || attempts(&e, &fresh) == vec!["submitted"]);
+    assert_eq!(attempts(&e, &old), vec!["submitted"], "old submission is not retried");
+    let argv = argv_log(&e);
+    assert!(argv.contains("old-session") && argv.contains("new-session"), "{argv}");
+    assert_eq!(argv.matches("--message").count(), 2);
+    let take = e.cli(&["take", "--as", "codex", "--id", &old], None);
+    assert!(take.status.success(), "the old message remains unacknowledged and readable");
+}

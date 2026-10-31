@@ -936,20 +936,23 @@ impl Store {
         Ok(out)
     }
 
-    /// Whether a push may go to `ep` now: none started within `min_interval_ms`, and no submitted,
-    /// started or uncertain push of a still-unacknowledged message within `inflight_ms`.
+    /// Whether a push may go to `ep` now: in this binding's generation, none started within
+    /// `min_interval_ms`, and no submitted, started or uncertain push of a still-unacknowledged
+    /// message within `inflight_ms`. An old session's attempts cannot throttle a new binding.
     pub fn push_allowed(&self, ep: &EndpointView, now: i64, min_interval_ms: i64, inflight_ms: i64) -> Result<bool> {
-        let last: Option<i64> =
-            self.conn
-                .query_row("SELECT max(started_at_ms) FROM attempts WHERE endpoint = ?1 AND state <> 'failed'", [&ep.name], |r| r.get(0))?;
+        let last: Option<i64> = self.conn.query_row(
+            "SELECT max(started_at_ms) FROM attempts WHERE endpoint = ?1 AND generation = ?2 AND state <> 'failed'",
+            params![ep.name, ep.generation],
+            |r| r.get(0),
+        )?;
         if last.is_some_and(|t| now - t < min_interval_ms) {
             return Ok(false);
         }
         let inflight: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM attempts t JOIN messages m ON m.id = t.message_id
-               WHERE t.endpoint = ?1 AND t.state IN ('started', 'submitted', 'uncertain') AND t.started_at_ms > ?2
+               WHERE t.endpoint = ?1 AND t.generation = ?2 AND t.state IN ('started', 'submitted', 'uncertain') AND t.started_at_ms > ?3
                  AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.reader = m.recipient AND a.message_id = m.id))",
-            params![ep.name, now - inflight_ms],
+            params![ep.name, ep.generation, now - inflight_ms],
             |r| r.get(0),
         )?;
         Ok(!inflight)
@@ -1425,5 +1428,42 @@ mod tests {
         s.endpoint_unregister("codex").unwrap();
         assert_eq!(s.endpoint_register("codex", "c", "/bin/true").unwrap().generation, 3);
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn rebind_resets_both_throttle_windows_without_receiving_or_replaying_old_messages() {
+        for state in ["started", "submitted", "uncertain"] {
+            let (mut s, dir) = store();
+            let old = s.endpoint_register("codex", "old", "/bin/true").unwrap();
+            let id = send(&mut s, "old-message");
+            let selected = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap().remove(0);
+            let attempt = s.begin_attempt(&selected).unwrap().unwrap();
+            if state != "started" {
+                s.finish_attempt(attempt, state, (state == "submitted").then_some(0), None, &[], &[]).unwrap();
+            }
+            let now = now_ms();
+            assert!(!s.push_allowed(&old, now, 300_000, 0).unwrap(), "minimum interval: {state}");
+            assert!(!s.push_allowed(&old, now, 0, 3_600_000).unwrap(), "in-flight window: {state}");
+            let fresh = s.endpoint_register("codex", "new", "/bin/true").unwrap();
+            assert!(s.push_allowed(&fresh, now_ms(), 300_000, 3_600_000).unwrap(), "fresh generation: {state}");
+            if state == "started" {
+                s.finish_attempt(attempt, "submitted", Some(0), None, &[], &[]).unwrap();
+                assert!(s.push_allowed(&fresh, now_ms(), 300_000, 3_600_000).unwrap(), "late old completion");
+            }
+            assert!(s.unacknowledged_page("codex", None, 0, 10).unwrap().iter().any(|m| m.id == id));
+            assert!(s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap().is_empty(), "old attempt stays fenced");
+            let new_id = send(&mut s, "fresh-message");
+            let selected = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap().remove(0);
+            assert_eq!(selected.message.id, new_id);
+            let new_attempt = s.begin_attempt(&selected).unwrap().unwrap();
+            s.finish_attempt(new_attempt, "submitted", Some(0), None, &[], &[]).unwrap();
+            let now = now_ms();
+            assert!(!s.push_allowed(&fresh, now, 300_000, 0).unwrap(), "new minimum interval still applies");
+            assert!(!s.push_allowed(&fresh, now, 0, 3_600_000).unwrap(), "new in-flight window still applies");
+            s.ack("codex", &[new_id]).unwrap();
+            assert!(s.push_allowed(&fresh, now, 0, 3_600_000).unwrap(), "new ack releases only its in-flight hold");
+            assert!(!s.push_allowed(&fresh, now, 300_000, 0).unwrap(), "ack does not bypass the minimum interval");
+            assert_eq!(s.attempts_for(&id).unwrap().len(), 1);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

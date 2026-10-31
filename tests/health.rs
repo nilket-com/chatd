@@ -325,3 +325,24 @@ fn unregistering_stops_the_inspection_at_once() {
     let row = peers.lines().find(|l| l.starts_with("codex")).unwrap();
     assert!(row.contains("pull") && !row.contains("OK") && !row.contains("FILTERED"), "{peers}");
 }
+
+#[test]
+fn re_registering_clears_the_old_session_health_and_warning_immediately() {
+    let mut e = Env::new(30 * 60_000);
+    e.append(FILTERED_TURN);
+    e.start();
+    e.register_codex();
+    wait_for("old filtered session", || e.codex_health() == Some(HealthState::Filtered));
+    let bad = e.call(Request::EndpointRegister { name: "codex".into(), session: "bad session".into(), exe: "/bin/true".into() });
+    assert!(matches!(bad, Response::Error { .. }));
+    assert_eq!(e.codex_health(), Some(HealthState::Filtered), "failed registration retains the current binding's health");
+    let registered = e.call(Request::EndpointRegister { name: "codex".into(), session: "fresh-session".into(), exe: "/bin/true".into() });
+    assert!(matches!(registered, Response::Registered(_)));
+    let health = e.codex().health;
+    assert!(
+        health.as_ref().is_none_or(|h| h.state == HealthState::Unknown && h.log.is_none()),
+        "old log health must not survive: {health:?}"
+    );
+    let Response::Stored(receipt) = e.send("claude", "codex", "after-rebind") else { panic!() };
+    assert_eq!(receipt.warning, None, "the old session's filter warning must not leak to the fresh binding");
+}

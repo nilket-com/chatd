@@ -593,6 +593,11 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
         Request::EndpointRegister { name, session, exe } => match store.endpoint_register(&name, &session, &exe) {
             Ok(v) => {
                 wrote = true;
+                // Held under the store lock, like unregister: an observation of the old
+                // session cannot repopulate its health after the binding changes.
+                if let Ok(mut h) = shared.health.lock() {
+                    h.remove(&name);
+                }
                 journal::log(
                     journal::PRIORITY_NOTICE,
                     &format!("endpoint {name} bound, generation {}", v.generation),
