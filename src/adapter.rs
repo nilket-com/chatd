@@ -15,10 +15,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::journal;
 use crate::server::Shared;
 use crate::store::{Delivery, now_ms};
 use crate::text;
+use crate::{health, journal};
 
 const MAX_STDERR: usize = 4096;
 /// Bounds on one stderr pass, and on the final drain after the attempt ends.
@@ -53,9 +53,25 @@ pub fn run(shared: Arc<Shared>) {
             if pushed.contains(&d.endpoint.name) {
                 continue;
             }
-            let allowed = shared.store.lock().map(|s| {
-                s.push_allowed(&d.endpoint, now_ms(), shared.config.push_min_interval_ms as i64, shared.config.push_inflight_ms as i64)
-            });
+            let check = |handled_since| {
+                shared.store.lock().map(|s| {
+                    s.push_allowed(
+                        &d.endpoint,
+                        now_ms(),
+                        shared.config.push_min_interval_ms as i64,
+                        shared.config.push_inflight_ms as i64,
+                        handled_since,
+                    )
+                })
+            };
+            let mut allowed = check(None);
+            if matches!(allowed, Ok(Ok(false))) {
+                // Held back. A turn that started after the held push and has since completed took it up,
+                // acknowledged or not; the session log shows that. Read with no lock held, and only here.
+                if let Some(since) = completed_turn_start(&shared, &d.endpoint.name, &d.endpoint.session) {
+                    allowed = check(Some(since));
+                }
+            }
             match allowed {
                 Ok(Ok(true)) => {}
                 Ok(Ok(false)) => continue,
@@ -71,6 +87,15 @@ pub fn run(shared: Arc<Shared>) {
         // Wake on the next commit, or after a second to honour retry backoff deadlines.
         shared.hub.wait_beyond(head, Duration::from_secs(1));
     }
+}
+
+/// When the endpoint session's newest completed turn started, if its log shows one.
+fn completed_turn_start(shared: &Arc<Shared>, name: &str, session: &str) -> Option<i64> {
+    let product = shared.config.participant.get(name).and_then(|c| c.product.clone());
+    // A registered endpoint is a Codex `queue` binding, so an endpoint without a product is Codex.
+    let inspector = health::inspector_for(product.as_deref().unwrap_or("codex"), &shared.config)?;
+    let log = inspector.locate(session)?;
+    inspector.completed_turn_start(&log).ok().flatten()
 }
 
 fn deliver(shared: &Arc<Shared>, d: &Delivery) {

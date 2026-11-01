@@ -56,6 +56,10 @@ pub trait Inspector: Send + Sync {
     fn locate(&self, session: &str) -> Option<PathBuf>;
     /// How the newest turn in the log ended. Reads only the tail.
     fn last_turn(&self, log: &Path) -> io::Result<LastTurn>;
+    /// When the newest completed turn in the log started, if the tail shows one. Reads only the tail.
+    fn completed_turn_start(&self, _log: &Path) -> io::Result<Option<i64>> {
+        Ok(None)
+    }
 }
 
 /// The inspector for a product, if there is one.
@@ -107,6 +111,10 @@ impl Inspector for CodexInspector {
     fn last_turn(&self, log: &Path) -> io::Result<LastTurn> {
         scan_last_turn(log, TAIL_CHUNK, TAIL_MAX)
     }
+
+    fn completed_turn_start(&self, log: &Path) -> io::Result<Option<i64>> {
+        scan_completed_turn_start(log, TAIL_CHUNK, TAIL_MAX)
+    }
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -142,6 +150,71 @@ pub fn codex_turn_end(line: &[u8]) -> Option<LastTurn> {
 /// Scans `path` backward from its end, `chunk` bytes at a time and at most `max_scan` bytes in all,
 /// for the newest Codex turn end. Memory stays bounded by `chunk` plus one line of at most MAX_LINE.
 pub fn scan_last_turn(path: &Path, chunk: usize, max_scan: u64) -> io::Result<LastTurn> {
+    let mut found = LastTurn::NotSeen;
+    scan_lines_backward(path, chunk, max_scan, &mut |line| match codex_turn_end(line) {
+        Some(t) => {
+            found = t;
+            true
+        }
+        None => false,
+    })?;
+    Ok(found)
+}
+
+/// The start of the newest COMPLETED Codex turn in the scanned tail: the `task_started` whose turn id
+/// matches the newest `task_complete`. `None` when the tail holds no completed turn, or its start lies
+/// beyond the scan. A turn that started and completed proves the session handled a turn since then;
+/// a turn end alone does not, since it may belong to a turn that was already running.
+pub fn scan_completed_turn_start(path: &Path, chunk: usize, max_scan: u64) -> io::Result<Option<i64>> {
+    let mut turn: Option<String> = None;
+    let mut start = None;
+    scan_lines_backward(path, chunk, max_scan, &mut |line| {
+        let Some(id) = &turn else {
+            turn = codex_completed_turn_id(line);
+            return false;
+        };
+        if let Some((started, at_ms)) = codex_turn_start(line)
+            && &started == id
+        {
+            start = at_ms;
+            return true;
+        }
+        false
+    })?;
+    Ok(start)
+}
+
+/// The turn id of a `task_complete` line, if it is one.
+fn codex_completed_turn_id(line: &[u8]) -> Option<String> {
+    if !contains(line, b"\"task_complete\"") {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(line).ok()?;
+    let payload = v.get("payload")?;
+    if payload.get("type")?.as_str()? != "task_complete" {
+        return None;
+    }
+    Some(payload.get("turn_id")?.as_str()?.to_owned())
+}
+
+/// The turn id and timestamp of a `task_started` line, if it is one.
+fn codex_turn_start(line: &[u8]) -> Option<(String, Option<i64>)> {
+    if !contains(line, b"\"task_started\"") {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(line).ok()?;
+    let payload = v.get("payload")?;
+    if payload.get("type")?.as_str()? != "task_started" {
+        return None;
+    }
+    let id = payload.get("turn_attribution")?.get("turn_id")?.as_str()?.to_owned();
+    Some((id, v.get("timestamp").and_then(Value::as_str).and_then(parse_utc)))
+}
+
+/// Visits `path`'s lines newest first, `chunk` bytes at a time and at most `max_scan` bytes in all, until
+/// `visit` returns true. Lines longer than MAX_LINE are skipped unread, so memory stays bounded by
+/// `chunk` plus one line.
+fn scan_lines_backward(path: &Path, chunk: usize, max_scan: u64, visit: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
     let floor = len.saturating_sub(max_scan);
@@ -167,8 +240,8 @@ pub fn scan_last_turn(path: &Path, chunk: usize, max_scan: u64) -> io::Result<La
                 line.clear();
                 line.extend_from_slice(&data[i + 1..end]);
                 line.extend_from_slice(&pending);
-                if let Some(t) = codex_turn_end(&line) {
-                    return Ok(t);
+                if visit(&line) {
+                    return Ok(());
                 }
             }
             pending.clear();
@@ -187,13 +260,10 @@ pub fn scan_last_turn(path: &Path, chunk: usize, max_scan: u64) -> io::Result<La
         }
     }
     // The file's first line is whole only if the scan reached the start of the file.
-    if pos == 0
-        && !oversized
-        && let Some(t) = codex_turn_end(&pending)
-    {
-        return Ok(t);
+    if pos == 0 && !oversized {
+        visit(&pending);
     }
-    Ok(LastTurn::NotSeen)
+    Ok(())
 }
 
 /// What a check found for one session.
@@ -509,6 +579,45 @@ pub fn parse_utc(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STARTED_A: &str = r#"{"timestamp":"2026-10-30T22:25:48.474Z","type":"event_msg","payload":{"type":"task_started","turn_attribution":{"turn_id":"A","turn_trigger":"user","parent_turn_id":null}}}"#;
+    const DONE_A: &str = r#"{"timestamp":"2026-10-30T22:33:11.220Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"A","last_agent_message":"ok","error":null}}"#;
+    const STARTED_B: &str = r#"{"timestamp":"2026-10-30T22:39:41.902Z","type":"event_msg","payload":{"type":"task_started","turn_attribution":{"turn_id":"B","turn_trigger":"user","parent_turn_id":null}}}"#;
+    const DONE_B: &str = r#"{"timestamp":"2026-10-30T22:45:00.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"B","last_agent_message":"ok","error":null}}"#;
+    const NOISE: &str = r#"{"timestamp":"2026-10-30T22:40:00.000Z","type":"response_item","payload":{"type":"message","text":"task_complete task_started"}}"#;
+
+    fn log_of(lines: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("chatd-turn-start-{}-{}", std::process::id(), lines.len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", lines.iter().map(|l| l.len()).sum::<usize>()));
+        std::fs::write(&path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        path
+    }
+
+    #[test]
+    fn completed_turn_start_is_the_start_of_the_newest_completed_turn_only() {
+        let at = |s: &str| parse_utc(s);
+        // The newest completed turn is B, and its own start is returned (small chunks cross line edges).
+        for chunk in [7, 64, 4096] {
+            let log = log_of(&[STARTED_A, DONE_A, STARTED_B, NOISE, DONE_B]);
+            assert_eq!(scan_completed_turn_start(&log, chunk, 1 << 20).unwrap(), at("2026-10-30T22:39:41.902Z"));
+        }
+        // A turn that started but has not completed proves nothing about itself: the newest COMPLETED
+        // turn is still A.
+        let log = log_of(&[STARTED_A, DONE_A, STARTED_B, NOISE]);
+        assert_eq!(scan_completed_turn_start(&log, 64, 1 << 20).unwrap(), at("2026-10-30T22:25:48.474Z"));
+        // A completion whose start is outside the scanned tail, or absent, gives no start.
+        let log = log_of(&[DONE_A]);
+        assert_eq!(scan_completed_turn_start(&log, 64, 1 << 20).unwrap(), None);
+        let log = log_of(&[STARTED_A, DONE_A]);
+        assert_eq!(scan_completed_turn_start(&log, 64, DONE_A.len() as u64 + 1).unwrap(), None);
+        // No completion at all, and mentions inside other lines, give none.
+        let log = log_of(&[STARTED_A, NOISE]);
+        assert_eq!(scan_completed_turn_start(&log, 64, 1 << 20).unwrap(), None);
+        // A start whose turn id differs from the completion's is not taken as its start.
+        let log = log_of(&[STARTED_B, DONE_A]);
+        assert_eq!(scan_completed_turn_start(&log, 64, 1 << 20).unwrap(), None);
+    }
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex").join(name)

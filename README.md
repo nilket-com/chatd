@@ -187,6 +187,13 @@ cached health. A push submitted to an old session cannot hold the new session be
 minimum interval or unacknowledged-push timeout. Existing messages and acknowledgements are
 unchanged; registration does not replay already submitted messages.
 
+An unacknowledged push normally holds the next one back for the unacknowledged-push timeout, so a
+participant is not handed a new turn while it is still working. A push held back this way is
+released early once the session's log shows a turn that STARTED after the push and has COMPLETED:
+that turn took the push up, whether or not it acknowledged the message. A turn end alone is not
+enough, since it may belong to a turn that was already running when the push was queued. The
+minimum interval still applies, and nothing is acknowledged or replayed by the release.
+
 To stop pushing to a participant (its session ended, or it should pull instead), remove the endpoint:
 
 ```sh
