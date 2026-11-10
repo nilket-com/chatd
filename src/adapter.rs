@@ -35,7 +35,7 @@ pub fn run(shared: Arc<Shared>) {
         // moves the counter past this value, so the wait at the bottom returns at once instead of
         // sleeping through a message the snapshot could not include.
         let head = shared.hub.head();
-        let due = match shared.store.lock().map(|s| s.due_deliveries(now_ms(), &|name| shared.config.wake_kinds(name))) {
+        let due = match shared.store.lock().map(|s| s.due_deliveries(now_ms(), &|name| shared.config().wake_kinds(name))) {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
                 journal::log(journal::PRIORITY_ERR, &format!("adapter could not read due deliveries: {e}"), &[]);
@@ -58,8 +58,8 @@ pub fn run(shared: Arc<Shared>) {
                     s.push_allowed(
                         &d.endpoint,
                         now_ms(),
-                        shared.config.push_min_interval_ms as i64,
-                        shared.config.push_inflight_ms as i64,
+                        shared.config().push_min_interval_ms as i64,
+                        shared.config().push_inflight_ms as i64,
                         handled_since,
                     )
                 })
@@ -91,9 +91,10 @@ pub fn run(shared: Arc<Shared>) {
 
 /// When the endpoint session's newest completed turn started, if its log shows one.
 fn completed_turn_start(shared: &Arc<Shared>, name: &str, session: &str) -> Option<i64> {
-    let product = shared.config.participant.get(name).and_then(|c| c.product.clone());
+    let config = shared.config();
+    let product = config.participant.get(name).and_then(|c| c.product.clone());
     // A registered endpoint is a Codex `queue` binding, so an endpoint without a product is Codex.
-    let inspector = health::inspector_for(product.as_deref().unwrap_or("codex"), &shared.config)?;
+    let inspector = health::inspector_for(product.as_deref().unwrap_or("codex"), &config)?;
     let log = inspector.locate(session)?;
     inspector.completed_turn_start(&log).ok().flatten()
 }
@@ -116,13 +117,15 @@ fn deliver(shared: &Arc<Shared>, d: &Delivery) {
         &[fields[0], fields[1], fields[2], ("EVENT", "submission_started")],
     );
     // Read after the attempt is recorded, so a digest carried by an earlier push in this pass is not repeated.
-    let kinds = if shared.config.push_coalesce { Vec::new() } else { shared.config.wake_kinds(&d.endpoint.name) };
     let queued = match shared
         .store
         .lock()
         // Coalescing: every kind, waking ones included, so a request that would need its own push rides here.
-        .map(|s| s.queued_for_wake(&d.endpoint.name, &kinds, Some(&d.message.id), text::DIGEST_MAX_ITEMS as u32))
-    {
+        .map(|s| {
+            let config = shared.config();
+            let kinds = if config.push_coalesce { Vec::new() } else { config.wake_kinds(&d.endpoint.name) };
+            s.queued_for_wake(&d.endpoint.name, &kinds, Some(&d.message.id), text::DIGEST_MAX_ITEMS as u32)
+        }) {
         Ok(Ok(q)) => q,
         Ok(Err(e)) => {
             journal::log(journal::PRIORITY_ERR, &format!("could not read the digest for {}: {e}", d.endpoint.name), &[]);
@@ -142,7 +145,7 @@ fn deliver(shared: &Arc<Shared>, d: &Delivery) {
     let result = shared
         .store
         .lock()
-        .map(|mut s| s.finish_attempt(attempt, state, code, error.as_deref(), &shared.config.retry_backoff_ms, &digested));
+        .map(|mut s| s.finish_attempt(attempt, state, code, error.as_deref(), &shared.config().retry_backoff_ms, &digested));
     if let Ok(Err(e)) = result {
         journal::log(journal::PRIORITY_ERR, &format!("could not record attempt {attempt}'s result: {e}"), &[]);
     }
@@ -217,7 +220,7 @@ fn run_child(shared: &Arc<Shared>, exe: &str, session: &str, line: &str) -> (&'s
             }
         }
     };
-    let deadline = Instant::now() + Duration::from_millis(shared.config.adapter_timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(shared.config().adapter_timeout_ms);
     let outcome = loop {
         drain(&mut stderr, &mut kept);
         match child.try_wait() {
@@ -231,7 +234,7 @@ fn run_child(shared: &Arc<Shared>, exe: &str, session: &str, line: &str) -> (&'s
         }
         if Instant::now() >= deadline {
             kill_group(&mut child);
-            break Err(format!("no result within {} ms; killed", shared.config.adapter_timeout_ms));
+            break Err(format!("no result within {} ms; killed", shared.config().adapter_timeout_ms));
         }
         std::thread::sleep(Duration::from_millis(20));
     };

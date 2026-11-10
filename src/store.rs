@@ -160,7 +160,7 @@ fn kind_of(s: &str) -> Result<Kind> {
     Kind::parse(s).ok_or_else(|| StoreError::new(ErrorCode::Storage, format!("stored kind {s:?} is not valid")))
 }
 
-fn valid_name(s: &str) -> bool {
+pub(crate) fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
         && s.bytes().enumerate().all(|(i, b)| b.is_ascii_lowercase() || (i > 0 && (b.is_ascii_digit() || b == b'-')))
@@ -1321,6 +1321,20 @@ impl Store {
         }
         tx.commit()?;
         Ok(receipts)
+    }
+
+    pub fn add_participants(&mut self, names: &[String]) -> Result<()> {
+        for name in names {
+            if !valid_name(name) {
+                return Err(StoreError::new(ErrorCode::BadRequest, format!("participant name {name:?} is not valid")));
+            }
+        }
+        let tx = self.conn.transaction()?;
+        for name in names {
+            tx.execute("INSERT INTO participants(name) VALUES (?1)", [name])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn participants(&self) -> Result<BTreeSet<String>> {

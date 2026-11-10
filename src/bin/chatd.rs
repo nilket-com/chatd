@@ -41,7 +41,8 @@ fn main() {
     }
     // Blocked before any thread starts, so only the signal thread below receives them.
     let set = block_signals();
-    let config = match server::Config::load(&paths::config_path()) {
+    let config_path = paths::config_path();
+    let config = match server::Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
             journal::log(journal::PRIORITY_ERR, &format!("configuration: {e}"), &[]);
@@ -49,7 +50,7 @@ fn main() {
         }
     };
     let socket = paths::socket_path();
-    let (shared, listener) = match server::prepare(config, &paths::state_dir(), &socket) {
+    let (shared, listener) = match server::prepare(config, &paths::state_dir(), &socket, &config_path) {
         Ok(x) => x,
         Err(e) => {
             // Never ready: systemd sees the start fail.

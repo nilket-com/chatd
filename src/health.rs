@@ -405,17 +405,17 @@ pub fn send_warning(name: &str, view: &HealthView) -> Option<String> {
 
 /// One health check of every participant, at `now`.
 pub fn check(shared: &Arc<Shared>, now: i64) {
-    let config = &shared.config;
-    let names = config.participant_names();
     let read = shared.store.lock().map(|s| -> Result<_, crate::store::StoreError> {
+        let config = shared.config();
+        let names = config.participant_names();
         let endpoints = s.endpoints()?;
         let mut unanswered = BTreeMap::new();
         for n in &names {
             unanswered.insert(n.clone(), s.unanswered_to(n)?);
         }
-        Ok((endpoints, unanswered))
+        Ok((config, names, endpoints, unanswered))
     });
-    let (endpoints, unanswered) = match read {
+    let (config, names, endpoints, unanswered) = match read {
         Ok(Ok(x)) => x,
         Ok(Err(e)) => {
             journal::log(journal::PRIORITY_ERR, &format!("health check could not read the store: {e}"), &[]);
@@ -427,7 +427,7 @@ pub fn check(shared: &Arc<Shared>, now: i64) {
         let product = config.participant.get(name).and_then(|c| c.product.clone());
         // A registered endpoint is a Codex `queue` binding, so an endpoint without a product is Codex.
         let target = endpoints.iter().find(|e| &e.name == name).and_then(|ep| {
-            let inspector = inspector_for(product.as_deref().unwrap_or("codex"), config)?;
+            let inspector = inspector_for(product.as_deref().unwrap_or("codex"), &config)?;
             Some((ep.session.clone(), inspector))
         });
         let Some((session, inspector)) = target else {
@@ -479,8 +479,8 @@ fn report(shared: &Arc<Shared>, name: &str, view: &HealthView, unanswered: i64) 
     }
     let notices: Vec<(String, String, String)> = if should_report(prev.as_ref(), &now) {
         let summary = summary(name, view, prev.as_ref());
-        let body = body(name, view, prev.as_ref(), unanswered, &shared.config);
-        shared.config.participant_names().into_iter().filter(|p| p != name).map(|p| (p, summary.clone(), body.clone())).collect()
+        let body = body(name, view, prev.as_ref(), unanswered, &shared.config());
+        shared.config().participant_names().into_iter().filter(|p| p != name).map(|p| (p, summary.clone(), body.clone())).collect()
     } else {
         Vec::new()
     };
@@ -510,7 +510,7 @@ fn report(shared: &Arc<Shared>, name: &str, view: &HealthView, unanswered: i64) 
 
 /// The health thread: one check at start, then one per interval, until shutdown.
 pub fn run(shared: Arc<Shared>) {
-    let interval = Duration::from_millis(shared.config.health_interval_ms);
+    let interval = Duration::from_millis(shared.config().health_interval_ms);
     loop {
         if shared.shutdown.load(Ordering::SeqCst) {
             return;

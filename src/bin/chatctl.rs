@@ -30,7 +30,21 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum ConfigCmd {
+    Preview,
+    Apply {
+        #[arg(long)]
+        revision: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
+    /// Preview or apply add-only changes from the daemon configuration file.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
     /// Store a request or information message.
     Send {
         #[arg(long = "as", alias = "from", env = "CHATD_AS")]
@@ -932,6 +946,30 @@ fn journal_view(follow: bool, lines: u32, no_color: bool, from_stdin: bool, unit
 fn run(cli: Cli) -> Result<(), ExitCode> {
     let json = cli.json;
     match cli.cmd {
+        Cmd::Config { cmd } => {
+            let req = match cmd {
+                ConfigCmd::Preview => Request::ConfigPreview,
+                ConfigCmd::Apply { revision } => Request::ConfigApply { revision },
+            };
+            let response = call(req)?;
+            if json {
+                print_json(&response);
+            } else if let Response::ConfigRefresh { base_revision, candidate_revision, effective_revision, added, applied, no_op } =
+                response
+            {
+                println!(
+                    "base revision: {base_revision}\ncandidate revision: {candidate_revision}\neffective revision: {effective_revision}"
+                );
+                if no_op {
+                    println!("no change: nothing to add");
+                } else {
+                    println!("{}: {}", if applied { "added" } else { "would add" }, added.join(", "));
+                }
+            } else {
+                return Err(ExitCode::FAILURE);
+            }
+        }
+
         Cmd::Send { who, to, conversation, kind, idempotency_key, summary, body_file } => {
             let body = body(&body_file).map_err(|e| {
                 eprintln!("chatctl: {e}");

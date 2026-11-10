@@ -90,6 +90,10 @@ pub struct BindResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
+    ConfigPreview,
+    ConfigApply {
+        revision: String,
+    },
     Health,
     Current {
         as_: Option<String>,
@@ -487,6 +491,14 @@ pub struct LegacyFileReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "r", rename_all = "snake_case")]
 pub enum Response {
+    ConfigRefresh {
+        base_revision: String,
+        candidate_revision: String,
+        effective_revision: String,
+        added: Vec<String>,
+        applied: bool,
+        no_op: bool,
+    },
     Health {
         store_id: String,
         head_seq: i64,

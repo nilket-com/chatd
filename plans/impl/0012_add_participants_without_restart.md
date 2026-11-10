@@ -24,3 +24,29 @@ missing or unreadable file; two candidates racing; identical reapply; formatting
 no-op; a name declared only as a table, a name in both spellings, omitted wake policy, `all` versus
 the explicit full set; a retained store name with an endpoint and outstanding messages refused with
 no delivery, health or endpoint change; restart parity.
+
+## Implemented publication and validation
+
+`Shared` retains the absolute startup-selected config path and a mutex-protected `Arc<Config>`.
+Refresh reads the file once before locks, validates those bytes (including the store's startup
+participant-name rule), and compares the SHA-256 candidate revision. Effective revisions hash a
+normalized semantic representation: participant union, defaults, canonical wake-kind sets and
+resolved default session directory. Formatting-only applies retain the existing snapshot/revision.
+
+Apply acquires store then config, revalidates against that current view and retained DB names, and
+prepares its response before mutation. A single insertion transaction commits before an infallible
+Arc assignment while both guards remain held. The publication helper has an empty production
+callback and a deterministic test callback at the commit/swap boundary. Database fault tests inject
+a SQLite abort trigger and verify rollback of earlier inserts in the same transaction.
+
+Store-dependent policy readers snapshot inside the store barrier; detached snapshots carry no guard
+into sockets, subprocesses or session-log reads. Watch admission uses the barrier; its independent
+read transaction remains safe afterward because active participant definitions cannot be removed or
+changed. Retained-name admission remains unchanged. No apply event, endpoint update, replay or
+health reset is introduced. Restart parity assumes the applied file has not subsequently changed.
+
+Nine added tests cover semantic equivalence and aggregate named refusals, revisions/file errors,
+rollback, retained names with an endpoint and outstanding request, competing captured candidates,
+the publication boundary, isolated live watcher/send continuity and restart parity, CLI source-path
+selection/no-ops/refusals, and concurrent send/register admission. An unreadable-file test uses a
+directory at the config path so it remains effective even under privileged test execution.

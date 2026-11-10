@@ -2786,3 +2786,165 @@ fn guarded_registration_never_falls_back_and_only_unknown_operation_gets_upgrade
         assert_eq!(stderr(&out).contains("predates guarded registration"), scenario == "old");
     }
 }
+
+fn config_candidate(e: &Env, extra: &str) -> String {
+    let path = e.dir.join("config.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str(extra);
+    std::fs::write(path, config).unwrap();
+    let out = e.cli(&["--json", "config", "preview"], None);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    value["candidate_revision"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn config_apply_keeps_existing_watch_and_send_and_has_restart_parity() {
+    let mut e = Env::standard();
+    e.start();
+    let (mut watcher, _) = open_watch(&e, "claude", None);
+    let mut inflight = e.client();
+    inflight
+        .send(Request::Send(SendReq {
+            from: "codex".into(),
+            to: Some("claude".into()),
+            conversation: Some("config".into()),
+            kind: Kind::Request,
+            reply_to: None,
+            idempotency_key: "during-refresh".into(),
+            summary: None,
+            body: "existing pair".into(),
+        }))
+        .unwrap();
+    let revision = config_candidate(
+        &e,
+        "\n[participant.team-c]\nproduct='claude'\ntier='luna'\n[participant.team-x]\nproduct='codex'\nwake_kinds=['final']\n",
+    );
+    let out = e.cli(&["config", "apply", "--revision", &revision], None);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).contains("added: team-c, team-x"));
+    assert!(matches!(inflight.recv().unwrap(), Response::Stored(_)));
+    next_event(&mut watcher); // the same connection survives apply
+    let (mut new_watcher, _) = open_watch(&e, "team-c", None);
+    let id = e.send("team-x", "team-c", "config", Kind::Request, "new-team", "new pair");
+    next_event(&mut new_watcher);
+    assert!(matches!(e.call(Request::Receive { as_: "team-c".into(), id }), Response::Message(_)));
+    assert!(matches!(
+        e.call(Request::EndpointBind {
+            name: "team-x".into(),
+            session: "private-session".into(),
+            exe: "/nonexistent-private-test-exe".into(),
+            mode: chatd::proto::BindMode::Plain,
+        }),
+        Response::Bound(_)
+    ));
+    let policies = |e: &Env| {
+        let mut rows: Vec<_> =
+            e.status(None).participants.unwrap().into_iter().map(|p| (p.name, p.product, p.tier, p.wake_kinds)).collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    };
+    let before = policies(&e);
+    drop(watcher);
+    drop(new_watcher);
+    drop(inflight);
+    assert!(e.term().success());
+    if e.try_start(false).is_none() {
+        let child = e.daemon.take().unwrap();
+        let output = child.wait_with_output().unwrap();
+        panic!("restart failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    assert_eq!(before, policies(&e));
+}
+
+#[test]
+fn config_cli_uses_daemon_path_and_reports_refusal_and_noop() {
+    let mut e = Env::standard();
+    e.start();
+    let revision = config_candidate(&e, "\n[participant.extra]\n");
+    let mut cmd = Command::new(CLI);
+    e.envs(&mut cmd);
+    let out = cmd
+        .env("CHATD_CONFIG", "/nonexistent-client-only-config")
+        .args(["--json", "config", "apply", "--revision", &revision])
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let out = e.cli(&["config", "apply", "--revision", &revision], None);
+    assert!(stdout(&out).lines().any(|line| line == "no change: nothing to add"));
+    let path = e.dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{config}\n# changed bytes")).unwrap();
+    assert_eq!(code(&e.cli(&["config", "apply", "--revision", &revision], None)), 5);
+    std::fs::write(&path, "participants=['claude']\nheartbeat_ms=3\n[participant.claude]\nproduct='changed'").unwrap();
+    let out = e.cli(&["config", "preview"], None);
+    assert_eq!(code(&out), 5);
+    let error = String::from_utf8_lossy(&out.stderr);
+    for word in ["codex", "extra", "claude", "heartbeat_ms"] {
+        assert!(error.contains(word), "{error}");
+    }
+    assert!(e.status(None).participants.unwrap().iter().any(|p| p.name == "extra"));
+}
+
+#[test]
+fn config_apply_concurrent_admissions_agree_with_directory() {
+    let mut e = Env::standard();
+    e.start();
+    let revision = config_candidate(&e, "\n[participant.new-team]\n");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut joins = Vec::new();
+    for register in [false, true] {
+        let mut client = e.client();
+        let barrier = barrier.clone();
+        joins.push(std::thread::spawn(move || {
+            barrier.wait();
+            let response = client
+                .call(if register {
+                    Request::EndpointBind {
+                        name: "new-team".into(),
+                        session: "private".into(),
+                        exe: "/nonexistent-private-test-exe".into(),
+                        mode: chatd::proto::BindMode::Plain,
+                    }
+                } else {
+                    Request::Send(SendReq {
+                        from: "new-team".into(),
+                        to: Some("claude".into()),
+                        conversation: Some("race".into()),
+                        kind: Kind::Info,
+                        reply_to: None,
+                        idempotency_key: "race".into(),
+                        summary: None,
+                        body: "race".into(),
+                    })
+                })
+                .unwrap();
+            match response {
+                Response::Error { code: ErrorCode::UnknownParticipant, .. } => {} // linearized before apply
+                Response::Stored(_) | Response::Bound(_) => {
+                    let Response::Status(s) = client
+                        .call(Request::Status {
+                            as_: None,
+                            conversation: None,
+                            limit: 1,
+                            unacknowledged_after: None,
+                            unanswered_after: None,
+                        })
+                        .unwrap()
+                    else {
+                        panic!()
+                    };
+                    assert!(s.participants.unwrap().iter().any(|p| p.name == "new-team"));
+                }
+                other => panic!("{other:?}"),
+            }
+        }));
+    }
+    barrier.wait();
+    assert!(matches!(e.call(Request::ConfigApply { revision }), Response::ConfigRefresh { applied: true, .. }));
+    for join in joins {
+        join.join().unwrap();
+    }
+    let (_, snap) = open_watch(&e, "new-team", None);
+    assert_eq!(snap.total, 0);
+}

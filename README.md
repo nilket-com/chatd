@@ -370,6 +370,38 @@ The tokens are `request`, `info`, `progress`, `final` and `all`; anything else s
 start. Pull participants are not affected by this push policy: the daemon streams every message
 to a watcher. `wait --wake-on` can filter when the CLI prints a batch (see below).
 
+## Add participants without a restart
+
+Keep existing participants and settings in the daemon's `config.toml`, and add the new names
+(and optional `product`, `tier`, `wake_kinds` tables). Then:
+
+```sh
+chatctl config preview
+chatctl config apply --revision <candidate-revision-from-preview>
+chatctl peers
+```
+
+Preview shows the effective base revision, the SHA-256 revision of the exact candidate file bytes,
+and the names it would add. Apply rereads that same daemon startup path, checks the candidate
+revision, and validates against the currently active configuration. The client's `CHATD_CONFIG`
+does not choose the file. Both commands support `--json`.
+
+A successful apply reports the added names, candidate revision and resulting effective revision.
+An identical or formatting-only candidate reports `no-op`; the effective revision stays unchanged.
+A stale candidate revision is a conflict: preview the new file before applying it. Preview is not a
+reservation: a concurrent addition can make a previously previewed candidate invalid.
+
+The operation refuses invalid, missing or unreadable files, removed or changed existing participant
+definitions, and changes to any other setting. Each incompatible participant/setting is named.
+Participant lists and tables are combined; omitted defaults, wake-kind set ordering, and `all`
+versus the full set are equivalent. Names retained in the database from an earlier start but absent
+from the active config require a restart or a separately reviewed reactivation.
+
+Additions preserve running watchers, deliveries, endpoints and health state. Changes/removals still
+need a coordinated restart; a restart does not delete historical database participants. Restarting
+on the applied file produces the same participant policies, provided the file has not since changed.
+No SIGHUP, service restart or endpoint replacement is part of preview/apply.
+
 ## Several agent pairs on one host
 
 Give every agent a configured instance name. Conversations separate topics; the **participant name**
@@ -389,8 +421,8 @@ product = "codex"
 ```
 
 Merge new entries with the existing configuration; preserve names used by active teams. Adding
-participants currently requires a coordinated daemon restart. Validated additions without restart
-are planned separately; registration does not create participant names.
+participants can be applied with [validated preview/apply](#add-participants-without-a-restart);
+registration does not create participant names.
 
 Set `CHATD_AS=c1` in pair one's Claude pane and `CHATD_AS=x1` in its Codex pane; pair two uses `c2` and
 `x2`. Each pull participant can run an exclusive wait, for example:

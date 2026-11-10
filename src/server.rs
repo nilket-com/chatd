@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::proto::{
@@ -24,7 +24,7 @@ use crate::{adapter, health, hub::Hub, journal, legacy, notify};
 pub const MAX_CONNECTIONS: usize = 64;
 pub const WATCH_BATCH: u32 = 256;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_participants")]
@@ -136,7 +136,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParticipantConf {
     /// The agent's product, a short lowercase token (`claude`, `codex`, ...). It decides how the agent
@@ -202,6 +202,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        for name in self.participant_names() {
+            if !crate::store::valid_name(&name) {
+                return Err(format!("participant name {name:?} is not valid"));
+            }
+        }
         if self.participant_names().iter().any(|n| n == SYSTEM_SENDER) {
             return Err(format!("{SYSTEM_SENDER:?} is reserved for the daemon's own notices and cannot be a participant"));
         }
@@ -275,7 +280,8 @@ pub struct Shared {
     pub store: Mutex<Store>,
     pub db_path: PathBuf,
     pub hub: Hub,
-    pub config: Config,
+    config: Mutex<Arc<Config>>,
+    config_path: PathBuf,
     pub shutdown: AtomicBool,
     pub connections: AtomicUsize,
     pub watchers: Mutex<HashMap<u64, WatcherView>>,
@@ -289,6 +295,13 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// Clone only: never carry the configuration guard into a store acquisition.
+    /// Operations combining policy with database state call this while holding `store`.
+    /// Snapshot-only readers may call it alone; external work uses the detached Arc.
+    pub fn config(&self) -> Arc<Config> {
+        self.config.lock().expect("config lock poisoned").clone()
+    }
+
     pub fn committed(&self) {
         if let Ok(store) = self.store.lock()
             && let Ok(h) = store.head_seq()
@@ -347,7 +360,7 @@ pub fn restore(state_dir: &Path, socket: &Path, backup: &Path) -> Result<(String
 
 /// Nothing in the store is touched until this process holds the state directory's exclusive lock
 /// and no live daemon answers on the socket: a refused second daemon changes nothing.
-pub fn prepare(config: Config, state_dir: &Path, socket: &Path) -> Result<(Arc<Shared>, UnixListener), String> {
+pub fn prepare(config: Config, state_dir: &Path, socket: &Path, config_path: &Path) -> Result<(Arc<Shared>, UnixListener), String> {
     let lock = lock_state(state_dir)?;
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -384,7 +397,8 @@ pub fn prepare(config: Config, state_dir: &Path, socket: &Path) -> Result<(Arc<S
         store: Mutex::new(store),
         db_path,
         hub: Hub::new(head),
-        config,
+        config: Mutex::new(Arc::new(config)),
+        config_path: std::path::absolute(config_path).map_err(|e| e.to_string())?,
         shutdown: AtomicBool::new(false),
         connections: AtomicUsize::new(0),
         watchers: Mutex::new(HashMap::new()),
@@ -402,7 +416,7 @@ pub fn serve(shared: Arc<Shared>, listener: UnixListener) -> io::Result<()> {
         let s = shared.clone();
         std::thread::Builder::new().name("adapter".into()).spawn(move || adapter::run(s))?;
     }
-    if shared.config.health_interval_ms > 0 {
+    if shared.config().health_interval_ms > 0 {
         let s = shared.clone();
         std::thread::Builder::new().name("health".into()).spawn(move || health::run(s))?;
     }
@@ -456,7 +470,7 @@ fn send<W: io::Write>(w: &mut W, resp: Response) -> io::Result<()> {
 
 fn handle(shared: &Arc<Shared>, stream: UnixStream) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(shared.config.write_deadline_ms)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(shared.config().write_deadline_ms)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream.try_clone()?);
     loop {
@@ -521,14 +535,20 @@ fn receipt_delivery(shared: &Shared, store: &Store, sender: &str, id: &str, dupl
         let evidence = store.delivery_evidence(&m).map_err(|e| e.to_string())?;
         let endpoint = store.endpoints().map_err(|e| e.to_string())?.into_iter().find(|e| e.name == m.recipient);
         let policy = if let Some(ep) = endpoint {
-            let wake_kinds = shared.config.wake_kinds(&ep.name);
+            let wake_kinds = shared.config().wake_kinds(&ep.name);
             DeliveryPolicy::Push {
                 recipient: m.recipient.clone(),
                 generation: ep.generation,
                 is_wake_kind: wake_kinds.contains(&m.kind),
                 wake_kinds,
                 throttle_candidate: store
-                    .push_hold(&ep, observed_at_ms, shared.config.push_min_interval_ms as i64, shared.config.push_inflight_ms as i64, None)
+                    .push_hold(
+                        &ep,
+                        observed_at_ms,
+                        shared.config().push_min_interval_ms as i64,
+                        shared.config().push_inflight_ms as i64,
+                        None,
+                    )
                     .map_err(|e| e.to_string())?,
                 completion_checked: false,
             }
@@ -637,6 +657,11 @@ fn endpoint_bound(shared: &Shared, result: &BindResult, wrote: &mut bool) {
 }
 
 fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
+    match &req {
+        Request::ConfigPreview => return refresh_config(shared, None),
+        Request::ConfigApply { revision } => return refresh_config(shared, Some(revision)),
+        _ => {}
+    }
     if let Some(name) = reserved_name(&req) {
         return Response::Error {
             code: ErrorCode::BadRequest,
@@ -713,7 +738,7 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
                 Ok(mut s) => {
                     s.watchers = shared.watchers.lock().map(|w| w.values().cloned().collect()).unwrap_or_default();
                     let health = shared.health.lock().map(|h| h.clone()).unwrap_or_default();
-                    let mut rows = directory(&shared.config, &s.endpoints, &s.watchers, &health);
+                    let mut rows = directory(&shared.config(), &s.endpoints, &s.watchers, &health);
                     for row in rows.iter_mut() {
                         if let Some(kinds) = &row.wake_kinds {
                             row.queued_for_wake = store.queued_for_wake(&row.name, kinds, None, 0).ok().map(|(_, total)| total);
@@ -785,6 +810,7 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
             }
         }
         Request::ImportLegacy { paths, dry_run } => legacy::import(&mut store, &paths, dry_run).map(Response::Legacy).unwrap_or_else(err),
+        Request::ConfigPreview | Request::ConfigApply { .. } => unreachable!(),
         Request::Watch { .. } => Response::Error { code: ErrorCode::BadRequest, message: "watch is handled by the connection".into() },
     };
     let head = if wrote { store.head_seq().ok() } else { None };
@@ -841,7 +867,11 @@ fn watch<W: io::Write>(
         Ok(s) => s,
         Err(e) => return send(w, err(e)),
     };
-    if !shared.config.knows(who) {
+    let known = {
+        let _store = shared.store.lock().expect("store lock poisoned");
+        shared.config().knows(who)
+    };
+    if !known {
         return send(w, Response::Error { code: ErrorCode::UnknownParticipant, message: format!("unknown participant {who:?}") });
     }
     let filter = filter_hash(who, conversation);
@@ -955,7 +985,7 @@ fn watch<W: io::Write>(
             return send(w, err(e.into()));
         }
         send(w, Response::SnapshotEnd { head_seq: head, pages })?;
-        let heartbeat = Duration::from_millis(shared.config.heartbeat_ms);
+        let heartbeat = Duration::from_millis(shared.config().heartbeat_ms);
         let mut seen_global = head;
         loop {
             if shared.shutdown.load(Ordering::SeqCst) {
@@ -1169,7 +1199,7 @@ mod receipt_delivery_tests {
             std::fs::create_dir_all(&dir).unwrap();
             let config =
                 toml::from_str(&format!("health_interval_ms=0\npush_min_interval_ms=1000\npush_inflight_ms=60000\n{extra}")).unwrap();
-            let (shared, listener) = prepare(config, &dir.join("state"), &dir.join("socket")).unwrap();
+            let (shared, listener) = prepare(config, &dir.join("state"), &dir.join("socket"), &dir.join("config.toml")).unwrap();
             drop(listener); // Exercise dispatch deterministically; no adapter or live socket is used.
             Self { shared, dir }
         }
@@ -1507,5 +1537,306 @@ mod receipt_delivery_tests {
             };
             assert!(next.endpoint.generation > first.endpoint.generation);
         }
+    }
+}
+
+// Normalize defaults and participant spellings before comparing policy or hashing its revision.
+fn normalized(config: &Config) -> serde_json::Value {
+    let mut value = serde_json::to_value(config).expect("configuration is serializable");
+    let mut participants = serde_json::Map::new();
+    for name in config.participant_names() {
+        let conf = config.participant.get(&name).cloned().unwrap_or_default();
+        participants.insert(
+            name.clone(),
+            serde_json::json!({
+                "product": conf.product, "tier": conf.tier,
+                "wake_kinds": config.wake_kinds(&name),
+            }),
+        );
+    }
+    value.as_object_mut().unwrap().remove("participants");
+    value["participant"] = participants.into();
+    // An explicit default session directory and the resolved default are equivalent.
+    value["codex_sessions_dir"] = serde_json::json!(config.codex_sessions());
+    value
+}
+
+fn config_revision(config: &Config) -> String {
+    format!("{:x}", Sha256::digest(serde_json::to_vec(&normalized(config)).expect("configuration is serializable")))
+}
+
+fn config_delta(current: &Config, candidate: &Config, retained: &std::collections::BTreeSet<String>) -> Result<Vec<String>, String> {
+    let old = normalized(current);
+    let new = normalized(candidate);
+    let mut refused = Vec::new();
+    for (key, value) in old.as_object().unwrap() {
+        if key != "participant" && new[key] != *value {
+            refused.push(format!("non-reloadable setting {key}"));
+        }
+    }
+    let old_names = old["participant"].as_object().unwrap();
+    let new_names = new["participant"].as_object().unwrap();
+    for (name, conf) in old_names {
+        match new_names.get(name) {
+            None => refused.push(format!("removed participant {name}")),
+            Some(next) if next != conf => refused.push(format!("changed participant {name}")),
+            _ => {}
+        }
+    }
+    let mut added = Vec::new();
+    for name in new_names.keys().filter(|n| !old_names.contains_key(*n)) {
+        if retained.contains(name) {
+            refused.push(format!("retained participant {name}: needs restart or separately reviewed reactivation"));
+        } else {
+            added.push(name.clone());
+        }
+    }
+    if refused.is_empty() { Ok(added) } else { Err(refused.join("; ")) }
+}
+
+fn refresh_config(shared: &Arc<Shared>, revision: Option<&str>) -> Response {
+    let failure = |code, message| Response::Error { code, message };
+    // Exactly one file read, before acquiring either publication lock.
+    let bytes = match std::fs::read(&shared.config_path) {
+        Ok(bytes) => bytes,
+        Err(e) => return failure(ErrorCode::BadRequest, format!("{}: {e}", shared.config_path.display())),
+    };
+    let candidate_revision = format!("{:x}", Sha256::digest(&bytes));
+    if revision.is_some_and(|r| r != candidate_revision) {
+        return failure(ErrorCode::Conflict, "candidate revision changed; preview the current file".into());
+    }
+    let candidate: Config =
+        match std::str::from_utf8(&bytes).map_err(|e| e.to_string()).and_then(|s| toml::from_str(s).map_err(|e| e.to_string())) {
+            Ok(config) => config,
+            Err(e) => return failure(ErrorCode::BadRequest, format!("invalid configuration: {e}")),
+        };
+    if let Err(e) = candidate.validate() {
+        return failure(ErrorCode::BadRequest, e);
+    }
+    apply_config(shared, candidate, candidate_revision, revision.is_some())
+}
+
+fn apply_config(shared: &Arc<Shared>, candidate: Config, candidate_revision: String, applied: bool) -> Response {
+    let failure = |code, message| Response::Error { code, message };
+    let candidate = Arc::new(candidate);
+    let mut store = match shared.store.lock() {
+        Ok(store) => store,
+        Err(_) => return failure(ErrorCode::Storage, "store lock poisoned".into()),
+    };
+    // Acquire the publication guard before commit, and revalidate against the current snapshot.
+    let mut effective = match shared.config.lock() {
+        Ok(config) => config,
+        Err(_) => return failure(ErrorCode::Storage, "config lock poisoned".into()),
+    };
+    let retained = match store.participants() {
+        Ok(names) => names,
+        Err(e) => return err(e),
+    };
+    let added = match config_delta(&effective, &candidate, &retained) {
+        Ok(added) => added,
+        Err(e) => return failure(ErrorCode::BadRequest, e),
+    };
+    let no_op = added.is_empty();
+    let base_revision = config_revision(&effective);
+    let effective_revision = if applied && !no_op { config_revision(&candidate) } else { base_revision.clone() };
+    let response = Response::ConfigRefresh { base_revision, candidate_revision, effective_revision, added: added.clone(), applied, no_op };
+    if applied
+        && !no_op
+        && let Err(e) = publish_config(&mut store, &mut effective, candidate, &added, || {})
+    {
+        return err(e);
+    }
+    response
+}
+
+// The callback is a deterministic test boundary; production supplies an empty closure.
+fn publish_config(
+    store: &mut Store,
+    effective: &mut Arc<Config>,
+    candidate: Arc<Config>,
+    added: &[String],
+    after_commit: impl FnOnce(),
+) -> Result<(), StoreError> {
+    store.add_participants(added)?;
+    after_commit();
+    *effective = candidate;
+    Ok(())
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    struct Fixture {
+        shared: Arc<Shared>,
+        dir: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("chatd-config-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (shared, listener) = prepare(Config::default(), &dir.join("state"), &dir.join("socket"), &dir.join("config")).unwrap();
+            drop(listener);
+            Self { shared, dir }
+        }
+        fn candidate(&self, text: &str) -> String {
+            std::fs::write(self.dir.join("config"), text).unwrap();
+            format!("{:x}", Sha256::digest(text.as_bytes()))
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    fn parse(s: &str) -> Config {
+        toml::from_str(s).unwrap()
+    }
+    fn refused(r: Response, words: &[&str]) {
+        let Response::Error { message, .. } = r else { panic!("expected refusal: {r:?}") };
+        for word in words {
+            assert!(message.contains(word), "{word}: {message}");
+        }
+    }
+    #[test]
+    fn normalized_definitions_and_named_refusals() {
+        let a = parse("participants=['a','b']\n[participant.b]\nwake_kinds=['all']");
+        let b = parse(
+            "participants=['b']\n[participant.a]\nwake_kinds=['request','request']\n[participant.b]\nwake_kinds=['final','request','progress','info']",
+        );
+        assert_eq!(config_revision(&a), config_revision(&b));
+        assert!(config_delta(&a, &b, &Default::default()).unwrap().is_empty());
+        let c = parse("participants=['b']\nheartbeat_ms=8\nwrite_deadline_ms=9\n[participant.b]\nproduct='codex'");
+        let error = config_delta(&a, &c, &Default::default()).unwrap_err();
+        for word in ["removed participant a", "changed participant b", "heartbeat_ms", "write_deadline_ms"] {
+            assert!(error.contains(word), "{error}");
+        }
+    }
+    #[test]
+    fn revisions_noops_and_file_errors() {
+        let f = Fixture::new();
+        refused(refresh_config(&f.shared, None), &["config"]);
+        let first = f.candidate("[participant.new]\nproduct='codex'");
+        let Response::ConfigRefresh { base_revision, added, applied, .. } = refresh_config(&f.shared, None) else { panic!() };
+        assert_eq!(added, ["new"]);
+        assert!(!applied);
+        let second = f.candidate("[participant.new]\nproduct='codex'\n# new bytes\n");
+        assert!(matches!(refresh_config(&f.shared, Some(&first)), Response::Error { code: ErrorCode::Conflict, .. }));
+        let Response::ConfigRefresh { effective_revision, no_op, .. } = refresh_config(&f.shared, Some(&second)) else { panic!() };
+        assert!(!no_op);
+        assert_ne!(base_revision, effective_revision);
+        for text in ["[participant.new]\nproduct='codex'", "# formatting\n[participant.new]\nproduct='codex'\n"] {
+            let revision = f.candidate(text);
+            let Response::ConfigRefresh { effective_revision: next, no_op, added, .. } = refresh_config(&f.shared, Some(&revision)) else {
+                panic!()
+            };
+            assert!(no_op && added.is_empty());
+            assert_eq!(next, effective_revision);
+        }
+        for text in ["[participant.bad_name]", "[participant.new]\nwake_kinds=['unknown']", "[participant.new]\nproduct='INVALID'"] {
+            let revision = f.candidate(text);
+            assert!(matches!(refresh_config(&f.shared, Some(&revision)), Response::Error { code: ErrorCode::BadRequest, .. }));
+        }
+        let invalid = f.candidate("unknown_option=1");
+        refused(refresh_config(&f.shared, Some(&invalid)), &["unknown_option"]);
+        std::fs::remove_file(f.dir.join("config")).unwrap();
+        std::fs::create_dir(f.dir.join("config")).unwrap();
+        refused(refresh_config(&f.shared, None), &["config"]); // unreadable as a file even under root
+        assert!(f.shared.config().knows("new"));
+    }
+    #[test]
+    fn database_failure_rolls_back_all_additions() {
+        let f = Fixture::new();
+        f.shared
+            .store
+            .lock()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_new BEFORE INSERT ON participants WHEN NEW.name='z' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+            )
+            .unwrap();
+        let revision = f.candidate("[participant.a]\n[participant.z]\n");
+        assert!(matches!(refresh_config(&f.shared, Some(&revision)), Response::Error { code: ErrorCode::Storage, .. }));
+        let store = f.shared.store.lock().unwrap();
+        assert!(!store.participants().unwrap().contains("a"));
+        assert!(!f.shared.config().knows("a"));
+    }
+    #[test]
+    fn retained_name_refusal_preserves_state() {
+        let f = Fixture::new();
+        let mut store = f.shared.store.lock().unwrap();
+        store.add_participants(&["retired".into()]).unwrap();
+        store.endpoint_bind("retired", "session", "/missing", BindMode::Plain).unwrap();
+        store
+            .send(&crate::proto::SendReq {
+                from: "claude".into(),
+                to: Some("retired".into()),
+                conversation: Some("retained".into()),
+                kind: Kind::Request,
+                reply_to: None,
+                idempotency_key: "pending".into(),
+                summary: None,
+                body: "outstanding".into(),
+            })
+            .unwrap();
+        let head = store.head_seq().unwrap();
+        let endpoints = serde_json::to_value(store.endpoints().unwrap()).unwrap();
+        drop(store);
+        let revision = f.candidate("[participant.retired]\nwake_kinds=['all']");
+        refused(refresh_config(&f.shared, Some(&revision)), &["retained participant retired", "restart"]);
+        let store = f.shared.store.lock().unwrap();
+        assert_eq!(head, store.head_seq().unwrap());
+        assert_eq!(endpoints, serde_json::to_value(store.endpoints().unwrap()).unwrap());
+        assert!(!f.shared.config().knows("retired"));
+        assert_eq!(store.unanswered_to("retired").unwrap(), 1);
+        assert!(store.health_record("retired").unwrap().is_none());
+    }
+    #[test]
+    fn competing_captured_candidates_revalidate_current_policy() {
+        let f = Fixture::new();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut joins = Vec::new();
+        for name in ["a", "b"] {
+            let shared = f.shared.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                let config = parse(&format!("[participant.{name}]"));
+                barrier.wait();
+                apply_config(&shared, config, name.into(), true)
+            }));
+        }
+        barrier.wait();
+        let responses: Vec<_> = joins.into_iter().map(|j| j.join().unwrap()).collect();
+        assert_eq!(responses.iter().filter(|r| matches!(r, Response::ConfigRefresh { .. })).count(), 1);
+        assert_eq!(responses.iter().filter(|r| matches!(r, Response::Error { .. })).count(), 1);
+        let store = f.shared.store.lock().unwrap();
+        for name in ["a", "b"] {
+            assert_eq!(store.participants().unwrap().contains(name), f.shared.config().knows(name));
+        }
+    }
+    #[test]
+    fn publication_barrier_covers_commit_to_swap() {
+        let f = Fixture::new();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let shared = f.shared.clone();
+        let writer = std::thread::spawn(move || {
+            let mut store = shared.store.lock().unwrap();
+            let mut config = shared.config.lock().unwrap();
+            publish_config(&mut store, &mut config, Arc::new(parse("[participant.new]")), &["new".into()], || {
+                committed_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap();
+        });
+        committed_rx.recv().unwrap();
+        assert!(f.shared.store.try_lock().is_err());
+        assert!(f.shared.config.try_lock().is_err());
+        // SQLite has committed, but neither admission nor policy readers can pass the barrier.
+        assert!(Store::open(&f.shared.db_path).unwrap().participants().unwrap().contains("new"));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let store = f.shared.store.lock().unwrap();
+        assert!(store.participants().unwrap().contains("new") && f.shared.config().knows("new"));
     }
 }
