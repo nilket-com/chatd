@@ -176,6 +176,45 @@ participant, sent as or sent to.
 | received | the recipient acknowledged it |
 | answered | a `final` reply references it (progress replies do not answer) |
 
+`send` and `reply` still print the same stored receipt on stdout. In plain mode a separate
+`chatctl: delivery: ...` line on stderr explains the current policy and recorded evidence.
+`--json` includes an optional `delivery` object instead (no delivery diagnostic on stderr):
+`observed_at_ms`, tagged `policy`, `evidence`, and human `text`. Parse the fields, not the text.
+An older daemon omits this field, meaning unknown; `lookup` remains unenriched.
+
+Policy is an observation, not a delivery promise. For example:
+
+| Case | Delivery statement (abbreviated) |
+| --- | --- |
+| New waking message | push to codex eligible by kind; submission not confirmed |
+| Non-waking info | codex wakes on request: info does not wake it by kind; normally carried by its next waking push (override: `chatctl redeliver ID`, still throttled) |
+| Minimum interval | push to codex held by the minimum interval for about 4m58s more (attempt 12 started 2s ago) |
+| In-flight candidate | push to codex possibly held: ID (attempt 12, submitted) started 3m ago, still unacknowledged; window ends in 57m; may already be released by a completed turn |
+| Pull | pull inbox; watcher attached for this conversation (or no watcher for this conversation) |
+| Duplicate with no evidence | already stored; no submission or receipt evidence recorded; current kind policy follows |
+| Duplicate with evidence | acknowledged 2s ago; carried in digest with ID; latest recorded attempt 12: submitted (generation 2) |
+| Answered request | answered by REPLY-ID, separately from acknowledgement and attempt evidence |
+| Retired request | retired rehearsal request (or superseded by ID); no automatic push or digest; redelivery refused |
+| Observation failed | stored; delivery observation unavailable |
+
+Push policy includes `generation`, `wake_kinds`, `is_wake_kind`, `throttle_candidate` and
+`completion_checked: false`. A throttle candidate uses **attempt start time**, even when the attempt
+is still started or uncertain; it does not prove submission. Minimum interval takes precedence.
+The adapter may already have released an in-flight hold using completed-turn evidence that the
+receipt does not inspect. An acknowledgement can also release that hold; another attempt can extend
+it. Window endpoints are not promised release times. Pull policy's `matching_watcher` counts only
+watchers covering this conversation, including all-conversation watchers. It does not reveal their
+client-side kind filters or prove acceptance by an agent.
+
+Evidence keeps acknowledgement time, final reply ID, digest, retirement, explicit redelivery and
+the latest 20 attempts (newest first), with `attempts_total` indicating older omitted history. Each
+attempt includes its state, generation, start and finish times. These facts can coexist. A duplicate
+receipt never creates a new attempt; current kind policy is not a retry-eligibility verdict.
+Explicit redelivery, retry limits, backoff and generation fencing still govern eligibility. Retirement
+belongs to the annotated request itself, not its progress/final replies. Advisory observation failure
+never undoes a durable send or suppresses its normal notification; the successful receipt still clears
+the pending key only after stdout is flushed. Existing health warnings remain unchanged.
+
 A watch starts with a paged snapshot of the authoritative unacknowledged inbox (bounded pages;
 `SnapshotBegin`, `SnapshotPage`…, `SnapshotEnd`), then streams events after it. If its resume
 token is refused (malformed, from another store or filter, beyond the head, or from before a
@@ -270,6 +309,12 @@ receipt. A timeout or a stop mid-submission leaves an **uncertain** attempt, whi
 repeated automatically (`chatctl redeliver <id>` is explicit).
 
 ### Which messages wake a push participant
+
+The send/reply receipt's delivery observation explains this policy without promising a push.
+Work the recipient must act on should be a `request`, or a `final` reply when that recipient's
+policy wakes on finals. `final` still completes its parent request; it is not a generic urgency tag.
+A non-waking receipt suggests `chatctl redeliver ID` as an explicit override, which still respects
+throttling and cannot redeliver a retired request.
 
 Every push is a model turn for the agent, so only messages that need action are pushed. By default
 that is `request`. Every other message (progress and final replies, info notes, chatd's health

@@ -183,6 +183,76 @@ pub struct Receipt {
     /// refused for it; the sender is told.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// Advisory post-store observation; missing on old daemons and lookup receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeliveryObservation>,
+}
+
+/// Policy is separate from historical evidence: neither implies current retry eligibility.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryObservation {
+    pub observed_at_ms: i64,
+    pub policy: DeliveryPolicy,
+    pub evidence: Option<DeliveryEvidence>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeliveryPolicy {
+    Push {
+        recipient: String,
+        generation: i64,
+        wake_kinds: Vec<Kind>,
+        is_wake_kind: bool,
+        throttle_candidate: Option<PushHold>,
+        completion_checked: bool,
+    },
+    Pull {
+        recipient: String,
+        matching_watcher: bool,
+    },
+    Unavailable,
+}
+
+/// Shared throttle result. It is effective only with the same completed-turn evidence as the adapter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum PushHold {
+    MinimumInterval { attempt: i64, message_id: String, started_at_ms: i64, until_ms: i64 },
+    InFlight { attempt: i64, message_id: String, state: String, started_at_ms: i64, until_ms: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryEvidence {
+    /// Most recent 20 attempts, newest first. The total makes truncation explicit.
+    pub attempts: Vec<AttemptView>,
+    pub attempts_total: i64,
+    pub acknowledged_at_ms: Option<i64>,
+    pub final_reply_id: Option<String>,
+    pub digest: Option<DigestEvidence>,
+    pub retirement: Option<RetirementEvidence>,
+    pub redelivery: Option<RedeliveryEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DigestEvidence {
+    pub attempt: i64,
+    pub generation: i64,
+    pub with_message_id: String,
+    pub at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetirementEvidence {
+    pub superseded_by: Option<String>,
+    pub rehearsal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RedeliveryEvidence {
+    pub after_attempt: i64,
+    pub at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

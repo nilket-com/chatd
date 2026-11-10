@@ -2546,3 +2546,112 @@ fn unfiltered_wait_returns_before_snapshot_end_but_filtered_wait_waits_for_it() 
         }
     }
 }
+
+// ---- plan 0009: receipt policy observations ----
+
+#[test]
+fn receipt_cli_keeps_stdout_stable_and_json_structured_for_send_and_reply() {
+    let mut e = Env::standard();
+    e.start();
+    let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "receipt"];
+    let plain = e.cli(&args, Some("body"));
+    assert_eq!(code(&plain), 0);
+    let id = stdout(&plain).split_whitespace().next().unwrap().to_owned();
+    let Response::Found(found) = e.call(Request::Lookup { sender: "claude".into(), idempotency_key: "receipt".into() }) else { panic!() };
+    assert!(found.delivery.is_none(), "lookup remains unenriched");
+    assert_eq!(stdout(&plain), format!("{id} (seq {}, key receipt)\n", found.seq));
+    assert!(stderr(&plain).contains("chatctl: delivery: pull inbox; no watcher for this conversation"));
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let out = e.cli(&json_args, Some("body"));
+    let receipt: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(receipt["duplicate"], true);
+    assert_eq!(receipt["delivery"]["policy"]["state"], "pull");
+    assert_eq!(receipt["delivery"]["policy"]["matching_watcher"], false);
+    assert!(receipt["delivery"]["observed_at_ms"].as_i64().unwrap() > 0);
+    assert!(!stderr(&out).contains("chatctl: delivery:"));
+    let reply = e.cli(&["reply", "--as", "codex", "--to-message", &id, "--final", "--json"], Some("done"));
+    assert_eq!(code(&reply), 0);
+    let reply: serde_json::Value = serde_json::from_str(&stdout(&reply)).unwrap();
+    assert_eq!(reply["delivery"]["policy"]["recipient"], "claude");
+    let out = e.cli(&json_args, Some("body"));
+    let receipt: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(receipt["delivery"]["evidence"]["final_reply_id"], reply["id"]);
+    assert!(receipt["delivery"]["evidence"]["acknowledged_at_ms"].is_i64());
+    assert!(e.pending_files().is_empty());
+}
+
+#[test]
+fn protocol_receipts_match_watchers_by_conversation_and_report_configured_push_kinds() {
+    for (filter, matching) in [(Some("other"), false), (Some("c"), true), (None, true)] {
+        let mut e = Env::standard();
+        e.start();
+        let mut watcher = e.client();
+        watcher
+            .send(Request::Watch { as_: "claude".into(), conversation: filter.map(str::to_owned), resume_token: None, exclusive: false })
+            .unwrap();
+        assert!(matches!(watcher.recv().unwrap(), Response::SnapshotBegin { .. }));
+        let out = e.cli(&["send", "--as", "codex", "--to", "claude", "--conversation", "c", "--json"], Some("body"));
+        assert_eq!(code(&out), 0);
+        let r: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        assert_eq!(r["delivery"]["policy"]["matching_watcher"], matching);
+    }
+    for config in ["", "[participant.codex]\nwake_kinds=[\"info\",\"final\"]\n"] {
+        let mut e = Env::new(config);
+        e.start();
+        let exe = fake_codex(&e, "exit 0");
+        register(&e, &exe, "isolated");
+        for kind in ["info", "request"] {
+            let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--kind", kind, "--json"], Some("body"));
+            let r: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+            assert_eq!(r["delivery"]["policy"]["state"], "push");
+            assert_eq!(r["delivery"]["policy"]["is_wake_kind"], if config.is_empty() { kind == "request" } else { kind == "info" });
+            assert_eq!(r["delivery"]["policy"]["completion_checked"], false);
+        }
+        let parent = e.send("codex", "claude", "c", Kind::Request, "parent", "answer me");
+        let Response::Stored(r) = e.reply("claude", &parent, Kind::Final, "final") else { panic!() };
+        let policy = serde_json::to_value(r.delivery.unwrap()).unwrap();
+        assert_eq!(policy["policy"]["is_wake_kind"], !config.is_empty());
+    }
+}
+
+#[test]
+fn old_receipt_without_delivery_is_accepted_and_new_receipt_is_readable_by_old_shape() {
+    use chatd::proto::{ClientFrame, PROTOCOL_VERSION, read_frame, write_frame};
+    use std::os::unix::net::UnixListener;
+    let e = Env::standard();
+    let listener = UnixListener::bind(e.socket()).unwrap();
+    let old = serde_json::json!({"id":"00000000-0000-4000-8000-000000000001", "seq":1, "idempotency_key":"compat", "duplicate":false});
+    let wire = serde_json::to_value(chatd::proto::ServerFrame {
+        v: PROTOCOL_VERSION,
+        resp: Response::Stored(serde_json::from_value(old.clone()).unwrap()),
+    })
+    .unwrap();
+    assert!(wire.to_string().find("delivery").is_none());
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _: ClientFrame = read_frame(&mut socket).unwrap().unwrap();
+        write_frame(&mut socket, &wire).unwrap();
+    });
+    let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "compat"], Some("body"));
+    server.join().unwrap();
+    assert_eq!(code(&out), 0);
+    assert!(!stderr(&out).contains("delivery:"));
+    assert_eq!(stdout(&out), "00000000-0000-4000-8000-000000000001 (seq 1, key compat)\n");
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct OldReceipt {
+        id: String,
+        seq: i64,
+        idempotency_key: String,
+        duplicate: bool,
+    }
+    let mut e = Env::standard();
+    e.start();
+    let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--json"], Some("body"));
+    let new: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let old: OldReceipt = serde_json::from_value(new.clone()).unwrap();
+    assert_eq!(old.id, new["id"].as_str().unwrap());
+    assert_eq!(serde_json::to_value(old).unwrap()["seq"], new["seq"]);
+}

@@ -15,8 +15,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::proto::{
-    ClientFrame, EndpointView, ErrorCode, EventView, HealthView, Kind, MAX_PAGE, PROTOCOL_VERSION, ParticipantView, Request, Response,
-    ServerFrame, WatcherView, read_frame, write_frame,
+    ClientFrame, DeliveryObservation, DeliveryPolicy, EndpointView, ErrorCode, EventView, HealthView, Kind, MAX_PAGE, PROTOCOL_VERSION,
+    ParticipantView, PushHold, Request, Response, ServerFrame, WatcherView, read_frame, write_frame,
 };
 use crate::store::{SYSTEM_SENDER, Store, StoreError, now_ms};
 use crate::{adapter, health, hub::Hub, journal, legacy, notify};
@@ -500,6 +500,123 @@ fn reserved_name(req: &Request) -> Option<&str> {
     names.into_iter().find(|n| *n == SYSTEM_SENDER)
 }
 
+/// Compact relative time for human receipts; structured timestamps remain milliseconds.
+fn receipt_duration(milliseconds: i64) -> String {
+    let seconds = milliseconds.max(0) / 1000;
+    match seconds {
+        0 => "<1s".into(),
+        1..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m{}s", seconds / 60, seconds % 60),
+        3600..86400 => format!("{}h{}m", seconds / 3600, seconds % 3600 / 60),
+        _ => format!("{}d{}h", seconds / 86400, seconds % 86400 / 3600),
+    }
+}
+
+fn receipt_delivery(shared: &Shared, store: &Store, sender: &str, id: &str, duplicate: bool) -> DeliveryObservation {
+    let observed_at_ms = now_ms();
+    let observe = || -> Result<DeliveryObservation, String> {
+        let m = store.receive(sender, id).map_err(|e| e.to_string())?;
+        let evidence = store.delivery_evidence(&m).map_err(|e| e.to_string())?;
+        let endpoint = store.endpoints().map_err(|e| e.to_string())?.into_iter().find(|e| e.name == m.recipient);
+        let policy = if let Some(ep) = endpoint {
+            let wake_kinds = shared.config.wake_kinds(&ep.name);
+            DeliveryPolicy::Push {
+                recipient: m.recipient.clone(),
+                generation: ep.generation,
+                is_wake_kind: wake_kinds.contains(&m.kind),
+                wake_kinds,
+                throttle_candidate: store
+                    .push_hold(&ep, observed_at_ms, shared.config.push_min_interval_ms as i64, shared.config.push_inflight_ms as i64, None)
+                    .map_err(|e| e.to_string())?,
+                completion_checked: false,
+            }
+        } else {
+            let watchers = shared.watchers.lock().map_err(|_| "watcher registry unavailable".to_string())?;
+            let matching_watcher =
+                watchers.values().any(|w| w.participant == m.recipient && w.conversation.as_ref().is_none_or(|c| *c == m.conversation));
+            DeliveryPolicy::Pull { recipient: m.recipient.clone(), matching_watcher }
+        };
+        let mut facts = Vec::new();
+        if let Some(retired) = &evidence.retirement {
+            facts.push(if retired.rehearsal {
+                "retired rehearsal request".into()
+            } else {
+                format!("retired request, superseded by {}", retired.superseded_by.as_deref().unwrap_or("unknown"))
+            });
+            facts.push("no automatic push or digest; redelivery refused".into());
+        }
+        if let Some(reply) = &evidence.final_reply_id {
+            facts.push(format!("answered by {reply}"));
+        }
+        if let Some(at) = evidence.acknowledged_at_ms {
+            facts.push(format!("acknowledged {} ago", receipt_duration(observed_at_ms.saturating_sub(at))));
+        }
+        if let Some(digest) = &evidence.digest {
+            facts.push(format!("carried in digest with {} (attempt {})", digest.with_message_id, digest.attempt));
+        }
+        if let Some(attempt) = evidence.attempts.first() {
+            facts.push(format!("latest recorded attempt {}: {} (generation {})", attempt.attempt, attempt.state, attempt.generation));
+        }
+        if let Some(redelivery) = &evidence.redelivery {
+            facts.push(format!("explicit redelivery recorded after attempt {}; retry eligibility not assessed", redelivery.after_attempt));
+        }
+        let no_delivery_evidence = evidence.attempts.is_empty()
+            && evidence.digest.is_none()
+            && evidence.acknowledged_at_ms.is_none()
+            && evidence.final_reply_id.is_none();
+        if duplicate && no_delivery_evidence {
+            facts.push("already stored; no submission or receipt evidence recorded".into());
+        }
+        match &policy {
+            DeliveryPolicy::Push { recipient, wake_kinds, is_wake_kind, throttle_candidate, .. } => {
+                let kinds = wake_kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(",");
+                let fresh = !duplicate && no_delivery_evidence && evidence.retirement.is_none();
+                if !*is_wake_kind {
+                    facts.push(format!("{recipient} wakes on {kinds}: {} does not wake it by kind", m.kind.as_str()));
+                    if evidence.retirement.is_none() {
+                        facts.push(format!("normally carried by its next waking push (override: chatctl redeliver {id}, still throttled)"));
+                    }
+                } else if evidence.retirement.is_some() {
+                    facts.push(format!("current kind policy: {recipient} wakes on {kinds}"));
+                } else {
+                    let target = if fresh { format!("push to {recipient}") } else { format!("current endpoint {recipient}") };
+                    match throttle_candidate {
+                        Some(PushHold::MinimumInterval { attempt, started_at_ms, until_ms, .. }) => facts.push(format!(
+                            "{target} held by the minimum interval for about {} more (attempt {attempt} started {} ago)",
+                            receipt_duration(until_ms.saturating_sub(observed_at_ms)),
+                            receipt_duration(observed_at_ms.saturating_sub(*started_at_ms)))),
+                        Some(PushHold::InFlight { attempt, message_id, state, started_at_ms, until_ms }) => facts.push(format!(
+                            "{target} possibly held: {message_id} (attempt {attempt}, {state}) started {} ago, still unacknowledged; window ends in {}; ack can release it; may already be released by a completed turn",
+                            receipt_duration(observed_at_ms.saturating_sub(*started_at_ms)),
+                            receipt_duration(until_ms.saturating_sub(observed_at_ms)))),
+                        None if fresh => facts.push(format!("push to {recipient} eligible by kind")),
+                        None => {}
+                    }
+                    if fresh {
+                        facts.push("submission not confirmed".into());
+                    }
+                    if !fresh || throttle_candidate.is_some() {
+                        facts.push(format!("current kind policy: {recipient} wakes on {kinds}"));
+                    }
+                }
+            }
+            DeliveryPolicy::Pull { matching_watcher, .. } => facts
+                .push(format!("pull inbox; {} for this conversation", if *matching_watcher { "watcher attached" } else { "no watcher" })),
+            DeliveryPolicy::Unavailable => unreachable!(),
+        }
+        Ok(DeliveryObservation { observed_at_ms, policy, evidence: Some(evidence), text: facts.join("; ") })
+    };
+    observe().unwrap_or_else(|error| {
+        journal::log(journal::PRIORITY_WARNING, &format!("delivery observation unavailable for {id}: {error}"), &[("MESSAGE_ID", id)]);
+        DeliveryObservation {
+            observed_at_ms,
+            policy: DeliveryPolicy::Unavailable,
+            evidence: None,
+            text: "stored; delivery observation unavailable".into(),
+        }
+    })
+}
+
 fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
     if let Some(name) = reserved_name(&req) {
         return Response::Error {
@@ -525,6 +642,8 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
                 let to = store.receive(&req.from, &r.id).map(|m| m.recipient).unwrap_or_default();
                 // Never refuses: a recipient whose last turn failed is still sent to, and the sender is told.
                 r.warning = shared.health.lock().ok().and_then(|h| h.get(&to).and_then(|v| health::send_warning(&to, v)));
+                // Advisory enrichment must never turn a durable send into an error or skip its hub wake.
+                r.delivery = Some(receipt_delivery(shared, &store, &req.from, &r.id, r.duplicate));
                 if !r.duplicate {
                     journal::log(
                         journal::PRIORITY_INFO,
@@ -1016,5 +1135,258 @@ mod directory_tests {
             "a codex with no endpoint has no path"
         );
         assert!(!c2.path_ready && c2.product.is_none() && c2.expected_transport.is_none());
+    }
+}
+
+#[cfg(test)]
+mod receipt_delivery_tests {
+    use super::*;
+    use crate::proto::{Receipt, SendReq};
+
+    struct Fixture {
+        shared: Arc<Shared>,
+        dir: PathBuf,
+    }
+    impl Fixture {
+        fn new(extra: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("chatd-receipt-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let config =
+                toml::from_str(&format!("health_interval_ms=0\npush_min_interval_ms=1000\npush_inflight_ms=60000\n{extra}")).unwrap();
+            let (shared, listener) = prepare(config, &dir.join("state"), &dir.join("socket")).unwrap();
+            drop(listener); // Exercise dispatch deterministically; no adapter or live socket is used.
+            Self { shared, dir }
+        }
+        fn send(&self, key: &str, kind: Kind, reply: Option<&str>) -> Receipt {
+            let req = SendReq {
+                from: if reply.is_some() { "codex" } else { "claude" }.into(),
+                to: if reply.is_some() { None } else { Some("codex".into()) },
+                conversation: if reply.is_some() { None } else { Some("c".into()) },
+                kind,
+                reply_to: reply.map(str::to_owned),
+                idempotency_key: key.into(),
+                summary: None,
+                body: "body".into(),
+            };
+            match dispatch(&self.shared, Request::Send(req)) {
+                Response::Stored(r) => r,
+                other => panic!("{other:?}"),
+            }
+        }
+        fn endpoint(&self) -> EndpointView {
+            self.shared.store.lock().unwrap().endpoint_register("codex", "test-session", "/bin/true").unwrap()
+        }
+        fn start_attempt(&self, id: &str) -> i64 {
+            let mut s = self.shared.store.lock().unwrap();
+            let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap().into_iter().find(|d| d.message.id == id).unwrap();
+            s.begin_attempt(&due).unwrap().unwrap()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn observation(r: Receipt) -> DeliveryObservation {
+        r.delivery.expect("enriched receipt")
+    }
+
+    #[test]
+    fn receipts_report_current_kind_policy_and_matching_pull_watchers() {
+        let f = Fixture::new("");
+        for (conversation, matching) in [(Some("other"), false), (Some("c"), true), (None, true)] {
+            f.shared.watchers.lock().unwrap().insert(
+                1,
+                WatcherView {
+                    participant: "codex".into(),
+                    conversation: conversation.map(str::to_owned),
+                    connected_at_ms: 0,
+                    last_event_seq: 0,
+                },
+            );
+            let d = observation(f.send("pull", Kind::Request, None));
+            assert!(matches!(d.policy, DeliveryPolicy::Pull { matching_watcher, .. } if matching_watcher == matching));
+        }
+        f.endpoint();
+        for kind in Kind::ALL {
+            if kind.is_reply() {
+                continue;
+            }
+            let d = observation(f.send(kind.as_str(), kind, None));
+            assert!(
+                matches!(d.policy, DeliveryPolicy::Push { is_wake_kind, completion_checked:false, .. } if is_wake_kind == (kind == Kind::Request))
+            );
+        }
+        let f = Fixture::new("[participant.codex]\nwake_kinds=[\"info\",\"final\"]\n");
+        f.endpoint();
+        assert!(matches!(observation(f.send("info", Kind::Info, None)).policy, DeliveryPolicy::Push { is_wake_kind: true, .. }));
+        assert!(matches!(observation(f.send("request", Kind::Request, None)).policy, DeliveryPolicy::Push { is_wake_kind: false, .. }));
+    }
+
+    #[test]
+    fn duplicate_receipts_preserve_attempt_history_and_never_claim_new_submission() {
+        for state in ["started", "submitted", "failed", "uncertain"] {
+            let f = Fixture::new("");
+            f.endpoint();
+            let original = f.send("message", Kind::Request, None);
+            let empty = observation(f.send("message", Kind::Request, None));
+            assert!(empty.text.contains("already stored; no submission or receipt evidence recorded"));
+            let attempt = f.start_attempt(&original.id);
+            if state != "started" {
+                f.shared.store.lock().unwrap().finish_attempt(attempt, state, Some(0), None, &[10000], &[]).unwrap();
+            }
+            let r = f.send("message", Kind::Request, None);
+            assert!(r.duplicate);
+            assert_eq!(r.id, original.id);
+            let d = observation(r);
+            assert!(!d.text.contains("submission not confirmed"));
+            let evidence = d.evidence.unwrap();
+            assert_eq!(evidence.attempts_total, 1);
+            assert_eq!(evidence.attempts[0].state, state);
+            assert_eq!(evidence.attempts[0].attempt, attempt);
+            if state != "started" {
+                f.shared.store.lock().unwrap().redeliver(&original.id).unwrap();
+                let d = observation(f.send("message", Kind::Request, None));
+                assert_eq!(d.evidence.unwrap().redelivery.unwrap().after_attempt, attempt);
+                assert!(!d.text.contains("submission not confirmed"));
+            }
+            f.shared.store.lock().unwrap().ack("codex", std::slice::from_ref(&original.id)).unwrap();
+            assert!(observation(f.send("message", Kind::Request, None)).evidence.unwrap().acknowledged_at_ms.is_some());
+        }
+    }
+
+    #[test]
+    fn digest_answer_and_retirement_evidence_are_independent_of_reply_policy() {
+        let f = Fixture::new("");
+        f.endpoint();
+        let info = f.send("info", Kind::Info, None);
+        let parent = f.send("parent", Kind::Request, None);
+        let attempt = f.start_attempt(&parent.id);
+        f.shared.store.lock().unwrap().finish_attempt(attempt, "submitted", Some(0), None, &[], std::slice::from_ref(&info.id)).unwrap();
+        let d = observation(f.send("info", Kind::Info, None));
+        assert_eq!(d.evidence.unwrap().digest.unwrap().with_message_id, parent.id);
+        assert!(d.text.contains("carried in digest"));
+        f.shared.store.lock().unwrap().redeliver(&info.id).unwrap();
+        let d = observation(f.send("info", Kind::Info, None));
+        let evidence = d.evidence.unwrap();
+        assert!(evidence.digest.is_some() && evidence.redelivery.is_some());
+        let replacement = f.send("replacement", Kind::Request, None);
+        f.shared.store.lock().unwrap().annotate_work("claude", &parent.id, Some(&replacement.id), "replacement").unwrap();
+        let d = observation(f.send("parent", Kind::Request, None));
+        assert_eq!(d.evidence.unwrap().retirement.unwrap().superseded_by, Some(replacement.id));
+        assert!(d.text.contains("redelivery refused"));
+        let reply = f.send("reply", Kind::Final, Some(&parent.id));
+        assert!(reply.delivery.unwrap().evidence.unwrap().retirement.is_none());
+        assert_eq!(observation(f.send("parent", Kind::Request, None)).evidence.unwrap().final_reply_id, Some(reply.id));
+        let rehearsal = f.send("rehearsal", Kind::Request, None);
+        f.shared.store.lock().unwrap().annotate_work("claude", &rehearsal.id, None, "probe").unwrap();
+        assert!(observation(f.send("rehearsal", Kind::Request, None)).evidence.unwrap().retirement.unwrap().rehearsal);
+    }
+
+    #[test]
+    fn receipt_candidates_share_adapter_precedence_but_disclose_unchecked_completion() {
+        let f = Fixture::new("");
+        let ep = f.endpoint();
+        let first = f.send("first", Kind::Request, None);
+        let first_text = &first.delivery.as_ref().unwrap().text;
+        assert!(first_text.starts_with("push to codex eligible by kind; submission not confirmed"));
+        assert!(!first_text.contains("completed turn"));
+        let attempt = f.start_attempt(&first.id);
+        let d = observation(f.send("next", Kind::Request, None));
+        assert!(d.text.starts_with("push to codex held by the minimum interval"));
+        assert!(!d.text.contains("completed turn"));
+        assert!(!d.text.contains(" ms"));
+        let DeliveryPolicy::Push { throttle_candidate, completion_checked, .. } = d.policy else { panic!() };
+        assert!(!completion_checked);
+        assert!(matches!(throttle_candidate, Some(PushHold::MinimumInterval { .. })));
+        {
+            let s = f.shared.store.lock().unwrap();
+            assert_eq!(throttle_candidate, s.push_hold(&ep, d.observed_at_ms, 1000, 60000, None).unwrap());
+            assert!(!s.push_allowed(&ep, d.observed_at_ms, 1000, 60000, None).unwrap());
+        }
+        let started = now_ms() - 2000;
+        f.shared
+            .store
+            .lock()
+            .unwrap()
+            .conn()
+            .execute("UPDATE attempts SET started_at_ms=?1 WHERE id=?2", rusqlite::params![started, attempt])
+            .unwrap();
+        let d = observation(f.send("next2", Kind::Request, None));
+        assert!(d.text.contains("may already be released by a completed turn"));
+        let DeliveryPolicy::Push { throttle_candidate, .. } = d.policy else { panic!() };
+        assert!(matches!(throttle_candidate, Some(PushHold::InFlight { attempt:a, .. }) if a==attempt));
+        {
+            let s = f.shared.store.lock().unwrap();
+            assert_eq!(throttle_candidate, s.push_hold(&ep, d.observed_at_ms, 1000, 60000, None).unwrap());
+            assert!(!s.push_allowed(&ep, d.observed_at_ms, 1000, 60000, None).unwrap());
+            assert!(
+                s.push_allowed(&ep, d.observed_at_ms, 1000, 60000, Some(started + 1)).unwrap(),
+                "completed-turn evidence releases the adapter"
+            );
+        }
+        f.endpoint();
+        assert!(matches!(
+            observation(f.send("new-binding", Kind::Request, None)).policy,
+            DeliveryPolicy::Push { throttle_candidate: None, generation: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn enrichment_query_or_registry_failure_preserves_receipt_and_hub_wake() {
+        for query_failure in [true, false] {
+            let f = Fixture::new("");
+            if query_failure {
+                f.shared.store.lock().unwrap().conn().execute_batch("DROP TABLE digests").unwrap();
+            } else {
+                let _ = std::panic::catch_unwind(|| {
+                    let _guard = f.shared.watchers.lock().unwrap();
+                    panic!("poison only this fixture's watcher registry");
+                });
+            }
+            let before = f.shared.hub.head();
+            let r = f.send("stored", Kind::Info, None);
+            assert!(!r.duplicate);
+            assert!(matches!(r.delivery.unwrap().policy, DeliveryPolicy::Unavailable));
+            assert!(f.shared.hub.head() > before);
+            let retry = f.send("stored", Kind::Info, None);
+            assert!(retry.duplicate);
+            assert_eq!(retry.id, r.id);
+            assert_eq!(f.shared.store.lock().unwrap().lookup("claude", "stored").unwrap().id, r.id);
+        }
+    }
+    #[test]
+    fn receipt_attempt_history_is_bounded_and_reports_omitted_older_attempts() {
+        let f = Fixture::new("");
+        f.endpoint();
+        let message = f.send("history", Kind::Request, None);
+        let mut ids = Vec::new();
+        for _ in 0..23 {
+            let attempt = f.start_attempt(&message.id);
+            ids.push(attempt);
+            let mut store = f.shared.store.lock().unwrap();
+            store.finish_attempt(attempt, "submitted", Some(0), None, &[], &[]).unwrap();
+            store.redeliver(&message.id).unwrap();
+        }
+        let evidence = observation(f.send("history", Kind::Request, None)).evidence.unwrap();
+        assert_eq!(evidence.attempts_total, 23);
+        assert_eq!(evidence.attempts.iter().map(|a| a.attempt).collect::<Vec<_>>(), ids.into_iter().rev().take(20).collect::<Vec<_>>());
+        assert_eq!(f.shared.store.lock().unwrap().attempts_for(&message.id).unwrap().len(), 23, "history is not deleted");
+    }
+    #[test]
+    fn human_receipt_times_are_compact_relative_durations() {
+        for (milliseconds, expected) in [
+            (0, "<1s"),
+            (999, "<1s"),
+            (2000, "2s"),
+            (298000, "4m58s"),
+            (3420000, "57m0s"),
+            (3660000, "1h1m"),
+            (90000000, "1d1h"),
+            (-1000, "<1s"),
+        ] {
+            assert_eq!(receipt_duration(milliseconds), expected);
+        }
     }
 }

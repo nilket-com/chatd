@@ -9,8 +9,9 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 
 use crate::proto::{
-    AttemptView, CurrentLine, CurrentView, EndpointView, ErrorCode, EventView, Kind, MAX_BODY, MAX_CONVERSATION_LEN, MAX_KEY_LEN,
-    MAX_LOG_PAGE, MAX_PAGE, MessageView, Receipt, SendReq, StatusLine, StatusView,
+    AttemptView, CurrentLine, CurrentView, DeliveryEvidence, DigestEvidence, EndpointView, ErrorCode, EventView, Kind, MAX_BODY,
+    MAX_CONVERSATION_LEN, MAX_KEY_LEN, MAX_LOG_PAGE, MAX_PAGE, MessageView, PushHold, Receipt, RedeliveryEvidence, RetirementEvidence,
+    SendReq, StatusLine, StatusView,
 };
 use crate::text;
 
@@ -326,7 +327,17 @@ impl Store {
             None => Ok(None),
             Some(id) => {
                 let m = self.message_row(&id)?.ok_or_else(|| StoreError::new(ErrorCode::Storage, "message vanished"))?;
-                Ok(Some((Receipt { id: m.id.clone(), seq: m.seq, idempotency_key: key.to_string(), duplicate: true, warning: None }, m)))
+                Ok(Some((
+                    Receipt {
+                        id: m.id.clone(),
+                        seq: m.seq,
+                        idempotency_key: key.to_string(),
+                        duplicate: true,
+                        warning: None,
+                        delivery: None,
+                    },
+                    m,
+                )))
             }
         }
     }
@@ -450,7 +461,7 @@ impl Store {
             }
         }
         tx.commit()?;
-        Ok(Receipt { id, seq, idempotency_key: req.idempotency_key.clone(), duplicate: false, warning: None })
+        Ok(Receipt { id, seq, idempotency_key: req.idempotency_key.clone(), duplicate: false, warning: None, delivery: None })
     }
 
     pub fn lookup(&self, sender: &str, key: &str) -> Result<Receipt> {
@@ -951,23 +962,96 @@ impl Store {
         inflight_ms: i64,
         handled_since: Option<i64>,
     ) -> Result<bool> {
-        let last: Option<i64> = self.conn.query_row(
-            "SELECT max(started_at_ms) FROM attempts WHERE endpoint = ?1 AND generation = ?2 AND state <> 'failed'",
-            params![ep.name, ep.generation],
-            |r| r.get(0),
-        )?;
-        if last.is_some_and(|t| now - t < min_interval_ms) {
-            return Ok(false);
+        Ok(self.push_hold(ep, now, min_interval_ms, inflight_ms, handled_since)?.is_none())
+    }
+
+    /// The adapter and receipts share precisely the same precedence and generation fencing.
+    /// A receipt passes no completed-turn evidence and labels that limitation explicitly.
+    pub fn push_hold(
+        &self,
+        ep: &EndpointView,
+        now: i64,
+        min_interval_ms: i64,
+        inflight_ms: i64,
+        handled_since: Option<i64>,
+    ) -> Result<Option<PushHold>> {
+        let last: Option<(i64, String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT id,message_id,started_at_ms FROM attempts WHERE endpoint=?1 AND generation=?2 AND state <> 'failed'
+             ORDER BY started_at_ms DESC,id DESC LIMIT 1",
+                params![ep.name, ep.generation],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((attempt, message_id, started_at_ms)) = last
+            && now - started_at_ms < min_interval_ms
+        {
+            return Ok(Some(PushHold::MinimumInterval {
+                attempt,
+                message_id,
+                started_at_ms,
+                until_ms: started_at_ms.saturating_add(min_interval_ms),
+            }));
         }
-        let inflight: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM attempts t JOIN messages m ON m.id = t.message_id
-               WHERE t.endpoint = ?1 AND t.generation = ?2 AND t.state IN ('started', 'submitted', 'uncertain') AND t.started_at_ms > ?3
-                 AND t.started_at_ms >= ?4
-                 AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.reader = m.recipient AND a.message_id = m.id))",
-            params![ep.name, ep.generation, now - inflight_ms, handled_since.unwrap_or(i64::MIN)],
-            |r| r.get(0),
+        let inflight: Option<(i64, String, String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT t.id,t.message_id,t.state,t.started_at_ms FROM attempts t JOIN messages m ON m.id=t.message_id
+             WHERE t.endpoint=?1 AND t.generation=?2 AND t.state IN ('started','submitted','uncertain')
+               AND t.started_at_ms > ?3 AND t.started_at_ms >= ?4
+               AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.reader=m.recipient AND a.message_id=m.id)
+             ORDER BY t.started_at_ms DESC,t.id DESC LIMIT 1",
+                params![ep.name, ep.generation, now - inflight_ms, handled_since.unwrap_or(i64::MIN)],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        Ok(inflight.map(|(attempt, message_id, state, started_at_ms)| PushHold::InFlight {
+            attempt,
+            message_id,
+            state,
+            started_at_ms,
+            until_ms: started_at_ms.saturating_add(inflight_ms),
+        }))
+    }
+
+    /// Bounded historical evidence for a receipt; never changes delivery eligibility.
+    pub fn delivery_evidence(&self, m: &MessageView) -> Result<DeliveryEvidence> {
+        let attempts_total = self.conn.query_row("SELECT count(*) FROM attempts WHERE message_id=?1", [&m.id], |r| r.get(0))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id,message_id,endpoint,generation,state,started_at_ms,finished_at_ms,exit_code,error
+             FROM attempts WHERE message_id=?1 ORDER BY id DESC LIMIT 20",
         )?;
-        Ok(!inflight)
+        let attempts = stmt.query_map([&m.id], attempt_row)?.collect::<std::result::Result<_, _>>()?;
+        let digest = self
+            .conn
+            .query_row(
+                "SELECT d.attempt,t.generation,t.message_id,d.at_ms FROM digests d JOIN attempts t ON t.id=d.attempt WHERE d.message_id=?1",
+                [&m.id],
+                |r| Ok(DigestEvidence { attempt: r.get(0)?, generation: r.get(1)?, with_message_id: r.get(2)?, at_ms: r.get(3)? }),
+            )
+            .optional()?;
+        let retirement = self
+            .conn
+            .query_row("SELECT by_request,rehearsal FROM work_annotations WHERE message_id=?1", [&m.id], |r| {
+                Ok(RetirementEvidence { superseded_by: r.get(0)?, rehearsal: r.get(1)? })
+            })
+            .optional()?;
+        let redelivery = self
+            .conn
+            .query_row("SELECT after_attempt,at_ms FROM redeliveries WHERE message_id=?1", [&m.id], |r| {
+                Ok(RedeliveryEvidence { after_attempt: r.get(0)?, at_ms: r.get(1)? })
+            })
+            .optional()?;
+        Ok(DeliveryEvidence {
+            attempts,
+            attempts_total,
+            acknowledged_at_ms: m.received_at_ms,
+            final_reply_id: m.answered_by.clone(),
+            digest,
+            retirement,
+            redelivery,
+        })
     }
 
     /// Persists an attempt BEFORE the adapter runs. The selection is re-validated inside the same
@@ -1196,7 +1280,7 @@ impl Store {
                 },
                 now,
             )?;
-            receipts.push(Receipt { id, seq, idempotency_key: key, duplicate: false, warning: None });
+            receipts.push(Receipt { id, seq, idempotency_key: key, duplicate: false, warning: None, delivery: None });
         }
         tx.commit()?;
         Ok(receipts)

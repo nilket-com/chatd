@@ -333,6 +333,9 @@ fn print_receipt(r: &chatd::proto::Receipt, json: bool) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(out.as_bytes())?;
     stdout.flush()?;
+    if !json && let Some(delivery) = &r.delivery {
+        eprintln!("chatctl: delivery: {}", delivery.text);
+    }
     if let Some(w) = &r.warning {
         eprintln!("chatctl: warning: {w}");
     }
