@@ -16,3 +16,20 @@ Paired ADR: ../adr/0013_tab_indentation.md.
 4. Verify: `git diff -w` over pre-existing tracked Rust files is empty (supporting evidence of a
    mechanical change); the new test, `rustfmt.toml` and docs are inspected separately; Clippy with
    warnings denied and the full suite including the history check pass.
+
+## Implemented verification detail
+
+`tests/formatting.rs` invokes Cargo's supplied executable from `CARGO_MANIFEST_DIR`.
+It permits a directly printed skip only for Rustup's explicit missing `rustfmt` or
+`cargo-fmt` component diagnostic for the selected toolchain; other command failures
+retain stdout/stderr and fail. Five tests cover the repository, a misformatted
+isolated fixture (also proving check does not rewrite it), malformed formatter
+configuration, missing Cargo, and strict missing-component diagnostic recognition.
+
+Verification adjustment: `git diff -w` is not empty because rustfmt reflows two
+`params!` calls in `src/store.rs` and one `execute_batch` call in `tests/broker.rs`
+(the latter gains a trailing argument comma). No pre-existing Rust file was hand
+edited. Formatting an isolated clean archive of the plan commit after adding only
+`hard_tabs = true` reproduces all 22 pre-existing Rust files byte-for-byte. Retain
+that reproduction receipt alongside the reviewed three-hunk `git diff -w` output;
+this establishes the mechanical change despite Git's line-oriented comparison.

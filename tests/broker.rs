@@ -17,2934 +17,2936 @@ const CLI: &str = env!("CARGO_BIN_EXE_chatctl");
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Env {
-    dir: PathBuf,
-    daemon: Option<Child>,
+	dir: PathBuf,
+	daemon: Option<Child>,
 }
 
 impl Env {
-    fn new(config: &str) -> Env {
-        let dir = std::env::temp_dir().join(format!("chatd-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("run")).unwrap();
-        // Health has its own tests (tests/health.rs); here its notices would be extra inbox traffic and the
-        // check would read the real ~/.codex. Prepended, so the key stays top-level ahead of any table.
-        // Tests of delivery mechanics run unthrottled unless they set the push throttle themselves.
-        let throttle = if config.contains("push_") { "" } else { "push_min_interval_ms = 0\npush_inflight_ms = 0\n" };
-        std::fs::write(dir.join("config.toml"), format!("health_interval_ms = 0\n{throttle}{config}")).unwrap();
-        Env { dir, daemon: None }
-    }
+	fn new(config: &str) -> Env {
+		let dir = std::env::temp_dir().join(format!("chatd-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(dir.join("run")).unwrap();
+		// Health has its own tests (tests/health.rs); here its notices would be extra inbox traffic and the
+		// check would read the real ~/.codex. Prepended, so the key stays top-level ahead of any table.
+		// Tests of delivery mechanics run unthrottled unless they set the push throttle themselves.
+		let throttle = if config.contains("push_") { "" } else { "push_min_interval_ms = 0\npush_inflight_ms = 0\n" };
+		std::fs::write(dir.join("config.toml"), format!("health_interval_ms = 0\n{throttle}{config}")).unwrap();
+		Env { dir, daemon: None }
+	}
 
-    fn standard() -> Env {
-        Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\n")
-    }
+	fn standard() -> Env {
+		Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\n")
+	}
 
-    fn socket(&self) -> PathBuf {
-        self.dir.join("run").join("chatd.sock")
-    }
+	fn socket(&self) -> PathBuf {
+		self.dir.join("run").join("chatd.sock")
+	}
 
-    fn state(&self) -> PathBuf {
-        self.dir.join("state")
-    }
+	fn state(&self) -> PathBuf {
+		self.dir.join("state")
+	}
 
-    fn envs(&self, cmd: &mut Command) {
-        cmd.env("CHATD_STATE_DIR", self.state())
-            .env("CHATD_SOCKET", self.socket())
-            .env("CHATD_CONFIG", self.dir.join("config.toml"))
-            .env("CHATD_NO_JOURNAL", "1")
-            .env("CHATCTL_STATE_DIR", self.dir.join("ctl"))
-            .env_remove("CHATD_AS")
-            .env_remove("NOTIFY_SOCKET");
-    }
+	fn envs(&self, cmd: &mut Command) {
+		cmd.env("CHATD_STATE_DIR", self.state())
+			.env("CHATD_SOCKET", self.socket())
+			.env("CHATD_CONFIG", self.dir.join("config.toml"))
+			.env("CHATD_NO_JOURNAL", "1")
+			.env("CHATCTL_STATE_DIR", self.dir.join("ctl"))
+			.env_remove("CHATD_AS")
+			.env_remove("NOTIFY_SOCKET");
+	}
 
-    /// Starts the daemon and returns once it has sent READY=1 on a test notify socket.
-    fn start(&mut self) -> Duration {
-        self.try_start(false).expect("daemon became ready")
-    }
+	/// Starts the daemon and returns once it has sent READY=1 on a test notify socket.
+	fn start(&mut self) -> Duration {
+		self.try_start(false).expect("daemon became ready")
+	}
 
-    fn try_start(&mut self, abstract_socket: bool) -> Option<Duration> {
-        let path = self.dir.join(format!("notify-{}.sock", NEXT.fetch_add(1, Ordering::SeqCst)));
-        let (sock, target) = if abstract_socket {
-            use std::os::linux::net::SocketAddrExt;
-            let name = format!("chatd-test-{}", NEXT.fetch_add(1, Ordering::SeqCst));
-            let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
-            (UnixDatagram::bind_addr(&addr).unwrap(), format!("@{name}"))
-        } else {
-            (UnixDatagram::bind(&path).unwrap(), path.to_string_lossy().into_owned())
-        };
-        sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-        let mut cmd = Command::new(DAEMON);
-        self.envs(&mut cmd);
-        cmd.env("NOTIFY_SOCKET", &target).stdout(Stdio::null()).stderr(Stdio::piped());
-        let t0 = Instant::now();
-        self.daemon = Some(cmd.spawn().unwrap());
-        let mut buf = [0u8; 256];
-        while t0.elapsed() < Duration::from_secs(15) {
-            if let Ok(n) = sock.recv(&mut buf)
-                && String::from_utf8_lossy(&buf[..n]).contains("READY=1")
-            {
-                return Some(t0.elapsed());
-            }
-            if let Ok(Some(_)) = self.daemon.as_mut().unwrap().try_wait() {
-                return None;
-            }
-        }
-        None
-    }
+	fn try_start(&mut self, abstract_socket: bool) -> Option<Duration> {
+		let path = self.dir.join(format!("notify-{}.sock", NEXT.fetch_add(1, Ordering::SeqCst)));
+		let (sock, target) = if abstract_socket {
+			use std::os::linux::net::SocketAddrExt;
+			let name = format!("chatd-test-{}", NEXT.fetch_add(1, Ordering::SeqCst));
+			let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+			(UnixDatagram::bind_addr(&addr).unwrap(), format!("@{name}"))
+		} else {
+			(UnixDatagram::bind(&path).unwrap(), path.to_string_lossy().into_owned())
+		};
+		sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+		let mut cmd = Command::new(DAEMON);
+		self.envs(&mut cmd);
+		cmd.env("NOTIFY_SOCKET", &target).stdout(Stdio::null()).stderr(Stdio::piped());
+		let t0 = Instant::now();
+		self.daemon = Some(cmd.spawn().unwrap());
+		let mut buf = [0u8; 256];
+		while t0.elapsed() < Duration::from_secs(15) {
+			if let Ok(n) = sock.recv(&mut buf)
+				&& String::from_utf8_lossy(&buf[..n]).contains("READY=1")
+			{
+				return Some(t0.elapsed());
+			}
+			if let Ok(Some(_)) = self.daemon.as_mut().unwrap().try_wait() {
+				return None;
+			}
+		}
+		None
+	}
 
-    fn kill9(&mut self) {
-        if let Some(mut d) = self.daemon.take() {
-            let _ = d.kill();
-            let _ = d.wait();
-        }
-    }
+	fn kill9(&mut self) {
+		if let Some(mut d) = self.daemon.take() {
+			let _ = d.kill();
+			let _ = d.wait();
+		}
+	}
 
-    fn term(&mut self) -> std::process::ExitStatus {
-        let mut d = self.daemon.take().unwrap();
-        unsafe { libc::kill(d.id() as i32, libc::SIGTERM) };
-        d.wait().unwrap()
-    }
+	fn term(&mut self) -> std::process::ExitStatus {
+		let mut d = self.daemon.take().unwrap();
+		unsafe { libc::kill(d.id() as i32, libc::SIGTERM) };
+		d.wait().unwrap()
+	}
 
-    fn cli(&self, args: &[&str], stdin: Option<&str>) -> Output {
-        let mut cmd = Command::new(CLI);
-        self.envs(&mut cmd);
-        cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().unwrap();
-        if let Some(s) = stdin {
-            child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
-        } else {
-            drop(child.stdin.take());
-        }
-        child.wait_with_output().unwrap()
-    }
+	fn cli(&self, args: &[&str], stdin: Option<&str>) -> Output {
+		let mut cmd = Command::new(CLI);
+		self.envs(&mut cmd);
+		cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+		let mut child = cmd.spawn().unwrap();
+		if let Some(s) = stdin {
+			child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
+		} else {
+			drop(child.stdin.take());
+		}
+		child.wait_with_output().unwrap()
+	}
 
-    fn client(&self) -> Client {
-        Client::connect(&self.socket(), Some(Duration::from_secs(10))).unwrap()
-    }
+	fn client(&self) -> Client {
+		Client::connect(&self.socket(), Some(Duration::from_secs(10))).unwrap()
+	}
 
-    fn call(&self, req: Request) -> Response {
-        self.client().call(req).unwrap()
-    }
+	fn call(&self, req: Request) -> Response {
+		self.client().call(req).unwrap()
+	}
 
-    fn send(&self, from: &str, to: &str, conv: &str, kind: Kind, key: &str, body: &str) -> String {
-        match self.call(Request::Send(SendReq {
-            from: from.into(),
-            to: Some(to.into()),
-            conversation: Some(conv.into()),
-            kind,
-            reply_to: None,
-            idempotency_key: key.into(),
-            summary: None,
-            body: body.into(),
-        })) {
-            Response::Stored(r) => r.id,
-            other => panic!("send failed: {other:?}"),
-        }
-    }
+	fn send(&self, from: &str, to: &str, conv: &str, kind: Kind, key: &str, body: &str) -> String {
+		match self.call(Request::Send(SendReq {
+			from: from.into(),
+			to: Some(to.into()),
+			conversation: Some(conv.into()),
+			kind,
+			reply_to: None,
+			idempotency_key: key.into(),
+			summary: None,
+			body: body.into(),
+		})) {
+			Response::Stored(r) => r.id,
+			other => panic!("send failed: {other:?}"),
+		}
+	}
 
-    fn reply(&self, from: &str, to: &str, kind: Kind, key: &str) -> Response {
-        self.call(Request::Send(SendReq {
-            from: from.into(),
-            to: None,
-            conversation: None,
-            kind,
-            reply_to: Some(to.into()),
-            idempotency_key: key.into(),
-            summary: None,
-            body: format!("{} reply", kind.as_str()),
-        }))
-    }
+	fn reply(&self, from: &str, to: &str, kind: Kind, key: &str) -> Response {
+		self.call(Request::Send(SendReq {
+			from: from.into(),
+			to: None,
+			conversation: None,
+			kind,
+			reply_to: Some(to.into()),
+			idempotency_key: key.into(),
+			summary: None,
+			body: format!("{} reply", kind.as_str()),
+		}))
+	}
 
-    fn status(&self, who: Option<&str>) -> chatd::proto::StatusView {
-        match self.call(Request::Status {
-            as_: who.map(str::to_string),
-            conversation: None,
-            limit: 200,
-            unacknowledged_after: None,
-            unanswered_after: None,
-        }) {
-            Response::Status(s) => s,
-            other => panic!("{other:?}"),
-        }
-    }
+	fn status(&self, who: Option<&str>) -> chatd::proto::StatusView {
+		match self.call(Request::Status {
+			as_: who.map(str::to_string),
+			conversation: None,
+			limit: 200,
+			unacknowledged_after: None,
+			unanswered_after: None,
+		}) {
+			Response::Status(s) => s,
+			other => panic!("{other:?}"),
+		}
+	}
 }
 
 impl Drop for Env {
-    fn drop(&mut self) {
-        self.kill9();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
+	fn drop(&mut self) {
+		self.kill9();
+		let _ = std::fs::remove_dir_all(&self.dir);
+	}
 }
 
 fn stdout(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout).into_owned()
+	String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
 fn code(o: &Output) -> i32 {
-    o.status.code().unwrap_or(-1)
+	o.status.code().unwrap_or(-1)
 }
 
 // ---------------------------------------------------------------- readiness and startup
 
 #[test]
 fn readiness_is_sent_only_with_a_serving_socket_and_health() {
-    let mut e = Env::standard();
-    e.start();
-    match e.call(Request::Health) {
-        Response::Health { schema_version, head_seq, .. } => {
-            assert_eq!(schema_version, 2);
-            assert!(head_seq >= 0);
-        }
-        other => panic!("{other:?}"),
-    }
-    let mode = std::fs::metadata(e.socket()).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600);
-    let mode = std::fs::metadata(e.state()).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o700);
+	let mut e = Env::standard();
+	e.start();
+	match e.call(Request::Health) {
+		Response::Health { schema_version, head_seq, .. } => {
+			assert_eq!(schema_version, 2);
+			assert!(head_seq >= 0);
+		}
+		other => panic!("{other:?}"),
+	}
+	let mode = std::fs::metadata(e.socket()).unwrap().permissions().mode() & 0o777;
+	assert_eq!(mode, 0o600);
+	let mode = std::fs::metadata(e.state()).unwrap().permissions().mode() & 0o777;
+	assert_eq!(mode, 0o700);
 }
 
 #[test]
 fn readiness_over_an_abstract_notify_socket() {
-    let mut e = Env::standard();
-    assert!(e.try_start(true).is_some());
-    assert!(matches!(e.call(Request::Health), Response::Health { .. }));
+	let mut e = Env::standard();
+	assert!(e.try_start(true).is_some());
+	assert!(matches!(e.call(Request::Health), Response::Health { .. }));
 }
 
 #[test]
 fn an_unwritable_state_never_advertises_readiness() {
-    let mut e = Env::standard();
-    std::fs::write(e.state(), b"a file where the state directory should be").unwrap();
-    assert!(e.try_start(false).is_none(), "readiness must not be sent");
-    let status = e.daemon.as_mut().unwrap().wait().unwrap();
-    assert!(!status.success());
+	let mut e = Env::standard();
+	std::fs::write(e.state(), b"a file where the state directory should be").unwrap();
+	assert!(e.try_start(false).is_none(), "readiness must not be sent");
+	let status = e.daemon.as_mut().unwrap().wait().unwrap();
+	assert!(!status.success());
 }
 
 #[test]
 fn a_newer_schema_refuses_startup_and_preserves_the_database() {
-    let mut e = Env::standard();
-    e.start();
-    e.send("claude", "codex", "c", Kind::Info, "k1", "kept");
-    e.kill9();
-    let db = e.state().join("chat.db");
-    {
-        let c = rusqlite::Connection::open(&db).unwrap();
-        c.execute("UPDATE meta SET value = '99' WHERE key = 'schema_version'", []).unwrap();
-        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    }
-    let before = std::fs::read(&db).unwrap();
-    assert!(e.try_start(false).is_none());
-    assert!(!e.daemon.as_mut().unwrap().wait().unwrap().success());
-    assert_eq!(std::fs::read(&db).unwrap(), before, "a refused migration leaves the database untouched");
+	let mut e = Env::standard();
+	e.start();
+	e.send("claude", "codex", "c", Kind::Info, "k1", "kept");
+	e.kill9();
+	let db = e.state().join("chat.db");
+	{
+		let c = rusqlite::Connection::open(&db).unwrap();
+		c.execute("UPDATE meta SET value = '99' WHERE key = 'schema_version'", []).unwrap();
+		c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+	}
+	let before = std::fs::read(&db).unwrap();
+	assert!(e.try_start(false).is_none());
+	assert!(!e.daemon.as_mut().unwrap().wait().unwrap().success());
+	assert_eq!(std::fs::read(&db).unwrap(), before, "a refused migration leaves the database untouched");
 }
 
 #[test]
 fn a_second_daemon_refuses_a_served_socket() {
-    let mut e = Env::standard();
-    e.start();
-    let mut cmd = Command::new(DAEMON);
-    e.envs(&mut cmd);
-    let out = cmd.stderr(Stdio::piped()).output().unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("another daemon"));
+	let mut e = Env::standard();
+	e.start();
+	let mut cmd = Command::new(DAEMON);
+	e.envs(&mut cmd);
+	let out = cmd.stderr(Stdio::piped()).output().unwrap();
+	assert!(!out.status.success());
+	assert!(String::from_utf8_lossy(&out.stderr).contains("another daemon"));
 }
 
 #[test]
 fn the_cli_fails_fast_when_the_daemon_is_down_and_creates_nothing() {
-    let e = Env::standard();
-    let t0 = Instant::now();
-    let out = e.cli(&["status"], None);
-    assert_eq!(code(&out), 3);
-    assert!(t0.elapsed() < Duration::from_secs(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("systemctl --user status chatd"));
-    assert!(!e.state().exists() && !e.socket().exists(), "no second inbox or socket is created");
-    let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "k"], Some("x"));
-    assert_eq!(code(&out), 3);
+	let e = Env::standard();
+	let t0 = Instant::now();
+	let out = e.cli(&["status"], None);
+	assert_eq!(code(&out), 3);
+	assert!(t0.elapsed() < Duration::from_secs(2));
+	assert!(String::from_utf8_lossy(&out.stderr).contains("systemctl --user status chatd"));
+	assert!(!e.state().exists() && !e.socket().exists(), "no second inbox or socket is created");
+	let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "k"], Some("x"));
+	assert_eq!(code(&out), 3);
 }
 
 // ---------------------------------------------------------------- messages, keys, replies
 
 #[test]
 fn send_receive_ack_and_status() {
-    let mut e = Env::standard();
-    e.start();
-    let key = stdout(&e.cli(&["new-key"], None)).trim().to_string();
-    let out = e.cli(
-        &["--json", "send", "--as", "claude", "--to", "codex", "--conversation", "adr628", "--idempotency-key", &key],
-        Some("Please review\nthe details"),
-    );
-    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
-    let receipt: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-    let id = receipt["id"].as_str().unwrap().to_string();
-    let m = stdout(&e.cli(&["--json", "receive", "--as", "codex", "--id", &id], None));
-    let m: serde_json::Value = serde_json::from_str(&m).unwrap();
-    assert_eq!(m["body"], "Please review\nthe details");
-    assert_eq!(m["summary"], "Please review");
-    assert!(m["received_at_ms"].is_null(), "receive does not acknowledge");
-    let s = e.status(Some("codex"));
-    assert_eq!(s.unacknowledged.len(), 1);
-    assert_eq!(s.unanswered.len(), 1);
-    assert_eq!(code(&e.cli(&["ack", "--as", "codex", &id], None)), 0);
-    let s = e.status(Some("codex"));
-    assert!(s.unacknowledged.is_empty());
-    assert_eq!(s.unanswered.len(), 1, "acknowledgement is not an answer");
-    assert!(s.unanswered[0].received);
-    // Only the recipient acknowledges.
-    assert_eq!(code(&e.cli(&["ack", "--as", "claude", &id], None)), 5);
+	let mut e = Env::standard();
+	e.start();
+	let key = stdout(&e.cli(&["new-key"], None)).trim().to_string();
+	let out = e.cli(
+		&["--json", "send", "--as", "claude", "--to", "codex", "--conversation", "adr628", "--idempotency-key", &key],
+		Some("Please review\nthe details"),
+	);
+	assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+	let receipt: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	let id = receipt["id"].as_str().unwrap().to_string();
+	let m = stdout(&e.cli(&["--json", "receive", "--as", "codex", "--id", &id], None));
+	let m: serde_json::Value = serde_json::from_str(&m).unwrap();
+	assert_eq!(m["body"], "Please review\nthe details");
+	assert_eq!(m["summary"], "Please review");
+	assert!(m["received_at_ms"].is_null(), "receive does not acknowledge");
+	let s = e.status(Some("codex"));
+	assert_eq!(s.unacknowledged.len(), 1);
+	assert_eq!(s.unanswered.len(), 1);
+	assert_eq!(code(&e.cli(&["ack", "--as", "codex", &id], None)), 0);
+	let s = e.status(Some("codex"));
+	assert!(s.unacknowledged.is_empty());
+	assert_eq!(s.unanswered.len(), 1, "acknowledgement is not an answer");
+	assert!(s.unanswered[0].received);
+	// Only the recipient acknowledges.
+	assert_eq!(code(&e.cli(&["ack", "--as", "claude", &id], None)), 5);
 }
 
 #[test]
 fn identical_retries_return_the_original_and_conflicts_refuse() {
-    let mut e = Env::standard();
-    e.start();
-    let a = e.send("claude", "codex", "c", Kind::Request, "key-1", "same");
-    let b = e.send("claude", "codex", "c", Kind::Request, "key-1", "same");
-    assert_eq!(a, b);
-    let r = e.call(Request::Send(SendReq {
-        from: "claude".into(),
-        to: Some("codex".into()),
-        conversation: Some("c".into()),
-        kind: Kind::Request,
-        reply_to: None,
-        idempotency_key: "key-1".into(),
-        summary: None,
-        body: "different".into(),
-    }));
-    assert!(matches!(r, Response::Error { code: ErrorCode::Conflict, .. }), "{r:?}");
-    match e.call(Request::Lookup { sender: "claude".into(), idempotency_key: "key-1".into() }) {
-        Response::Found(r) => assert_eq!(r.id, a),
-        other => panic!("{other:?}"),
-    }
-    // Distinct keys keep intentionally identical messages distinct.
-    let c = e.send("claude", "codex", "c", Kind::Request, "key-2", "same");
-    assert_ne!(a, c);
-    // The same key under another sender is independent.
-    let d = e.send("codex", "claude", "c", Kind::Request, "key-1", "same");
-    assert_ne!(a, d);
+	let mut e = Env::standard();
+	e.start();
+	let a = e.send("claude", "codex", "c", Kind::Request, "key-1", "same");
+	let b = e.send("claude", "codex", "c", Kind::Request, "key-1", "same");
+	assert_eq!(a, b);
+	let r = e.call(Request::Send(SendReq {
+		from: "claude".into(),
+		to: Some("codex".into()),
+		conversation: Some("c".into()),
+		kind: Kind::Request,
+		reply_to: None,
+		idempotency_key: "key-1".into(),
+		summary: None,
+		body: "different".into(),
+	}));
+	assert!(matches!(r, Response::Error { code: ErrorCode::Conflict, .. }), "{r:?}");
+	match e.call(Request::Lookup { sender: "claude".into(), idempotency_key: "key-1".into() }) {
+		Response::Found(r) => assert_eq!(r.id, a),
+		other => panic!("{other:?}"),
+	}
+	// Distinct keys keep intentionally identical messages distinct.
+	let c = e.send("claude", "codex", "c", Kind::Request, "key-2", "same");
+	assert_ne!(a, c);
+	// The same key under another sender is independent.
+	let d = e.send("codex", "claude", "c", Kind::Request, "key-1", "same");
+	assert_ne!(a, d);
 }
 
 #[test]
 fn replies_are_validated_and_only_a_final_reply_answers() {
-    let mut e = Env::standard();
-    e.start();
-    let req = e.send("claude", "codex", "adr628", Kind::Request, "r1", "question");
-    let info = e.send("claude", "codex", "adr628", Kind::Info, "i1", "fyi");
-    // The requester cannot reply to its own request; info cannot be replied to.
-    assert!(matches!(e.reply("claude", &req, Kind::Final, "x1"), Response::Error { code: ErrorCode::InvalidReply, .. }));
-    assert!(matches!(e.reply("codex", &info, Kind::Final, "x2"), Response::Error { code: ErrorCode::InvalidReply, .. }));
-    assert!(matches!(
-        e.reply("codex", "01990000-0000-7000-8000-000000000000", Kind::Final, "x3"),
-        Response::Error { code: ErrorCode::InvalidReply, .. }
-    ));
-    let wrong_conv = e.call(Request::Send(SendReq {
-        from: "codex".into(),
-        to: None,
-        conversation: Some("other".into()),
-        kind: Kind::Final,
-        reply_to: Some(req.clone()),
-        idempotency_key: "x4".into(),
-        summary: None,
-        body: "b".into(),
-    }));
-    assert!(matches!(wrong_conv, Response::Error { code: ErrorCode::InvalidReply, .. }));
-    // Progress acknowledges receipt but leaves the request unanswered.
-    assert!(matches!(e.reply("codex", &req, Kind::Progress, "p1"), Response::Stored(_)));
-    let s = e.status(Some("claude"));
-    assert!(s.unanswered.iter().any(|l| l.id == req && l.received && l.answered_by.is_none()));
-    let Response::Stored(fin) = e.reply("codex", &req, Kind::Final, "f1") else { panic!() };
-    let s = e.status(Some("claude"));
-    assert!(!s.unanswered.iter().any(|l| l.id == req));
-    let Response::Message(m) = e.call(Request::Receive { as_: "claude".into(), id: fin.id.clone() }) else { panic!() };
-    assert_eq!((m.sender.as_str(), m.recipient.as_str(), m.conversation.as_str()), ("codex", "claude", "adr628"));
-    let Response::Message(orig) = e.call(Request::Receive { as_: "claude".into(), id: req.clone() }) else { panic!() };
-    assert_eq!(orig.answered_by.as_deref(), Some(fin.id.as_str()));
-    // Information never appears as unanswered.
-    assert!(!s.unanswered.iter().any(|l| l.id == info));
+	let mut e = Env::standard();
+	e.start();
+	let req = e.send("claude", "codex", "adr628", Kind::Request, "r1", "question");
+	let info = e.send("claude", "codex", "adr628", Kind::Info, "i1", "fyi");
+	// The requester cannot reply to its own request; info cannot be replied to.
+	assert!(matches!(e.reply("claude", &req, Kind::Final, "x1"), Response::Error { code: ErrorCode::InvalidReply, .. }));
+	assert!(matches!(e.reply("codex", &info, Kind::Final, "x2"), Response::Error { code: ErrorCode::InvalidReply, .. }));
+	assert!(matches!(
+		e.reply("codex", "01990000-0000-7000-8000-000000000000", Kind::Final, "x3"),
+		Response::Error { code: ErrorCode::InvalidReply, .. }
+	));
+	let wrong_conv = e.call(Request::Send(SendReq {
+		from: "codex".into(),
+		to: None,
+		conversation: Some("other".into()),
+		kind: Kind::Final,
+		reply_to: Some(req.clone()),
+		idempotency_key: "x4".into(),
+		summary: None,
+		body: "b".into(),
+	}));
+	assert!(matches!(wrong_conv, Response::Error { code: ErrorCode::InvalidReply, .. }));
+	// Progress acknowledges receipt but leaves the request unanswered.
+	assert!(matches!(e.reply("codex", &req, Kind::Progress, "p1"), Response::Stored(_)));
+	let s = e.status(Some("claude"));
+	assert!(s.unanswered.iter().any(|l| l.id == req && l.received && l.answered_by.is_none()));
+	let Response::Stored(fin) = e.reply("codex", &req, Kind::Final, "f1") else { panic!() };
+	let s = e.status(Some("claude"));
+	assert!(!s.unanswered.iter().any(|l| l.id == req));
+	let Response::Message(m) = e.call(Request::Receive { as_: "claude".into(), id: fin.id.clone() }) else { panic!() };
+	assert_eq!((m.sender.as_str(), m.recipient.as_str(), m.conversation.as_str()), ("codex", "claude", "adr628"));
+	let Response::Message(orig) = e.call(Request::Receive { as_: "claude".into(), id: req.clone() }) else { panic!() };
+	assert_eq!(orig.answered_by.as_deref(), Some(fin.id.as_str()));
+	// Information never appears as unanswered.
+	assert!(!s.unanswered.iter().any(|l| l.id == info));
 }
 
 #[test]
 fn unknown_participants_and_bad_input_are_refused() {
-    let mut e = Env::standard();
-    e.start();
-    let r = e.call(Request::Send(SendReq {
-        from: "mallory".into(),
-        to: Some("codex".into()),
-        conversation: Some("c".into()),
-        kind: Kind::Request,
-        reply_to: None,
-        idempotency_key: "k".into(),
-        summary: None,
-        body: "b".into(),
-    }));
-    assert!(matches!(r, Response::Error { code: ErrorCode::UnknownParticipant, .. }));
-    let r = e.call(Request::Send(SendReq {
-        from: "claude".into(),
-        to: Some("codex".into()),
-        conversation: Some("c".into()),
-        kind: Kind::Request,
-        reply_to: None,
-        idempotency_key: "has space".into(),
-        summary: None,
-        body: "b".into(),
-    }));
-    assert!(matches!(r, Response::Error { code: ErrorCode::BadRequest, .. }));
+	let mut e = Env::standard();
+	e.start();
+	let r = e.call(Request::Send(SendReq {
+		from: "mallory".into(),
+		to: Some("codex".into()),
+		conversation: Some("c".into()),
+		kind: Kind::Request,
+		reply_to: None,
+		idempotency_key: "k".into(),
+		summary: None,
+		body: "b".into(),
+	}));
+	assert!(matches!(r, Response::Error { code: ErrorCode::UnknownParticipant, .. }));
+	let r = e.call(Request::Send(SendReq {
+		from: "claude".into(),
+		to: Some("codex".into()),
+		conversation: Some("c".into()),
+		kind: Kind::Request,
+		reply_to: None,
+		idempotency_key: "has space".into(),
+		summary: None,
+		body: "b".into(),
+	}));
+	assert!(matches!(r, Response::Error { code: ErrorCode::BadRequest, .. }));
 }
 
 #[test]
 fn oversized_bodies_and_frames_are_refused_and_the_daemon_survives() {
-    let mut e = Env::standard();
-    e.start();
-    let big = "x".repeat(chatd::proto::MAX_BODY + 1);
-    let r = e.call(Request::Send(SendReq {
-        from: "claude".into(),
-        to: Some("codex".into()),
-        conversation: Some("c".into()),
-        kind: Kind::Request,
-        reply_to: None,
-        idempotency_key: "big".into(),
-        summary: None,
-        body: big,
-    }));
-    assert!(matches!(r, Response::Error { code: ErrorCode::TooLarge, .. }), "{r:?}");
-    // A declared 4 GiB frame is refused from its length prefix alone.
-    let mut raw = UnixStream::connect(e.socket()).unwrap();
-    raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    raw.write_all(&u32::MAX.to_be_bytes()).unwrap();
-    let mut reply = Vec::new();
-    let _ = raw.read_to_end(&mut reply);
-    assert!(String::from_utf8_lossy(&reply).contains("exceeds"), "{:?}", String::from_utf8_lossy(&reply));
-    // Garbage JSON is refused too.
-    let mut raw = UnixStream::connect(e.socket()).unwrap();
-    raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    raw.write_all(&5u32.to_be_bytes()).unwrap();
-    raw.write_all(b"nope!").unwrap();
-    let mut reply = Vec::new();
-    let _ = raw.read_to_end(&mut reply);
-    assert!(String::from_utf8_lossy(&reply).contains("bad_request"));
-    assert!(matches!(e.call(Request::Health), Response::Health { .. }));
+	let mut e = Env::standard();
+	e.start();
+	let big = "x".repeat(chatd::proto::MAX_BODY + 1);
+	let r = e.call(Request::Send(SendReq {
+		from: "claude".into(),
+		to: Some("codex".into()),
+		conversation: Some("c".into()),
+		kind: Kind::Request,
+		reply_to: None,
+		idempotency_key: "big".into(),
+		summary: None,
+		body: big,
+	}));
+	assert!(matches!(r, Response::Error { code: ErrorCode::TooLarge, .. }), "{r:?}");
+	// A declared 4 GiB frame is refused from its length prefix alone.
+	let mut raw = UnixStream::connect(e.socket()).unwrap();
+	raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+	raw.write_all(&u32::MAX.to_be_bytes()).unwrap();
+	let mut reply = Vec::new();
+	let _ = raw.read_to_end(&mut reply);
+	assert!(String::from_utf8_lossy(&reply).contains("exceeds"), "{:?}", String::from_utf8_lossy(&reply));
+	// Garbage JSON is refused too.
+	let mut raw = UnixStream::connect(e.socket()).unwrap();
+	raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+	raw.write_all(&5u32.to_be_bytes()).unwrap();
+	raw.write_all(b"nope!").unwrap();
+	let mut reply = Vec::new();
+	let _ = raw.read_to_end(&mut reply);
+	assert!(String::from_utf8_lossy(&reply).contains("bad_request"));
+	assert!(matches!(e.call(Request::Health), Response::Health { .. }));
 }
 
 #[test]
 fn a_protocol_version_mismatch_is_refused() {
-    let mut e = Env::standard();
-    e.start();
-    let mut raw = UnixStream::connect(e.socket()).unwrap();
-    raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let frame = serde_json::to_vec(&serde_json::json!({"v": 999, "req": {"op": "health"}})).unwrap();
-    raw.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
-    raw.write_all(&frame).unwrap();
-    let mut reply = Vec::new();
-    let _ = raw.read_to_end(&mut reply);
-    assert!(String::from_utf8_lossy(&reply).contains("version_mismatch"));
+	let mut e = Env::standard();
+	e.start();
+	let mut raw = UnixStream::connect(e.socket()).unwrap();
+	raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+	let frame = serde_json::to_vec(&serde_json::json!({"v": 999, "req": {"op": "health"}})).unwrap();
+	raw.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
+	raw.write_all(&frame).unwrap();
+	let mut reply = Vec::new();
+	let _ = raw.read_to_end(&mut reply);
+	assert!(String::from_utf8_lossy(&reply).contains("version_mismatch"));
 }
 
 #[test]
 fn concurrent_senders_get_distinct_ordered_receipts() {
-    let mut e = Env::standard();
-    e.start();
-    let socket = e.socket();
-    let handles: Vec<_> = (0..8)
-        .map(|t| {
-            let socket = socket.clone();
-            std::thread::spawn(move || {
-                let mut ids = Vec::new();
-                for i in 0..25 {
-                    let mut c = Client::connect(&socket, Some(Duration::from_secs(10))).unwrap();
-                    let r = c
-                        .call(Request::Send(SendReq {
-                            from: "claude".into(),
-                            to: Some("codex".into()),
-                            conversation: Some("load".into()),
-                            kind: Kind::Info,
-                            reply_to: None,
-                            idempotency_key: format!("t{t}-{i}"),
-                            summary: None,
-                            body: format!("{t}/{i}"),
-                        }))
-                        .unwrap();
-                    let Response::Stored(r) = r else { panic!("{r:?}") };
-                    ids.push((r.seq, r.id));
-                }
-                ids
-            })
-        })
-        .collect();
-    let mut all: Vec<(i64, String)> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
-    all.sort();
-    let seqs: std::collections::BTreeSet<i64> = all.iter().map(|x| x.0).collect();
-    let ids: std::collections::BTreeSet<&String> = all.iter().map(|x| &x.1).collect();
-    assert_eq!((seqs.len(), ids.len()), (200, 200));
+	let mut e = Env::standard();
+	e.start();
+	let socket = e.socket();
+	let handles: Vec<_> = (0..8)
+		.map(|t| {
+			let socket = socket.clone();
+			std::thread::spawn(move || {
+				let mut ids = Vec::new();
+				for i in 0..25 {
+					let mut c = Client::connect(&socket, Some(Duration::from_secs(10))).unwrap();
+					let r = c
+						.call(Request::Send(SendReq {
+							from: "claude".into(),
+							to: Some("codex".into()),
+							conversation: Some("load".into()),
+							kind: Kind::Info,
+							reply_to: None,
+							idempotency_key: format!("t{t}-{i}"),
+							summary: None,
+							body: format!("{t}/{i}"),
+						}))
+						.unwrap();
+					let Response::Stored(r) = r else { panic!("{r:?}") };
+					ids.push((r.seq, r.id));
+				}
+				ids
+			})
+		})
+		.collect();
+	let mut all: Vec<(i64, String)> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+	all.sort();
+	let seqs: std::collections::BTreeSet<i64> = all.iter().map(|x| x.0).collect();
+	let ids: std::collections::BTreeSet<&String> = all.iter().map(|x| &x.1).collect();
+	assert_eq!((seqs.len(), ids.len()), (200, 200));
 }
 
 // ---------------------------------------------------------------- acknowledgement and replay
 
 #[test]
 fn acknowledgement_holes_are_kept() {
-    let mut e = Env::standard();
-    e.start();
-    let a = e.send("codex", "claude", "c", Kind::Info, "a", "first");
-    let b = e.send("codex", "claude", "c", Kind::Info, "b", "second");
-    let c = e.send("codex", "claude", "c", Kind::Info, "c", "third");
-    assert_eq!(code(&e.cli(&["ack", "--as", "claude", &c], None)), 0);
-    let s = e.status(Some("claude"));
-    let ids: Vec<&str> = s.unacknowledged.iter().map(|l| l.id.as_str()).collect();
-    assert_eq!(ids, vec![a.as_str(), b.as_str()]);
-    let out = e.cli(&["wait", "--as", "claude", "--timeout", "5"], None);
-    assert_eq!(code(&out), 0);
-    assert!(stdout(&out).contains(&a), "the oldest hole is replayed first: {}", stdout(&out));
+	let mut e = Env::standard();
+	e.start();
+	let a = e.send("codex", "claude", "c", Kind::Info, "a", "first");
+	let b = e.send("codex", "claude", "c", Kind::Info, "b", "second");
+	let c = e.send("codex", "claude", "c", Kind::Info, "c", "third");
+	assert_eq!(code(&e.cli(&["ack", "--as", "claude", &c], None)), 0);
+	let s = e.status(Some("claude"));
+	let ids: Vec<&str> = s.unacknowledged.iter().map(|l| l.id.as_str()).collect();
+	assert_eq!(ids, vec![a.as_str(), b.as_str()]);
+	let out = e.cli(&["wait", "--as", "claude", "--timeout", "5"], None);
+	assert_eq!(code(&out), 0);
+	assert!(stdout(&out).contains(&a), "the oldest hole is replayed first: {}", stdout(&out));
 }
 
 #[test]
 fn a_message_sent_while_no_waiter_exists_is_delivered_on_the_next_wait() {
-    let mut e = Env::standard();
-    e.start();
-    let id = e.send("codex", "claude", "adr628", Kind::Request, "gap", "arrived during the monitor gap");
-    let t0 = Instant::now();
-    let out = e.cli(&["wait", "--as", "claude", "--timeout", "30"], None);
-    assert_eq!(code(&out), 0);
-    assert!(t0.elapsed() < Duration::from_secs(3));
-    let line = stdout(&out);
-    assert!(line.contains(&id) && line.contains(&format!("chatctl receive --as claude --id {id}")), "{line}");
-    assert_eq!(line.lines().count(), 1);
+	let mut e = Env::standard();
+	e.start();
+	let id = e.send("codex", "claude", "adr628", Kind::Request, "gap", "arrived during the monitor gap");
+	let t0 = Instant::now();
+	let out = e.cli(&["wait", "--as", "claude", "--timeout", "30"], None);
+	assert_eq!(code(&out), 0);
+	assert!(t0.elapsed() < Duration::from_secs(3));
+	let line = stdout(&out);
+	assert!(line.contains(&id) && line.contains(&format!("chatctl receive --as claude --id {id}")), "{line}");
+	assert_eq!(line.lines().count(), 1);
 }
 
 #[test]
 fn a_printed_but_unacknowledged_message_is_replayed() {
-    let mut e = Env::standard();
-    e.start();
-    let id = e.send("codex", "claude", "c", Kind::Request, "p", "printed once");
-    let first = stdout(&e.cli(&["wait", "--as", "claude", "--timeout", "5"], None));
-    let second = stdout(&e.cli(&["wait", "--as", "claude", "--timeout", "5"], None));
-    assert!(first.contains(&id) && second.contains(&id));
-    e.cli(&["ack", "--as", "claude", &id], None);
-    let third = e.cli(&["wait", "--as", "claude", "--timeout", "1"], None);
-    assert_eq!(code(&third), 6, "nothing left after the ack: {}", stdout(&third));
+	let mut e = Env::standard();
+	e.start();
+	let id = e.send("codex", "claude", "c", Kind::Request, "p", "printed once");
+	let first = stdout(&e.cli(&["wait", "--as", "claude", "--timeout", "5"], None));
+	let second = stdout(&e.cli(&["wait", "--as", "claude", "--timeout", "5"], None));
+	assert!(first.contains(&id) && second.contains(&id));
+	e.cli(&["ack", "--as", "claude", &id], None);
+	let third = e.cli(&["wait", "--as", "claude", "--timeout", "1"], None);
+	assert_eq!(code(&third), 6, "nothing left after the ack: {}", stdout(&third));
 }
 
 #[test]
 fn a_blocked_wait_is_woken_by_a_push() {
-    let mut e = Env::standard();
-    e.start();
-    let mut cmd = Command::new(CLI);
-    e.envs(&mut cmd);
-    let waiter = cmd.args(["wait", "--as", "claude", "--timeout", "30"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    std::thread::sleep(Duration::from_millis(500));
-    let t0 = Instant::now();
-    let id = e.send("codex", "claude", "c", Kind::Request, "push", "wake up");
-    let out = waiter.wait_with_output().unwrap();
-    assert_eq!(code(&out), 0);
-    assert!(stdout(&out).contains(&id));
-    assert!(t0.elapsed() < Duration::from_secs(2), "pushed, not polled: {:?}", t0.elapsed());
+	let mut e = Env::standard();
+	e.start();
+	let mut cmd = Command::new(CLI);
+	e.envs(&mut cmd);
+	let waiter = cmd.args(["wait", "--as", "claude", "--timeout", "30"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+	std::thread::sleep(Duration::from_millis(500));
+	let t0 = Instant::now();
+	let id = e.send("codex", "claude", "c", Kind::Request, "push", "wake up");
+	let out = waiter.wait_with_output().unwrap();
+	assert_eq!(code(&out), 0);
+	assert!(stdout(&out).contains(&id));
+	assert!(t0.elapsed() < Duration::from_secs(2), "pushed, not polled: {:?}", t0.elapsed());
 }
 
 #[test]
 fn no_arrival_is_lost_between_the_inbox_check_and_the_subscription() {
-    let mut e = Env::standard();
-    e.start();
-    for i in 0..25 {
-        let mut cmd = Command::new(CLI);
-        e.envs(&mut cmd);
-        let waiter = cmd.args(["wait", "--as", "claude", "--timeout", "10"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
-        let id = e.send("codex", "claude", "race", Kind::Info, &format!("race-{i}"), "racing");
-        let out = waiter.wait_with_output().unwrap();
-        assert_eq!(code(&out), 0, "iteration {i}");
-        assert!(stdout(&out).contains(&id), "iteration {i}: {}", stdout(&out));
-        e.call(Request::Ack { as_: "claude".into(), ids: vec![id] });
-    }
+	let mut e = Env::standard();
+	e.start();
+	for i in 0..25 {
+		let mut cmd = Command::new(CLI);
+		e.envs(&mut cmd);
+		let waiter = cmd.args(["wait", "--as", "claude", "--timeout", "10"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+		let id = e.send("codex", "claude", "race", Kind::Info, &format!("race-{i}"), "racing");
+		let out = waiter.wait_with_output().unwrap();
+		assert_eq!(code(&out), 0, "iteration {i}");
+		assert!(stdout(&out).contains(&id), "iteration {i}: {}", stdout(&out));
+		e.call(Request::Ack { as_: "claude".into(), ids: vec![id] });
+	}
 }
 
 #[test]
 fn follow_emits_each_id_once_per_connection_and_replays_after_reconnect() {
-    let mut e = Env::standard();
-    e.start();
-    let mut cmd = Command::new(CLI);
-    e.envs(&mut cmd);
-    let follower =
-        cmd.args(["wait", "--as", "claude", "--follow", "--timeout", "3"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
-    std::thread::sleep(Duration::from_millis(400));
-    let ids: Vec<String> =
-        (0..5).map(|i| e.send("codex", "claude", "burst", Kind::Info, &format!("b{i}"), &format!("burst {i}"))).collect();
-    let out = follower.wait_with_output().unwrap();
-    assert_eq!(code(&out), 6, "follow ends at its timeout");
-    let lines: Vec<String> = stdout(&out).lines().map(str::to_string).collect();
-    assert_eq!(lines.len(), 5, "{lines:?}");
-    for id in &ids {
-        assert_eq!(lines.iter().filter(|l| l.contains(id.as_str())).count(), 1);
-    }
-    let again = stdout(&e.cli(&["wait", "--as", "claude", "--follow", "--timeout", "1"], None));
-    assert_eq!(again.lines().count(), 5, "a new connection replays all unacknowledged");
-    for l in again.lines() {
-        assert!(l.len() <= chatd::text::MAX_NOTIFICATION_BYTES);
-    }
+	let mut e = Env::standard();
+	e.start();
+	let mut cmd = Command::new(CLI);
+	e.envs(&mut cmd);
+	let follower =
+		cmd.args(["wait", "--as", "claude", "--follow", "--timeout", "3"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+	std::thread::sleep(Duration::from_millis(400));
+	let ids: Vec<String> =
+		(0..5).map(|i| e.send("codex", "claude", "burst", Kind::Info, &format!("b{i}"), &format!("burst {i}"))).collect();
+	let out = follower.wait_with_output().unwrap();
+	assert_eq!(code(&out), 6, "follow ends at its timeout");
+	let lines: Vec<String> = stdout(&out).lines().map(str::to_string).collect();
+	assert_eq!(lines.len(), 5, "{lines:?}");
+	for id in &ids {
+		assert_eq!(lines.iter().filter(|l| l.contains(id.as_str())).count(), 1);
+	}
+	let again = stdout(&e.cli(&["wait", "--as", "claude", "--follow", "--timeout", "1"], None));
+	assert_eq!(again.lines().count(), 5, "a new connection replays all unacknowledged");
+	for l in again.lines() {
+		assert!(l.len() <= chatd::text::MAX_NOTIFICATION_BYTES);
+	}
 }
 
 #[test]
 fn notifications_neutralise_control_characters_and_stay_bounded() {
-    let mut e = Env::standard();
-    e.start();
-    let nasty = format!("\x1b[2J\x1b]0;title\x07{}\nsecond line", "長".repeat(400));
-    let id = e.send("codex", "claude", "c", Kind::Request, "nasty", &nasty);
-    let line = stdout(&e.cli(&["wait", "--as", "claude", "--timeout", "5"], None));
-    let line = line.trim_end_matches('\n');
-    assert!(!line.chars().any(|c| c.is_control()), "{line:?}");
-    assert!(line.len() <= chatd::text::MAX_NOTIFICATION_BYTES);
-    assert!(line.ends_with(&format!("chatctl receive --as claude --id {id}")));
+	let mut e = Env::standard();
+	e.start();
+	let nasty = format!("\x1b[2J\x1b]0;title\x07{}\nsecond line", "長".repeat(400));
+	let id = e.send("codex", "claude", "c", Kind::Request, "nasty", &nasty);
+	let line = stdout(&e.cli(&["wait", "--as", "claude", "--timeout", "5"], None));
+	let line = line.trim_end_matches('\n');
+	assert!(!line.chars().any(|c| c.is_control()), "{line:?}");
+	assert!(line.len() <= chatd::text::MAX_NOTIFICATION_BYTES);
+	assert!(line.ends_with(&format!("chatctl receive --as claude --id {id}")));
 }
 
 // ---------------------------------------------------------------- watch / resume
 
 struct Snap {
-    head_seq: i64,
-    resume_token: String,
-    resynchronized: Option<String>,
-    unacknowledged: Vec<chatd::proto::MessageView>,
-    total: i64,
-    pages: u64,
+	head_seq: i64,
+	resume_token: String,
+	resynchronized: Option<String>,
+	unacknowledged: Vec<chatd::proto::MessageView>,
+	total: i64,
+	pages: u64,
 }
 
 fn read_snapshot(c: &mut Client) -> Snap {
-    let Response::SnapshotBegin { head_seq, resume_token, unacknowledged_total, resynchronized, .. } = c.recv().unwrap() else {
-        panic!("no SnapshotBegin")
-    };
-    let mut unacknowledged = Vec::new();
-    let mut seen_pages = 0;
-    loop {
-        match c.recv().unwrap() {
-            Response::SnapshotPage { unacknowledged: page } => {
-                assert!(page.len() <= chatd::proto::MAX_PAGE as usize);
-                unacknowledged.extend(page);
-                seen_pages += 1;
-            }
-            Response::SnapshotEnd { head_seq: h, pages } => {
-                assert_eq!((h, pages), (head_seq, seen_pages));
-                return Snap { head_seq, resume_token, resynchronized, unacknowledged, total: unacknowledged_total, pages };
-            }
-            other => panic!("{other:?}"),
-        }
-    }
+	let Response::SnapshotBegin { head_seq, resume_token, unacknowledged_total, resynchronized, .. } = c.recv().unwrap() else {
+		panic!("no SnapshotBegin")
+	};
+	let mut unacknowledged = Vec::new();
+	let mut seen_pages = 0;
+	loop {
+		match c.recv().unwrap() {
+			Response::SnapshotPage { unacknowledged: page } => {
+				assert!(page.len() <= chatd::proto::MAX_PAGE as usize);
+				unacknowledged.extend(page);
+				seen_pages += 1;
+			}
+			Response::SnapshotEnd { head_seq: h, pages } => {
+				assert_eq!((h, pages), (head_seq, seen_pages));
+				return Snap { head_seq, resume_token, resynchronized, unacknowledged, total: unacknowledged_total, pages };
+			}
+			other => panic!("{other:?}"),
+		}
+	}
 }
 
 fn open_watch(e: &Env, who: &str, token: Option<String>) -> (Client, Snap) {
-    let mut c = Client::connect(&e.socket(), Some(Duration::from_secs(5))).unwrap();
-    c.send(Request::Watch { as_: who.into(), conversation: None, resume_token: token, exclusive: false }).unwrap();
-    let snap = read_snapshot(&mut c);
-    (c, snap)
+	let mut c = Client::connect(&e.socket(), Some(Duration::from_secs(5))).unwrap();
+	c.send(Request::Watch { as_: who.into(), conversation: None, resume_token: token, exclusive: false }).unwrap();
+	let snap = read_snapshot(&mut c);
+	(c, snap)
 }
 
 fn next_event(c: &mut Client) -> (chatd::proto::EventView, String) {
-    loop {
-        match c.recv().unwrap() {
-            Response::Event { event, resume_token } => return (event, resume_token),
-            Response::Heartbeat { .. } => continue,
-            other => panic!("{other:?}"),
-        }
-    }
+	loop {
+		match c.recv().unwrap() {
+			Response::Event { event, resume_token } => return (event, resume_token),
+			Response::Heartbeat { .. } => continue,
+			other => panic!("{other:?}"),
+		}
+	}
 }
 
 #[test]
 fn watch_streams_events_and_resumes_by_token() {
-    let mut e = Env::standard();
-    e.start();
-    let (mut c, snap) = open_watch(&e, "claude", None);
-    assert!(snap.unacknowledged.is_empty() && snap.resynchronized.is_none());
-    let first = e.send("codex", "claude", "w", Kind::Request, "w1", "one");
-    let (ev, token) = next_event(&mut c);
-    assert_eq!((ev.kind.as_str(), ev.message_id.as_deref()), ("message_stored", Some(first.as_str())));
-    drop(c);
-    let second = e.send("codex", "claude", "w", Kind::Request, "w2", "two");
-    let third = e.send("codex", "claude", "w", Kind::Request, "w3", "three");
-    let (mut c, snap) = open_watch(&e, "claude", Some(token));
-    assert!(snap.resynchronized.is_none());
-    // Event position is not acknowledgement: all three are still in the inbox snapshot.
-    assert_eq!(snap.unacknowledged.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![first.clone(), second.clone(), third.clone()]);
-    let (a, _) = next_event(&mut c);
-    let (b, _) = next_event(&mut c);
-    assert_eq!((a.message_id.unwrap(), b.message_id.unwrap()), (second.clone(), third.clone()), "exactly the events after the token");
-    // Heartbeats show a live, quiet connection.
-    assert!(matches!(c.recv().unwrap(), Response::Heartbeat { .. }));
-    // The sender's watch sees receipt and answer events for its message.
-    let (mut s, _) = open_watch(&e, "codex", None);
-    e.call(Request::Ack { as_: "claude".into(), ids: vec![first.clone()] });
-    let (ev, _) = next_event(&mut s);
-    assert_eq!((ev.kind.as_str(), ev.message_id.as_deref()), ("received", Some(first.as_str())));
+	let mut e = Env::standard();
+	e.start();
+	let (mut c, snap) = open_watch(&e, "claude", None);
+	assert!(snap.unacknowledged.is_empty() && snap.resynchronized.is_none());
+	let first = e.send("codex", "claude", "w", Kind::Request, "w1", "one");
+	let (ev, token) = next_event(&mut c);
+	assert_eq!((ev.kind.as_str(), ev.message_id.as_deref()), ("message_stored", Some(first.as_str())));
+	drop(c);
+	let second = e.send("codex", "claude", "w", Kind::Request, "w2", "two");
+	let third = e.send("codex", "claude", "w", Kind::Request, "w3", "three");
+	let (mut c, snap) = open_watch(&e, "claude", Some(token));
+	assert!(snap.resynchronized.is_none());
+	// Event position is not acknowledgement: all three are still in the inbox snapshot.
+	assert_eq!(snap.unacknowledged.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![first.clone(), second.clone(), third.clone()]);
+	let (a, _) = next_event(&mut c);
+	let (b, _) = next_event(&mut c);
+	assert_eq!((a.message_id.unwrap(), b.message_id.unwrap()), (second.clone(), third.clone()), "exactly the events after the token");
+	// Heartbeats show a live, quiet connection.
+	assert!(matches!(c.recv().unwrap(), Response::Heartbeat { .. }));
+	// The sender's watch sees receipt and answer events for its message.
+	let (mut s, _) = open_watch(&e, "codex", None);
+	e.call(Request::Ack { as_: "claude".into(), ids: vec![first.clone()] });
+	let (ev, _) = next_event(&mut s);
+	assert_eq!((ev.kind.as_str(), ev.message_id.as_deref()), ("received", Some(first.as_str())));
 }
 
 #[test]
 fn invalid_foreign_and_future_tokens_require_resynchronization() {
-    let mut e = Env::standard();
-    e.start();
-    e.send("codex", "claude", "w", Kind::Info, "k", "x");
-    let (_, snap) = open_watch(&e, "claude", None);
-    let (resume_token, head_seq) = (snap.resume_token, snap.head_seq);
-    let parts: Vec<&str> = resume_token.split('.').collect();
-    let future = format!("{}.{}.{}.{}.{}", parts[0], parts[1], parts[2], parts[3], head_seq + 1000);
-    let foreign_store = format!("{}.{}.{}.{}.{}", parts[0], "00000000-0000-4000-8000-000000000000", parts[2], parts[3], 0);
-    for (token, why) in [("garbage".to_string(), "malformed"), (future, "beyond"), (foreign_store, "another store")] {
-        let (_, snap) = open_watch(&e, "claude", Some(token));
-        assert!(snap.resynchronized.as_deref().unwrap_or("").contains(why), "{:?}", snap.resynchronized);
-        assert_eq!(snap.unacknowledged.len(), 1, "a resync still carries the authoritative inbox");
-    }
-    // A token from another participant's filter is not accepted either.
-    let (_, snap) = open_watch(&e, "codex", Some(resume_token));
-    assert!(snap.resynchronized.unwrap().contains("filter"));
+	let mut e = Env::standard();
+	e.start();
+	e.send("codex", "claude", "w", Kind::Info, "k", "x");
+	let (_, snap) = open_watch(&e, "claude", None);
+	let (resume_token, head_seq) = (snap.resume_token, snap.head_seq);
+	let parts: Vec<&str> = resume_token.split('.').collect();
+	let future = format!("{}.{}.{}.{}.{}", parts[0], parts[1], parts[2], parts[3], head_seq + 1000);
+	let foreign_store = format!("{}.{}.{}.{}.{}", parts[0], "00000000-0000-4000-8000-000000000000", parts[2], parts[3], 0);
+	for (token, why) in [("garbage".to_string(), "malformed"), (future, "beyond"), (foreign_store, "another store")] {
+		let (_, snap) = open_watch(&e, "claude", Some(token));
+		assert!(snap.resynchronized.as_deref().unwrap_or("").contains(why), "{:?}", snap.resynchronized);
+		assert_eq!(snap.unacknowledged.len(), 1, "a resync still carries the authoritative inbox");
+	}
+	// A token from another participant's filter is not accepted either.
+	let (_, snap) = open_watch(&e, "codex", Some(resume_token));
+	assert!(snap.resynchronized.unwrap().contains("filter"));
 }
 
 #[test]
 fn send_and_status_are_not_blocked_by_waiting_clients() {
-    let mut e = Env::standard();
-    e.start();
-    let mut waiters = Vec::new();
-    for _ in 0..10 {
-        let mut cmd = Command::new(CLI);
-        e.envs(&mut cmd);
-        waiters.push(cmd.args(["wait", "--as", "claude", "--timeout", "5"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
-    }
-    std::thread::sleep(Duration::from_millis(300));
-    let t0 = Instant::now();
-    e.send("claude", "codex", "c", Kind::Info, "free", "not blocked");
-    e.status(None);
-    assert!(t0.elapsed() < Duration::from_millis(500), "{:?}", t0.elapsed());
-    for mut w in waiters {
-        let _ = w.kill();
-        let _ = w.wait();
-    }
+	let mut e = Env::standard();
+	e.start();
+	let mut waiters = Vec::new();
+	for _ in 0..10 {
+		let mut cmd = Command::new(CLI);
+		e.envs(&mut cmd);
+		waiters.push(cmd.args(["wait", "--as", "claude", "--timeout", "5"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+	}
+	std::thread::sleep(Duration::from_millis(300));
+	let t0 = Instant::now();
+	e.send("claude", "codex", "c", Kind::Info, "free", "not blocked");
+	e.status(None);
+	assert!(t0.elapsed() < Duration::from_millis(500), "{:?}", t0.elapsed());
+	for mut w in waiters {
+		let _ = w.kill();
+		let _ = w.wait();
+	}
 }
 
 // ---------------------------------------------------------------- durability
 
 #[test]
 fn a_killed_daemon_restarts_with_every_committed_message_and_ack() {
-    let mut e = Env::standard();
-    e.start();
-    let a = e.send("codex", "claude", "d", Kind::Request, "d1", "one");
-    let b = e.send("codex", "claude", "d", Kind::Request, "d2", "two");
-    e.call(Request::Ack { as_: "claude".into(), ids: vec![a.clone()] });
-    let before = e.status(None);
-    e.kill9();
-    e.start();
-    let after = e.status(None);
-    assert_eq!(before.head_seq, after.head_seq);
-    assert_eq!(before.store_id, after.store_id);
-    assert_eq!(after.unacknowledged.iter().map(|l| l.id.clone()).collect::<Vec<_>>(), vec![b]);
-    // An identical retry after the restart (lost receipt) returns the original.
-    assert_eq!(e.send("codex", "claude", "d", Kind::Request, "d1", "one"), a);
+	let mut e = Env::standard();
+	e.start();
+	let a = e.send("codex", "claude", "d", Kind::Request, "d1", "one");
+	let b = e.send("codex", "claude", "d", Kind::Request, "d2", "two");
+	e.call(Request::Ack { as_: "claude".into(), ids: vec![a.clone()] });
+	let before = e.status(None);
+	e.kill9();
+	e.start();
+	let after = e.status(None);
+	assert_eq!(before.head_seq, after.head_seq);
+	assert_eq!(before.store_id, after.store_id);
+	assert_eq!(after.unacknowledged.iter().map(|l| l.id.clone()).collect::<Vec<_>>(), vec![b]);
+	// An identical retry after the restart (lost receipt) returns the original.
+	assert_eq!(e.send("codex", "claude", "d", Kind::Request, "d1", "one"), a);
 }
 
 #[test]
 fn backup_is_a_consistent_copy() {
-    let mut e = Env::standard();
-    e.start();
-    for i in 0..20 {
-        e.send("claude", "codex", "bk", Kind::Info, &format!("bk{i}"), "x");
-    }
-    let path = e.dir.join("backup.db");
-    match e.call(Request::Backup { path: path.to_string_lossy().into_owned() }) {
-        Response::BackedUp { head_seq, .. } => assert!(head_seq >= 20),
-        other => panic!("{other:?}"),
-    }
-    let c = rusqlite::Connection::open(&path).unwrap();
-    let n: i64 = c.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)).unwrap();
-    let ok: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
-    assert_eq!((n, ok.as_str()), (20, "ok"));
-    assert!(matches!(
-        e.call(Request::Backup { path: path.to_string_lossy().into_owned() }),
-        Response::Error { code: ErrorCode::Conflict, .. }
-    ));
+	let mut e = Env::standard();
+	e.start();
+	for i in 0..20 {
+		e.send("claude", "codex", "bk", Kind::Info, &format!("bk{i}"), "x");
+	}
+	let path = e.dir.join("backup.db");
+	match e.call(Request::Backup { path: path.to_string_lossy().into_owned() }) {
+		Response::BackedUp { head_seq, .. } => assert!(head_seq >= 20),
+		other => panic!("{other:?}"),
+	}
+	let c = rusqlite::Connection::open(&path).unwrap();
+	let n: i64 = c.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)).unwrap();
+	let ok: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+	assert_eq!((n, ok.as_str()), (20, "ok"));
+	assert!(matches!(
+		e.call(Request::Backup { path: path.to_string_lossy().into_owned() }),
+		Response::Error { code: ErrorCode::Conflict, .. }
+	));
 }
 
 #[test]
 fn legacy_import_is_inert_and_idempotent() {
-    let mut e = Env::standard();
-    e.start();
-    let f = e.dir.join("to-claude.md");
-    std::fs::write(&f, "[codex 10:00]\nhello\n--- end ---\n[codex 10:00]\nrepeated time\n--- end ---\n[codex 11:00]\ncut off\n").unwrap();
-    let p = f.to_string_lossy().into_owned();
-    let Response::Legacy(dry) = e.call(Request::ImportLegacy { paths: vec![p.clone()], dry_run: true }) else { panic!() };
-    assert_eq!((dry.files[0].blocks, dry.files[0].malformed, dry.files[0].newly_imported), (3, 1, 3));
-    let Response::Legacy(dry2) = e.call(Request::ImportLegacy { paths: vec![p.clone()], dry_run: true }) else { panic!() };
-    assert_eq!(dry2.files[0].newly_imported, 3, "a dry run stores nothing");
-    let Response::Legacy(real) = e.call(Request::ImportLegacy { paths: vec![p.clone()], dry_run: false }) else { panic!() };
-    assert_eq!(real.files[0].newly_imported, 3);
-    let Response::Legacy(again) = e.call(Request::ImportLegacy { paths: vec![p], dry_run: false }) else { panic!() };
-    assert_eq!((again.files[0].newly_imported, again.files[0].already_present), (0, 3));
-    let s = e.status(None);
-    assert!(s.unacknowledged.is_empty() && s.unanswered.is_empty(), "imported history never becomes work");
-    assert_eq!(s.head_seq, 0, "and never creates events");
+	let mut e = Env::standard();
+	e.start();
+	let f = e.dir.join("to-claude.md");
+	std::fs::write(&f, "[codex 10:00]\nhello\n--- end ---\n[codex 10:00]\nrepeated time\n--- end ---\n[codex 11:00]\ncut off\n").unwrap();
+	let p = f.to_string_lossy().into_owned();
+	let Response::Legacy(dry) = e.call(Request::ImportLegacy { paths: vec![p.clone()], dry_run: true }) else { panic!() };
+	assert_eq!((dry.files[0].blocks, dry.files[0].malformed, dry.files[0].newly_imported), (3, 1, 3));
+	let Response::Legacy(dry2) = e.call(Request::ImportLegacy { paths: vec![p.clone()], dry_run: true }) else { panic!() };
+	assert_eq!(dry2.files[0].newly_imported, 3, "a dry run stores nothing");
+	let Response::Legacy(real) = e.call(Request::ImportLegacy { paths: vec![p.clone()], dry_run: false }) else { panic!() };
+	assert_eq!(real.files[0].newly_imported, 3);
+	let Response::Legacy(again) = e.call(Request::ImportLegacy { paths: vec![p], dry_run: false }) else { panic!() };
+	assert_eq!((again.files[0].newly_imported, again.files[0].already_present), (0, 3));
+	let s = e.status(None);
+	assert!(s.unacknowledged.is_empty() && s.unanswered.is_empty(), "imported history never becomes work");
+	assert_eq!(s.head_seq, 0, "and never creates events");
 }
 
 // ---------------------------------------------------------------- the Codex adapter
 
 /// A fake `codex` executable: records its argv, then behaves per the mode file.
 fn fake_codex(e: &Env, script: &str) -> PathBuf {
-    let path = e.dir.join(format!("fake-codex-{}", NEXT.fetch_add(1, Ordering::SeqCst)));
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {log}\necho $$ >> {pids}\n{script}\n",
-            log = e.dir.join("argv.log").display(),
-            pids = e.dir.join("pids").display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+	let path = e.dir.join(format!("fake-codex-{}", NEXT.fetch_add(1, Ordering::SeqCst)));
+	std::fs::write(
+		&path,
+		format!(
+			"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {log}\necho $$ >> {pids}\n{script}\n",
+			log = e.dir.join("argv.log").display(),
+			pids = e.dir.join("pids").display()
+		),
+	)
+	.unwrap();
+	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+	path
 }
 
 fn attempts(e: &Env, id: &str) -> Vec<String> {
-    let c = rusqlite::Connection::open(e.state().join("chat.db")).unwrap();
-    let mut s = c.prepare("SELECT state FROM attempts WHERE message_id = ?1 ORDER BY id").unwrap();
-    s.query_map([id], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+	let c = rusqlite::Connection::open(e.state().join("chat.db")).unwrap();
+	let mut s = c.prepare("SELECT state FROM attempts WHERE message_id = ?1 ORDER BY id").unwrap();
+	s.query_map([id], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
 }
 
 fn wait_for(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
-    let t0 = Instant::now();
-    while !f() {
-        assert!(t0.elapsed() < timeout, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+	let t0 = Instant::now();
+	while !f() {
+		assert!(t0.elapsed() < timeout, "timed out waiting for {what}");
+		std::thread::sleep(Duration::from_millis(50));
+	}
 }
 
 fn register(e: &Env, exe: &Path, session: &str) -> i64 {
-    match e.call(Request::EndpointBind {
-        name: "codex".into(),
-        session: session.into(),
-        exe: exe.to_string_lossy().into_owned(),
-        mode: chatd::proto::BindMode::Replace,
-    }) {
-        Response::Bound(v) => v.endpoint.generation,
-        other => panic!("{other:?}"),
-    }
+	match e.call(Request::EndpointBind {
+		name: "codex".into(),
+		session: session.into(),
+		exe: exe.to_string_lossy().into_owned(),
+		mode: chatd::proto::BindMode::Replace,
+	}) {
+		Response::Bound(v) => v.endpoint.generation,
+		other => panic!("{other:?}"),
+	}
 }
 
 #[test]
 fn submission_retries_confirmed_failures_and_never_sends_the_body() {
-    let mut e = Env::standard();
-    e.start();
-    let counter = e.dir.join("count");
-    let exe = fake_codex(
-        &e,
-        &format!(
-            "n=$(cat {c} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}; [ $n -ge 3 ] && exit 0; echo 'transient failure' >&2; exit 1",
-            c = counter.display()
-        ),
-    );
-    register(&e, &exe, "00000000-0000-4000-8000-00000000c0de");
-    let id = e.send("claude", "codex", "adr628", Kind::Request, "sub", "review please\nSECRET BODY TEXT on a later line");
-    wait_for("three attempts", Duration::from_secs(10), || attempts(&e, &id).len() == 3 && attempts(&e, &id)[2] != "started");
-    assert_eq!(attempts(&e, &id), vec!["failed", "failed", "submitted"]);
-    let argv = std::fs::read_to_string(e.dir.join("argv.log")).unwrap();
-    assert!(!argv.contains("SECRET BODY TEXT"), "only the bounded summary, never the body, is passed to the adapter");
-    assert!(argv.contains("review please"));
-    assert!(argv.contains(&format!("chatctl receive --as codex --id {id}")));
-    assert!(argv.lines().take(4).collect::<Vec<_>>() == vec!["queue", "--thread", "00000000-0000-4000-8000-00000000c0de", "--message"]);
-    // Submission is not receipt.
-    let s = e.status(Some("codex"));
-    assert!(s.unacknowledged.iter().any(|l| l.id == id && !l.received));
-    std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(attempts(&e, &id).len(), 3, "a submitted message is not resubmitted");
+	let mut e = Env::standard();
+	e.start();
+	let counter = e.dir.join("count");
+	let exe = fake_codex(
+		&e,
+		&format!(
+			"n=$(cat {c} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}; [ $n -ge 3 ] && exit 0; echo 'transient failure' >&2; exit 1",
+			c = counter.display()
+		),
+	);
+	register(&e, &exe, "00000000-0000-4000-8000-00000000c0de");
+	let id = e.send("claude", "codex", "adr628", Kind::Request, "sub", "review please\nSECRET BODY TEXT on a later line");
+	wait_for("three attempts", Duration::from_secs(10), || attempts(&e, &id).len() == 3 && attempts(&e, &id)[2] != "started");
+	assert_eq!(attempts(&e, &id), vec!["failed", "failed", "submitted"]);
+	let argv = std::fs::read_to_string(e.dir.join("argv.log")).unwrap();
+	assert!(!argv.contains("SECRET BODY TEXT"), "only the bounded summary, never the body, is passed to the adapter");
+	assert!(argv.contains("review please"));
+	assert!(argv.contains(&format!("chatctl receive --as codex --id {id}")));
+	assert!(argv.lines().take(4).collect::<Vec<_>>() == vec!["queue", "--thread", "00000000-0000-4000-8000-00000000c0de", "--message"]);
+	// Submission is not receipt.
+	let s = e.status(Some("codex"));
+	assert!(s.unacknowledged.iter().any(|l| l.id == id && !l.received));
+	std::thread::sleep(Duration::from_millis(600));
+	assert_eq!(attempts(&e, &id).len(), 3, "a submitted message is not resubmitted");
 }
 
 #[test]
 fn failures_stop_at_the_bound_and_stay_visible() {
-    let mut e = Env::standard();
-    e.start();
-    let exe = fake_codex(&e, "echo 'session not found' >&2; exit 2");
-    register(&e, &exe, "s1");
-    let id = e.send("claude", "codex", "c", Kind::Request, "bound", "b");
-    wait_for("the retry bound", Duration::from_secs(10), || attempts(&e, &id) == vec!["failed", "failed", "failed"]);
-    std::thread::sleep(Duration::from_millis(800));
-    assert_eq!(attempts(&e, &id).len(), 3);
-    let s = e.status(None);
-    let a = s.uncertain_or_failed_submissions.iter().find(|a| a.message_id == id).unwrap();
-    assert_eq!((a.state.as_str(), a.exit_code), ("failed", Some(2)));
-    assert!(a.error.as_deref().unwrap().contains("session not found"));
-    // Explicit redelivery starts a fresh budget.
-    assert!(matches!(e.call(Request::Redeliver { id: id.clone() }), Response::Redelivery { .. }));
-    wait_for("redelivery attempts", Duration::from_secs(10), || attempts(&e, &id).len() == 6 && attempts(&e, &id)[5] == "failed");
+	let mut e = Env::standard();
+	e.start();
+	let exe = fake_codex(&e, "echo 'session not found' >&2; exit 2");
+	register(&e, &exe, "s1");
+	let id = e.send("claude", "codex", "c", Kind::Request, "bound", "b");
+	wait_for("the retry bound", Duration::from_secs(10), || attempts(&e, &id) == vec!["failed", "failed", "failed"]);
+	std::thread::sleep(Duration::from_millis(800));
+	assert_eq!(attempts(&e, &id).len(), 3);
+	let s = e.status(None);
+	let a = s.uncertain_or_failed_submissions.iter().find(|a| a.message_id == id).unwrap();
+	assert_eq!((a.state.as_str(), a.exit_code), ("failed", Some(2)));
+	assert!(a.error.as_deref().unwrap().contains("session not found"));
+	// Explicit redelivery starts a fresh budget.
+	assert!(matches!(e.call(Request::Redeliver { id: id.clone() }), Response::Redelivery { .. }));
+	wait_for("redelivery attempts", Duration::from_secs(10), || attempts(&e, &id).len() == 6 && attempts(&e, &id)[5] == "failed");
 }
 
 #[test]
 fn a_hung_adapter_is_killed_marked_uncertain_and_not_retried_and_does_not_block_others() {
-    let mut e = Env::standard();
-    e.start();
-    let exe = fake_codex(&e, "exec sleep 30");
-    register(&e, &exe, "s1");
-    let id = e.send("claude", "codex", "c", Kind::Request, "hang", "h");
-    wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
-    wait_for("the adapter child to run", Duration::from_secs(5), || e.dir.join("pids").exists());
-    let t0 = Instant::now();
-    e.send("claude", "codex", "c", Kind::Info, "during", "while the adapter hangs");
-    e.status(None);
-    assert!(t0.elapsed() < Duration::from_millis(500), "the store is not held during the adapter run");
-    wait_for("the deadline", Duration::from_secs(5), || attempts(&e, &id) == vec!["uncertain"]);
-    let pid: i32 = std::fs::read_to_string(e.dir.join("pids")).unwrap().lines().next().unwrap().trim().parse().unwrap();
-    assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the timed-out child was killed and reaped");
-    std::thread::sleep(Duration::from_millis(800));
-    assert_eq!(attempts(&e, &id)[0], "uncertain", "uncertain is never retried automatically");
-    assert_eq!(attempts(&e, &id).iter().filter(|s| *s == "uncertain").count(), 1);
+	let mut e = Env::standard();
+	e.start();
+	let exe = fake_codex(&e, "exec sleep 30");
+	register(&e, &exe, "s1");
+	let id = e.send("claude", "codex", "c", Kind::Request, "hang", "h");
+	wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
+	wait_for("the adapter child to run", Duration::from_secs(5), || e.dir.join("pids").exists());
+	let t0 = Instant::now();
+	e.send("claude", "codex", "c", Kind::Info, "during", "while the adapter hangs");
+	e.status(None);
+	assert!(t0.elapsed() < Duration::from_millis(500), "the store is not held during the adapter run");
+	wait_for("the deadline", Duration::from_secs(5), || attempts(&e, &id) == vec!["uncertain"]);
+	let pid: i32 = std::fs::read_to_string(e.dir.join("pids")).unwrap().lines().next().unwrap().trim().parse().unwrap();
+	assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the timed-out child was killed and reaped");
+	std::thread::sleep(Duration::from_millis(800));
+	assert_eq!(attempts(&e, &id)[0], "uncertain", "uncertain is never retried automatically");
+	assert_eq!(attempts(&e, &id).iter().filter(|s| *s == "uncertain").count(), 1);
 }
 
 #[test]
 fn a_rebind_fences_failed_attempts_of_the_old_binding() {
-    let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [1500, 1500, 1500]\n");
-    e.start();
-    let exe = fake_codex(&e, "exit 1");
-    assert_eq!(register(&e, &exe, "old-session"), 1);
-    let id = e.send("claude", "codex", "c", Kind::Request, "fence", "f");
-    wait_for("one failure", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed"]);
-    let ok = fake_codex(&e, "exit 0");
-    assert_eq!(register(&e, &ok, "new-session"), 2);
-    std::thread::sleep(Duration::from_millis(2500));
-    assert_eq!(attempts(&e, &id), vec!["failed"], "no automatic retry against the new session");
-    e.call(Request::Redeliver { id: id.clone() });
-    wait_for("redelivery under generation 2", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed", "submitted"]);
-    let argv = std::fs::read_to_string(e.dir.join("argv.log")).unwrap();
-    assert!(argv.contains("new-session"));
+	let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [1500, 1500, 1500]\n");
+	e.start();
+	let exe = fake_codex(&e, "exit 1");
+	assert_eq!(register(&e, &exe, "old-session"), 1);
+	let id = e.send("claude", "codex", "c", Kind::Request, "fence", "f");
+	wait_for("one failure", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed"]);
+	let ok = fake_codex(&e, "exit 0");
+	assert_eq!(register(&e, &ok, "new-session"), 2);
+	std::thread::sleep(Duration::from_millis(2500));
+	assert_eq!(attempts(&e, &id), vec!["failed"], "no automatic retry against the new session");
+	e.call(Request::Redeliver { id: id.clone() });
+	wait_for("redelivery under generation 2", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed", "submitted"]);
+	let argv = std::fs::read_to_string(e.dir.join("argv.log")).unwrap();
+	assert!(argv.contains("new-session"));
 }
 
 #[test]
 fn a_crash_during_submission_leaves_it_uncertain_after_restart() {
-    let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 20000\n");
-    e.start();
-    let exe = fake_codex(&e, "exec sleep 30");
-    register(&e, &exe, "s1");
-    let id = e.send("claude", "codex", "c", Kind::Request, "crash", "c");
-    wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
-    wait_for("the adapter child to run", Duration::from_secs(5), || e.dir.join("pids").exists());
-    e.kill9();
-    e.start();
-    assert_eq!(attempts(&e, &id), vec!["uncertain"]);
-    let s = e.status(None);
-    assert!(s.uncertain_or_failed_submissions.iter().any(|a| a.message_id == id && a.state == "uncertain"));
-    for pid in std::fs::read_to_string(e.dir.join("pids")).unwrap().lines() {
-        unsafe { libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL) };
-    }
+	let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 20000\n");
+	e.start();
+	let exe = fake_codex(&e, "exec sleep 30");
+	register(&e, &exe, "s1");
+	let id = e.send("claude", "codex", "c", Kind::Request, "crash", "c");
+	wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
+	wait_for("the adapter child to run", Duration::from_secs(5), || e.dir.join("pids").exists());
+	e.kill9();
+	e.start();
+	assert_eq!(attempts(&e, &id), vec!["uncertain"]);
+	let s = e.status(None);
+	assert!(s.uncertain_or_failed_submissions.iter().any(|a| a.message_id == id && a.state == "uncertain"));
+	for pid in std::fs::read_to_string(e.dir.join("pids")).unwrap().lines() {
+		unsafe { libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL) };
+	}
 }
 
 #[test]
 fn sigterm_stops_the_adapter_child_and_records_uncertain() {
-    let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 20000\n");
-    e.start();
-    let exe = fake_codex(&e, "exec sleep 30");
-    register(&e, &exe, "s1");
-    let id = e.send("claude", "codex", "c", Kind::Request, "term", "t");
-    wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
-    wait_for("the adapter child to run", Duration::from_secs(5), || e.dir.join("pids").exists());
-    let t0 = Instant::now();
-    assert!(e.term().success());
-    assert!(t0.elapsed() < Duration::from_secs(6));
-    let pid: i32 = std::fs::read_to_string(e.dir.join("pids")).unwrap().lines().next().unwrap().trim().parse().unwrap();
-    assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the adapter child does not survive the service");
-    assert!(!e.socket().exists(), "the socket is removed on a clean stop");
-    e.start();
-    assert_eq!(attempts(&e, &id), vec!["uncertain"]);
+	let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 20000\n");
+	e.start();
+	let exe = fake_codex(&e, "exec sleep 30");
+	register(&e, &exe, "s1");
+	let id = e.send("claude", "codex", "c", Kind::Request, "term", "t");
+	wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
+	wait_for("the adapter child to run", Duration::from_secs(5), || e.dir.join("pids").exists());
+	let t0 = Instant::now();
+	assert!(e.term().success());
+	assert!(t0.elapsed() < Duration::from_secs(6));
+	let pid: i32 = std::fs::read_to_string(e.dir.join("pids")).unwrap().lines().next().unwrap().trim().parse().unwrap();
+	assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the adapter child does not survive the service");
+	assert!(!e.socket().exists(), "the socket is removed on a clean stop");
+	e.start();
+	assert_eq!(attempts(&e, &id), vec!["uncertain"]);
 }
 
 #[test]
 fn the_journal_view_colours_by_sender() {
-    let e = Env::standard();
-    let input = "{\"__REALTIME_TIMESTAMP\":\"0\",\"MESSAGE\":\"stored request\",\"CHATD_SENDER\":\"claude\"}\n{\"__REALTIME_TIMESTAMP\":\"0\",\"MESSAGE\":\"stored final\",\"CHATD_SENDER\":\"codex\"}\n";
-    let out = e.cli(&["journal", "--stdin"], Some(input));
-    let s = stdout(&out);
-    let lines: Vec<_> = s.lines().collect();
-    assert_eq!(lines.len(), 3);
-    assert_eq!(lines[0], chatd::journal::HEADER);
-    assert!(lines[1].contains("claude    -         -") && lines[1].ends_with("stored request"));
-    assert!(lines[2].contains("codex     -         -") && lines[2].ends_with("stored final"));
-    assert!(!s.contains('\x1b'), "no colour when stdout is not a terminal");
+	let e = Env::standard();
+	let input = "{\"__REALTIME_TIMESTAMP\":\"0\",\"MESSAGE\":\"stored request\",\"CHATD_SENDER\":\"claude\"}\n{\"__REALTIME_TIMESTAMP\":\"0\",\"MESSAGE\":\"stored final\",\"CHATD_SENDER\":\"codex\"}\n";
+	let out = e.cli(&["journal", "--stdin"], Some(input));
+	let s = stdout(&out);
+	let lines: Vec<_> = s.lines().collect();
+	assert_eq!(lines.len(), 3);
+	assert_eq!(lines[0], chatd::journal::HEADER);
+	assert!(lines[1].contains("claude    -         -") && lines[1].ends_with("stored request"));
+	assert!(lines[2].contains("codex     -         -") && lines[2].ends_with("stored final"));
+	assert!(!s.contains('\x1b'), "no colour when stdout is not a terminal");
 }
 
 #[test]
 fn a_closed_watcher_leaves_status_promptly() {
-    let mut e = Env::new("heartbeat_ms = 10000\n");
-    e.start();
-    let (c, _) = open_watch(&e, "claude", None);
-    assert_eq!(e.status(None).watchers.len(), 1);
-    drop(c);
-    wait_for("the watcher to be removed", Duration::from_secs(2), || e.status(None).watchers.is_empty());
+	let mut e = Env::new("heartbeat_ms = 10000\n");
+	e.start();
+	let (c, _) = open_watch(&e, "claude", None);
+	assert_eq!(e.status(None).watchers.len(), 1);
+	drop(c);
+	wait_for("the watcher to be removed", Duration::from_secs(2), || e.status(None).watchers.is_empty());
 }
 
 fn thread_count(pid: u32) -> usize {
-    std::fs::read_dir(format!("/proc/{pid}/task")).map(|d| d.count()).unwrap_or(0)
+	std::fs::read_dir(format!("/proc/{pid}/task")).map(|d| d.count()).unwrap_or(0)
 }
 
 #[test]
 fn a_refused_second_daemon_changes_nothing_in_the_store() {
-    let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 20000\n");
-    e.start();
-    let exe = fake_codex(&e, "exec sleep 30");
-    register(&e, &exe, "s1");
-    let id = e.send("claude", "codex", "c", Kind::Request, "live", "in flight");
-    wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
-    let before = (e.status(None).head_seq, attempts(&e, &id));
-    let other_socket = e.dir.join("run").join("other.sock");
-    for round in 0..4 {
-        let mut cmd = Command::new(DAEMON);
-        e.envs(&mut cmd);
-        if round % 2 == 1 {
-            cmd.env("CHATD_SOCKET", &other_socket);
-        }
-        let out = cmd.stderr(Stdio::piped()).output().unwrap();
-        assert!(!out.status.success());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("another daemon"), "{}", String::from_utf8_lossy(&out.stderr));
-    }
-    assert_eq!(attempts(&e, &id), vec!["started"], "the live submission is untouched");
-    assert_eq!((e.status(None).head_seq, attempts(&e, &id)), before, "no events or attempts were written");
-    assert!(!other_socket.exists(), "the refused daemon bound nothing");
-    assert!(matches!(e.call(Request::Health), Response::Health { .. }));
-    for pid in std::fs::read_to_string(e.dir.join("pids")).unwrap_or_default().lines() {
-        unsafe { libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL) };
-    }
+	let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 20000\n");
+	e.start();
+	let exe = fake_codex(&e, "exec sleep 30");
+	register(&e, &exe, "s1");
+	let id = e.send("claude", "codex", "c", Kind::Request, "live", "in flight");
+	wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
+	let before = (e.status(None).head_seq, attempts(&e, &id));
+	let other_socket = e.dir.join("run").join("other.sock");
+	for round in 0..4 {
+		let mut cmd = Command::new(DAEMON);
+		e.envs(&mut cmd);
+		if round % 2 == 1 {
+			cmd.env("CHATD_SOCKET", &other_socket);
+		}
+		let out = cmd.stderr(Stdio::piped()).output().unwrap();
+		assert!(!out.status.success());
+		assert!(String::from_utf8_lossy(&out.stderr).contains("another daemon"), "{}", String::from_utf8_lossy(&out.stderr));
+	}
+	assert_eq!(attempts(&e, &id), vec!["started"], "the live submission is untouched");
+	assert_eq!((e.status(None).head_seq, attempts(&e, &id)), before, "no events or attempts were written");
+	assert!(!other_socket.exists(), "the refused daemon bound nothing");
+	assert!(matches!(e.call(Request::Health), Response::Health { .. }));
+	for pid in std::fs::read_to_string(e.dir.join("pids")).unwrap_or_default().lines() {
+		unsafe { libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL) };
+	}
 }
 
 #[test]
 fn watches_ended_by_the_server_leave_no_threads_behind() {
-    let mut e = Env::new("heartbeat_ms = 1\nwrite_deadline_ms = 200\n");
-    e.start();
-    let pid = e.daemon.as_ref().unwrap().id();
-    std::thread::sleep(Duration::from_millis(300));
-    let baseline = thread_count(pid);
-    // Watchers that never read: heartbeats fill their sockets until the write deadline ends the
-    // watch on the server side, while the clients stay connected.
-    let stalled: Vec<UnixStream> = (0..4)
-        .map(|_| {
-            let mut c = UnixStream::connect(e.socket()).unwrap();
-            let frame = serde_json::to_vec(
-                &serde_json::json!({"v": 1, "req": {"op": "watch", "as_": "claude", "conversation": null, "resume_token": null}}),
-            )
-            .unwrap();
-            c.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
-            c.write_all(&frame).unwrap();
-            c
-        })
-        .collect();
-    wait_for("the stalled watches to end", Duration::from_secs(60), || e.status(None).watchers.is_empty());
-    wait_for("their threads to exit", Duration::from_secs(5), || thread_count(pid) <= baseline);
-    drop(stalled);
+	let mut e = Env::new("heartbeat_ms = 1\nwrite_deadline_ms = 200\n");
+	e.start();
+	let pid = e.daemon.as_ref().unwrap().id();
+	std::thread::sleep(Duration::from_millis(300));
+	let baseline = thread_count(pid);
+	// Watchers that never read: heartbeats fill their sockets until the write deadline ends the
+	// watch on the server side, while the clients stay connected.
+	let stalled: Vec<UnixStream> = (0..4)
+		.map(|_| {
+			let mut c = UnixStream::connect(e.socket()).unwrap();
+			let frame = serde_json::to_vec(
+				&serde_json::json!({"v": 1, "req": {"op": "watch", "as_": "claude", "conversation": null, "resume_token": null}}),
+			)
+			.unwrap();
+			c.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
+			c.write_all(&frame).unwrap();
+			c
+		})
+		.collect();
+	wait_for("the stalled watches to end", Duration::from_secs(60), || e.status(None).watchers.is_empty());
+	wait_for("their threads to exit", Duration::from_secs(5), || thread_count(pid) <= baseline);
+	drop(stalled);
 }
 
 #[test]
 fn an_adapter_timeout_kills_its_whole_process_group() {
-    let mut e = Env::standard();
-    e.start();
-    let gpid = e.dir.join("grandchild");
-    let exe = fake_codex(&e, &format!("sleep 30 & echo $! > {}; wait", gpid.display()));
-    register(&e, &exe, "s1");
-    let id = e.send("claude", "codex", "c", Kind::Request, "group", "g");
-    wait_for("the deadline", Duration::from_secs(6), || attempts(&e, &id) == vec!["uncertain"]);
-    let g: i32 = std::fs::read_to_string(&gpid).unwrap().trim().parse().unwrap();
-    wait_for("the grandchild to be gone", Duration::from_secs(2), || unsafe { libc::kill(g, 0) } != 0);
+	let mut e = Env::standard();
+	e.start();
+	let gpid = e.dir.join("grandchild");
+	let exe = fake_codex(&e, &format!("sleep 30 & echo $! > {}; wait", gpid.display()));
+	register(&e, &exe, "s1");
+	let id = e.send("claude", "codex", "c", Kind::Request, "group", "g");
+	wait_for("the deadline", Duration::from_secs(6), || attempts(&e, &id) == vec!["uncertain"]);
+	let g: i32 = std::fs::read_to_string(&gpid).unwrap().trim().parse().unwrap();
+	wait_for("the grandchild to be gone", Duration::from_secs(2), || unsafe { libc::kill(g, 0) } != 0);
 }
 
 #[test]
 fn a_helper_left_running_after_success_does_not_hang_the_adapter() {
-    let mut e = Env::standard();
-    e.start();
-    let gpid = e.dir.join("helper");
-    let exe = fake_codex(&e, &format!("sleep 30 & echo $! > {}; exit 0", gpid.display()));
-    register(&e, &exe, "s1");
-    let a = e.send("claude", "codex", "c", Kind::Request, "h1", "first");
-    wait_for("the first submission", Duration::from_secs(5), || attempts(&e, &a) == vec!["submitted"]);
-    let g: i32 = std::fs::read_to_string(&gpid).unwrap().trim().parse().unwrap();
-    wait_for("the helper to be gone", Duration::from_secs(2), || unsafe { libc::kill(g, 0) } != 0);
-    let b = e.send("claude", "codex", "c", Kind::Request, "h2", "second");
-    wait_for("the adapter to continue", Duration::from_secs(5), || attempts(&e, &b) == vec!["submitted"]);
+	let mut e = Env::standard();
+	e.start();
+	let gpid = e.dir.join("helper");
+	let exe = fake_codex(&e, &format!("sleep 30 & echo $! > {}; exit 0", gpid.display()));
+	register(&e, &exe, "s1");
+	let a = e.send("claude", "codex", "c", Kind::Request, "h1", "first");
+	wait_for("the first submission", Duration::from_secs(5), || attempts(&e, &a) == vec!["submitted"]);
+	let g: i32 = std::fs::read_to_string(&gpid).unwrap().trim().parse().unwrap();
+	wait_for("the helper to be gone", Duration::from_secs(2), || unsafe { libc::kill(g, 0) } != 0);
+	let b = e.send("claude", "codex", "c", Kind::Request, "h2", "second");
+	wait_for("the adapter to continue", Duration::from_secs(5), || attempts(&e, &b) == vec!["submitted"]);
 }
 
 fn fd_count(pid: u32) -> usize {
-    std::fs::read_dir(format!("/proc/{pid}/fd")).map(|d| d.count()).unwrap_or(0)
+	std::fs::read_dir(format!("/proc/{pid}/fd")).map(|d| d.count()).unwrap_or(0)
 }
 
 fn socket_fds(pid: u32) -> usize {
-    std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .map(|d| {
-            d.filter_map(|x| x.ok())
-                .filter(|x| std::fs::read_link(x.path()).is_ok_and(|l| l.to_string_lossy().starts_with("socket:")))
-                .count()
-        })
-        .unwrap_or(0)
+	std::fs::read_dir(format!("/proc/{pid}/fd"))
+		.map(|d| {
+			d.filter_map(|x| x.ok())
+				.filter(|x| std::fs::read_link(x.path()).is_ok_and(|l| l.to_string_lossy().starts_with("socket:")))
+				.count()
+		})
+		.unwrap_or(0)
 }
 
 fn start_watch_raw(e: &Env) -> UnixStream {
-    let mut c = UnixStream::connect(e.socket()).unwrap();
-    let frame = serde_json::to_vec(
-        &serde_json::json!({"v": 1, "req": {"op": "watch", "as_": "claude", "conversation": null, "resume_token": null}}),
-    )
-    .unwrap();
-    c.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
-    c.write_all(&frame).unwrap();
-    c
+	let mut c = UnixStream::connect(e.socket()).unwrap();
+	let frame = serde_json::to_vec(
+		&serde_json::json!({"v": 1, "req": {"op": "watch", "as_": "claude", "conversation": null, "resume_token": null}}),
+	)
+	.unwrap();
+	c.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
+	c.write_all(&frame).unwrap();
+	c
 }
 
 #[test]
 fn half_closed_watchers_release_their_threads_and_sockets_every_round() {
-    let mut e = Env::new("heartbeat_ms = 50\nwrite_deadline_ms = 300\n");
-    e.start();
-    let pid = e.daemon.as_ref().unwrap().id();
-    std::thread::sleep(Duration::from_millis(300));
-    let (threads0, sockets0, fds0) = (thread_count(pid), socket_fds(pid), fd_count(pid));
-    let mut held = Vec::new();
-    for round in 0..3 {
-        for _ in 0..12 {
-            let c = start_watch_raw(&e);
-            // The client stops reading but keeps its write half open (Codex's probe).
-            c.shutdown(std::net::Shutdown::Read).unwrap();
-            held.push(c);
-        }
-        wait_for(&format!("round {round}: watchers gone"), Duration::from_secs(10), || e.status(None).watchers.is_empty());
-        wait_for(&format!("round {round}: threads back to baseline"), Duration::from_secs(5), || thread_count(pid) <= threads0);
-        wait_for(&format!("round {round}: sockets back to baseline"), Duration::from_secs(5), || socket_fds(pid) <= sockets0);
-        // SQLite keeps the database fds of closed reader connections for reuse while the writer
-        // holds its locks. They are bounded by the peak number of concurrent watchers (12 here),
-        // never by the cumulative number of watches (36 by the last round).
-        let total = fd_count(pid);
-        assert!(total <= fds0 + 12, "round {round}: {total} fds against baseline {fds0} with at most 12 concurrent watchers");
-    }
-    drop(held);
+	let mut e = Env::new("heartbeat_ms = 50\nwrite_deadline_ms = 300\n");
+	e.start();
+	let pid = e.daemon.as_ref().unwrap().id();
+	std::thread::sleep(Duration::from_millis(300));
+	let (threads0, sockets0, fds0) = (thread_count(pid), socket_fds(pid), fd_count(pid));
+	let mut held = Vec::new();
+	for round in 0..3 {
+		for _ in 0..12 {
+			let c = start_watch_raw(&e);
+			// The client stops reading but keeps its write half open (Codex's probe).
+			c.shutdown(std::net::Shutdown::Read).unwrap();
+			held.push(c);
+		}
+		wait_for(&format!("round {round}: watchers gone"), Duration::from_secs(10), || e.status(None).watchers.is_empty());
+		wait_for(&format!("round {round}: threads back to baseline"), Duration::from_secs(5), || thread_count(pid) <= threads0);
+		wait_for(&format!("round {round}: sockets back to baseline"), Duration::from_secs(5), || socket_fds(pid) <= sockets0);
+		// SQLite keeps the database fds of closed reader connections for reuse while the writer
+		// holds its locks. They are bounded by the peak number of concurrent watchers (12 here),
+		// never by the cumulative number of watches (36 by the last round).
+		let total = fd_count(pid);
+		assert!(total <= fds0 + 12, "round {round}: {total} fds against baseline {fds0} with at most 12 concurrent watchers");
+	}
+	drop(held);
 }
 
 /// Fills the store directly (synchronous off, daemon stopped) with `n` unacknowledged requests to
 /// claude whose summaries are long multi-byte text, so the inbox is far larger than one frame.
 fn backlog(e: &mut Env, n: usize) -> Vec<String> {
-    e.kill9();
-    let mut s = chatd::store::Store::open(&e.state().join("chat.db")).unwrap();
-    s.conn().execute_batch("PRAGMA synchronous = OFF").unwrap();
-    let summary = "滞".repeat(150);
-    let ids = (0..n)
-        .map(|i| {
-            s.send(&SendReq {
-                from: "codex".into(),
-                to: Some("claude".into()),
-                conversation: Some("backlog".into()),
-                kind: Kind::Request,
-                reply_to: None,
-                idempotency_key: format!("bl-{i}"),
-                summary: Some(format!("{i} {summary}")),
-                body: "b".into(),
-            })
-            .unwrap()
-            .id
-        })
-        .collect();
-    drop(s);
-    e.start();
-    ids
+	e.kill9();
+	let mut s = chatd::store::Store::open(&e.state().join("chat.db")).unwrap();
+	s.conn().execute_batch("PRAGMA synchronous = OFF").unwrap();
+	let summary = "滞".repeat(150);
+	let ids = (0..n)
+		.map(|i| {
+			s.send(&SendReq {
+				from: "codex".into(),
+				to: Some("claude".into()),
+				conversation: Some("backlog".into()),
+				kind: Kind::Request,
+				reply_to: None,
+				idempotency_key: format!("bl-{i}"),
+				summary: Some(format!("{i} {summary}")),
+				body: "b".into(),
+			})
+			.unwrap()
+			.id
+		})
+		.collect();
+	drop(s);
+	e.start();
+	ids
 }
 
 #[test]
 fn a_backlog_larger_than_one_frame_is_paged_consistently() {
-    let mut e = Env::new("heartbeat_ms = 300\n");
-    e.start();
-    let ids = backlog(&mut e, 6000);
-    // Snapshot pages carry the whole inbox in order, with a commit landing mid-snapshot.
-    let mut c = Client::connect(&e.socket(), Some(Duration::from_secs(20))).unwrap();
-    c.send(Request::Watch { as_: "claude".into(), conversation: None, resume_token: None, exclusive: false }).unwrap();
-    let Response::SnapshotBegin { head_seq, unacknowledged_total, .. } = c.recv().unwrap() else { panic!() };
-    assert_eq!(unacknowledged_total, 6000);
-    let late = e.send("codex", "claude", "backlog", Kind::Request, "late", "committed during the snapshot");
-    let mut got = Vec::new();
-    let mut pages = 0;
-    loop {
-        match c.recv().unwrap() {
-            Response::SnapshotPage { unacknowledged } => {
-                assert!(unacknowledged.len() <= chatd::proto::MAX_PAGE as usize);
-                got.extend(unacknowledged.into_iter().map(|m| m.id));
-                pages += 1;
-            }
-            Response::SnapshotEnd { head_seq: h, pages: p } => {
-                assert_eq!((h, p), (head_seq, pages));
-                break;
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-    assert_eq!(got, ids, "the snapshot at H is exactly the backlog, in order");
-    assert!(pages >= 30);
-    let (ev, _) = next_event(&mut c);
-    assert_eq!(ev.message_id.as_deref(), Some(late.as_str()), "the concurrent commit arrives as the first event after H");
-    drop(c);
-    // A reconnect replays everything still unacknowledged, including the late one.
-    let (_, snap) = open_watch(&e, "claude", None);
-    assert_eq!(snap.unacknowledged.len(), 6001);
-    assert_eq!(snap.total, 6001);
-    assert!(snap.pages >= 31);
-    // Status stays usable: bounded pages with totals and a continuation cursor.
-    let s = e.status(Some("claude"));
-    assert_eq!((s.unacknowledged.len(), s.unacknowledged_total), (200, 6001));
-    let next = s.next_unacknowledged_after.expect("a continuation cursor");
-    let Response::Status(s2) = e.call(Request::Status {
-        as_: Some("claude".into()),
-        conversation: None,
-        limit: 200,
-        unacknowledged_after: Some(next),
-        unanswered_after: None,
-    }) else {
-        panic!()
-    };
-    assert_eq!(s2.unacknowledged[0].id, ids[200]);
-    // The one-line wait still answers at once with the oldest.
-    let out = e.cli(&["wait", "--as", "claude", "--timeout", "10"], None);
-    assert!(stdout(&out).contains(&ids[0]));
-    let out = e.cli(&["status", "--as", "claude"], None);
-    assert_eq!(code(&out), 0);
-    assert!(stdout(&out).contains("of 6001"));
+	let mut e = Env::new("heartbeat_ms = 300\n");
+	e.start();
+	let ids = backlog(&mut e, 6000);
+	// Snapshot pages carry the whole inbox in order, with a commit landing mid-snapshot.
+	let mut c = Client::connect(&e.socket(), Some(Duration::from_secs(20))).unwrap();
+	c.send(Request::Watch { as_: "claude".into(), conversation: None, resume_token: None, exclusive: false }).unwrap();
+	let Response::SnapshotBegin { head_seq, unacknowledged_total, .. } = c.recv().unwrap() else { panic!() };
+	assert_eq!(unacknowledged_total, 6000);
+	let late = e.send("codex", "claude", "backlog", Kind::Request, "late", "committed during the snapshot");
+	let mut got = Vec::new();
+	let mut pages = 0;
+	loop {
+		match c.recv().unwrap() {
+			Response::SnapshotPage { unacknowledged } => {
+				assert!(unacknowledged.len() <= chatd::proto::MAX_PAGE as usize);
+				got.extend(unacknowledged.into_iter().map(|m| m.id));
+				pages += 1;
+			}
+			Response::SnapshotEnd { head_seq: h, pages: p } => {
+				assert_eq!((h, p), (head_seq, pages));
+				break;
+			}
+			other => panic!("{other:?}"),
+		}
+	}
+	assert_eq!(got, ids, "the snapshot at H is exactly the backlog, in order");
+	assert!(pages >= 30);
+	let (ev, _) = next_event(&mut c);
+	assert_eq!(ev.message_id.as_deref(), Some(late.as_str()), "the concurrent commit arrives as the first event after H");
+	drop(c);
+	// A reconnect replays everything still unacknowledged, including the late one.
+	let (_, snap) = open_watch(&e, "claude", None);
+	assert_eq!(snap.unacknowledged.len(), 6001);
+	assert_eq!(snap.total, 6001);
+	assert!(snap.pages >= 31);
+	// Status stays usable: bounded pages with totals and a continuation cursor.
+	let s = e.status(Some("claude"));
+	assert_eq!((s.unacknowledged.len(), s.unacknowledged_total), (200, 6001));
+	let next = s.next_unacknowledged_after.expect("a continuation cursor");
+	let Response::Status(s2) = e.call(Request::Status {
+		as_: Some("claude".into()),
+		conversation: None,
+		limit: 200,
+		unacknowledged_after: Some(next),
+		unanswered_after: None,
+	}) else {
+		panic!()
+	};
+	assert_eq!(s2.unacknowledged[0].id, ids[200]);
+	// The one-line wait still answers at once with the oldest.
+	let out = e.cli(&["wait", "--as", "claude", "--timeout", "10"], None);
+	assert!(stdout(&out).contains(&ids[0]));
+	let out = e.cli(&["status", "--as", "claude"], None);
+	assert_eq!(code(&out), 0);
+	assert!(stdout(&out).contains("of 6001"));
 }
 
 #[test]
 fn restoring_a_backup_invalidates_every_earlier_resume_token() {
-    let mut e = Env::standard();
-    e.start();
-    e.send("codex", "claude", "r", Kind::Info, "r1", "before the backup");
-    let (_, snap) = open_watch(&e, "claude", None);
-    let within = snap.resume_token;
-    let backup = e.dir.join("bk.db");
-    assert!(matches!(e.call(Request::Backup { path: backup.to_string_lossy().into_owned() }), Response::BackedUp { .. }));
-    for i in 0..5 {
-        e.send("codex", "claude", "r", Kind::Info, &format!("after-{i}"), "after the backup");
-    }
-    let (_, snap) = open_watch(&e, "claude", None);
-    let beyond = snap.resume_token;
-    // Restore refuses while the daemon holds the store.
-    let mut cmd = Command::new(DAEMON);
-    e.envs(&mut cmd);
-    let out = cmd.args(["restore", &backup.to_string_lossy()]).stderr(Stdio::piped()).output().unwrap();
-    assert!(!out.status.success());
-    e.term();
-    let mut cmd = Command::new(DAEMON);
-    e.envs(&mut cmd);
-    let out = cmd.args(["restore", &backup.to_string_lossy()]).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    e.start();
-    // The restored branch grows past both old positions.
-    for i in 0..10 {
-        e.send("codex", "claude", "r", Kind::Info, &format!("restored-{i}"), "on the restored branch");
-    }
-    for token in [within, beyond] {
-        let (_, snap) = open_watch(&e, "claude", Some(token));
-        assert!(snap.resynchronized.as_deref().unwrap_or("").contains("another store"), "{:?}", snap.resynchronized);
-        assert_eq!(snap.unacknowledged.len(), 11, "the authoritative restored inbox: 1 + 10");
-    }
-    let kept: Vec<_> = std::fs::read_dir(e.state())
-        .unwrap()
-        .filter_map(|d| d.ok())
-        .filter(|d| d.file_name().to_string_lossy().starts_with("replaced-"))
-        .collect();
-    assert_eq!(kept.len(), 1);
-    assert!(kept[0].path().join("chat.db").exists(), "the replaced database is kept");
+	let mut e = Env::standard();
+	e.start();
+	e.send("codex", "claude", "r", Kind::Info, "r1", "before the backup");
+	let (_, snap) = open_watch(&e, "claude", None);
+	let within = snap.resume_token;
+	let backup = e.dir.join("bk.db");
+	assert!(matches!(e.call(Request::Backup { path: backup.to_string_lossy().into_owned() }), Response::BackedUp { .. }));
+	for i in 0..5 {
+		e.send("codex", "claude", "r", Kind::Info, &format!("after-{i}"), "after the backup");
+	}
+	let (_, snap) = open_watch(&e, "claude", None);
+	let beyond = snap.resume_token;
+	// Restore refuses while the daemon holds the store.
+	let mut cmd = Command::new(DAEMON);
+	e.envs(&mut cmd);
+	let out = cmd.args(["restore", &backup.to_string_lossy()]).stderr(Stdio::piped()).output().unwrap();
+	assert!(!out.status.success());
+	e.term();
+	let mut cmd = Command::new(DAEMON);
+	e.envs(&mut cmd);
+	let out = cmd.args(["restore", &backup.to_string_lossy()]).output().unwrap();
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	e.start();
+	// The restored branch grows past both old positions.
+	for i in 0..10 {
+		e.send("codex", "claude", "r", Kind::Info, &format!("restored-{i}"), "on the restored branch");
+	}
+	for token in [within, beyond] {
+		let (_, snap) = open_watch(&e, "claude", Some(token));
+		assert!(snap.resynchronized.as_deref().unwrap_or("").contains("another store"), "{:?}", snap.resynchronized);
+		assert_eq!(snap.unacknowledged.len(), 11, "the authoritative restored inbox: 1 + 10");
+	}
+	let kept: Vec<_> = std::fs::read_dir(e.state())
+		.unwrap()
+		.filter_map(|d| d.ok())
+		.filter(|d| d.file_name().to_string_lossy().starts_with("replaced-"))
+		.collect();
+	assert_eq!(kept.len(), 1);
+	assert!(kept[0].path().join("chat.db").exists(), "the replaced database is kept");
 }
 
 #[test]
 fn a_helper_that_escaped_the_group_cannot_stall_the_adapter() {
-    let mut e = Env::standard();
-    e.start();
-    let gpid = e.dir.join("escaped");
-    // setsid leaves the process group; the helper keeps stderr open for 30 s.
-    let exe = fake_codex(
-        &e,
-        &format!("setsid sh -c 'echo $$ > {}; exec sleep 30' & sleep 0.2; echo 'leader failed' >&2; exit 3", gpid.display()),
-    );
-    register(&e, &exe, "s1");
-    let a = e.send("claude", "codex", "c", Kind::Request, "esc1", "first");
-    wait_for("the leader's failure to be recorded", Duration::from_secs(5), || {
-        attempts(&e, &a).first().map(String::as_str) == Some("failed")
-    });
-    let s = e.status(None);
-    let at = s.uncertain_or_failed_submissions.iter().find(|x| x.message_id == a).unwrap();
-    assert_eq!(at.exit_code, Some(3));
-    assert!(at.error.as_deref().unwrap_or("").contains("leader failed"));
-    let ok = fake_codex(&e, "exit 0");
-    register(&e, &ok, "s2");
-    let b = e.send("claude", "codex", "c", Kind::Request, "esc2", "second");
-    wait_for("the next delivery", Duration::from_secs(5), || attempts(&e, &b) == vec!["submitted"]);
-    if let Ok(p) = std::fs::read_to_string(&gpid) {
-        unsafe { libc::kill(p.trim().parse().unwrap(), libc::SIGKILL) };
-    }
+	let mut e = Env::standard();
+	e.start();
+	let gpid = e.dir.join("escaped");
+	// setsid leaves the process group; the helper keeps stderr open for 30 s.
+	let exe = fake_codex(
+		&e,
+		&format!("setsid sh -c 'echo $$ > {}; exec sleep 30' & sleep 0.2; echo 'leader failed' >&2; exit 3", gpid.display()),
+	);
+	register(&e, &exe, "s1");
+	let a = e.send("claude", "codex", "c", Kind::Request, "esc1", "first");
+	wait_for("the leader's failure to be recorded", Duration::from_secs(5), || {
+		attempts(&e, &a).first().map(String::as_str) == Some("failed")
+	});
+	let s = e.status(None);
+	let at = s.uncertain_or_failed_submissions.iter().find(|x| x.message_id == a).unwrap();
+	assert_eq!(at.exit_code, Some(3));
+	assert!(at.error.as_deref().unwrap_or("").contains("leader failed"));
+	let ok = fake_codex(&e, "exit 0");
+	register(&e, &ok, "s2");
+	let b = e.send("claude", "codex", "c", Kind::Request, "esc2", "second");
+	wait_for("the next delivery", Duration::from_secs(5), || attempts(&e, &b) == vec!["submitted"]);
+	if let Ok(p) = std::fs::read_to_string(&gpid) {
+		unsafe { libc::kill(p.trim().parse().unwrap(), libc::SIGKILL) };
+	}
 }
 
 #[test]
 fn sigterm_also_stops_the_adapters_helpers() {
-    let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 20000\n");
-    e.start();
-    let gpid = e.dir.join("helper");
-    let exe = fake_codex(&e, &format!("sleep 30 & echo $! > {}; wait", gpid.display()));
-    register(&e, &exe, "s1");
-    let id = e.send("claude", "codex", "c", Kind::Request, "termh", "t");
-    wait_for("the helper to start", Duration::from_secs(5), || gpid.exists());
-    assert!(e.term().success());
-    let g: i32 = std::fs::read_to_string(&gpid).unwrap().trim().parse().unwrap();
-    wait_for("the helper to be gone", Duration::from_secs(2), || unsafe { libc::kill(g, 0) } != 0);
-    e.start();
-    assert_eq!(attempts(&e, &id), vec!["uncertain"]);
+	let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 20000\n");
+	e.start();
+	let gpid = e.dir.join("helper");
+	let exe = fake_codex(&e, &format!("sleep 30 & echo $! > {}; wait", gpid.display()));
+	register(&e, &exe, "s1");
+	let id = e.send("claude", "codex", "c", Kind::Request, "termh", "t");
+	wait_for("the helper to start", Duration::from_secs(5), || gpid.exists());
+	assert!(e.term().success());
+	let g: i32 = std::fs::read_to_string(&gpid).unwrap().trim().parse().unwrap();
+	wait_for("the helper to be gone", Duration::from_secs(2), || unsafe { libc::kill(g, 0) } != 0);
+	e.start();
+	assert_eq!(attempts(&e, &id), vec!["uncertain"]);
 }
 
 // ---------------------------------------------------------------- restore failure atomicity
 
 fn facts(e: &Env) -> (String, i64) {
-    let c = rusqlite::Connection::open_with_flags(e.state().join("chat.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let id: String = c.query_row("SELECT value FROM meta WHERE key = 'store_id'", [], |r| r.get(0)).unwrap();
-    let n: i64 = c.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)).unwrap();
-    (id, n)
+	let c = rusqlite::Connection::open_with_flags(e.state().join("chat.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+	let id: String = c.query_row("SELECT value FROM meta WHERE key = 'store_id'", [], |r| r.get(0)).unwrap();
+	let n: i64 = c.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)).unwrap();
+	(id, n)
 }
 
 /// A store with 1 message in its backup and 3 live messages; the daemon is SIGKILLed so a WAL is
 /// present at the active path. Returns (backup path, backup's store id, live facts).
 fn restore_fixture(e: &mut Env) -> (PathBuf, String, (String, i64)) {
-    e.start();
-    e.send("codex", "claude", "r", Kind::Info, "b1", "in the backup");
-    let backup = e.dir.join("bk.db");
-    assert!(matches!(e.call(Request::Backup { path: backup.to_string_lossy().into_owned() }), Response::BackedUp { .. }));
-    e.send("codex", "claude", "r", Kind::Info, "b2", "after the backup");
-    e.send("codex", "claude", "r", Kind::Info, "b3", "after the backup");
-    e.kill9();
-    assert!(e.state().join("chat.db-wal").exists(), "the live store has a WAL");
-    let backup_id: String =
-        rusqlite::Connection::open(&backup).unwrap().query_row("SELECT value FROM meta WHERE key = 'store_id'", [], |r| r.get(0)).unwrap();
-    let live = facts(e);
-    assert_eq!(live.1, 3);
-    (backup, backup_id, live)
+	e.start();
+	e.send("codex", "claude", "r", Kind::Info, "b1", "in the backup");
+	let backup = e.dir.join("bk.db");
+	assert!(matches!(e.call(Request::Backup { path: backup.to_string_lossy().into_owned() }), Response::BackedUp { .. }));
+	e.send("codex", "claude", "r", Kind::Info, "b2", "after the backup");
+	e.send("codex", "claude", "r", Kind::Info, "b3", "after the backup");
+	e.kill9();
+	assert!(e.state().join("chat.db-wal").exists(), "the live store has a WAL");
+	let backup_id: String =
+		rusqlite::Connection::open(&backup).unwrap().query_row("SELECT value FROM meta WHERE key = 'store_id'", [], |r| r.get(0)).unwrap();
+	let live = facts(e);
+	assert_eq!(live.1, 3);
+	(backup, backup_id, live)
 }
 
 fn run_restore(e: &Env, backup: &Path, fault: Option<&str>) -> Output {
-    let mut cmd = Command::new(DAEMON);
-    e.envs(&mut cmd);
-    if let Some(f) = fault {
-        cmd.env("CHATD_TEST_FAULT", f);
-    }
-    cmd.args(["restore", &backup.to_string_lossy()]).stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
+	let mut cmd = Command::new(DAEMON);
+	e.envs(&mut cmd);
+	if let Some(f) = fault {
+		cmd.env("CHATD_TEST_FAULT", f);
+	}
+	cmd.args(["restore", &backup.to_string_lossy()]).stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
 }
 
 fn no_restore_leftovers(e: &Env) {
-    assert!(!e.state().join(chatd::restore::MARKER).exists());
-    assert!(!e.state().join(chatd::restore::CANDIDATE_DIR).exists());
+	assert!(!e.state().join(chatd::restore::MARKER).exists());
+	assert!(!e.state().join(chatd::restore::CANDIDATE_DIR).exists());
 }
 
 #[test]
 fn a_failed_identity_update_leaves_the_active_store_untouched() {
-    let mut e = Env::standard();
-    let (backup, _, live) = restore_fixture(&mut e);
-    // Codex's probe: the backup refuses the store_id update (integrity and schema stay valid).
-    rusqlite::Connection::open(&backup)
-        .unwrap()
-        .execute_batch("CREATE TRIGGER t BEFORE UPDATE ON meta WHEN old.key = 'store_id' BEGIN SELECT RAISE(ABORT, 'injected identity update failure'); END;")
-        .unwrap();
-    let out = run_restore(&e, &backup, None);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("injected identity update failure"));
-    assert_eq!(facts(&e), live, "the active store is unchanged");
-    no_restore_leftovers(&e);
-    e.start();
-    assert_eq!(e.status(None).store_id, live.0);
+	let mut e = Env::standard();
+	let (backup, _, live) = restore_fixture(&mut e);
+	// Codex's probe: the backup refuses the store_id update (integrity and schema stay valid).
+	rusqlite::Connection::open(&backup)
+		.unwrap()
+		.execute_batch(
+			"CREATE TRIGGER t BEFORE UPDATE ON meta WHEN old.key = 'store_id' BEGIN SELECT RAISE(ABORT, 'injected identity update failure'); END;",
+		)
+		.unwrap();
+	let out = run_restore(&e, &backup, None);
+	assert_eq!(out.status.code(), Some(1));
+	assert!(String::from_utf8_lossy(&out.stderr).contains("injected identity update failure"));
+	assert_eq!(facts(&e), live, "the active store is unchanged");
+	no_restore_leftovers(&e);
+	e.start();
+	assert_eq!(e.status(None).store_id, live.0);
 }
 
 #[test]
 fn an_unusable_backup_leaves_the_active_store_untouched() {
-    let mut e = Env::standard();
-    let (_, _, live) = restore_fixture(&mut e);
-    let junk = e.dir.join("junk.db");
-    std::fs::write(&junk, b"not a database at all").unwrap();
-    assert_eq!(run_restore(&e, &junk, None).status.code(), Some(1));
-    let empty = e.dir.join("empty.db");
-    rusqlite::Connection::open(&empty).unwrap().execute_batch("CREATE TABLE x (y)").unwrap();
-    assert_eq!(run_restore(&e, &empty, None).status.code(), Some(1));
-    assert_eq!(facts(&e), live);
-    no_restore_leftovers(&e);
+	let mut e = Env::standard();
+	let (_, _, live) = restore_fixture(&mut e);
+	let junk = e.dir.join("junk.db");
+	std::fs::write(&junk, b"not a database at all").unwrap();
+	assert_eq!(run_restore(&e, &junk, None).status.code(), Some(1));
+	let empty = e.dir.join("empty.db");
+	rusqlite::Connection::open(&empty).unwrap().execute_batch("CREATE TABLE x (y)").unwrap();
+	assert_eq!(run_restore(&e, &empty, None).status.code(), Some(1));
+	assert_eq!(facts(&e), live);
+	no_restore_leftovers(&e);
 }
 
 #[test]
 fn a_crash_before_the_commit_point_leaves_the_old_store_and_a_retry_works() {
-    for point in ["after_copy", "after_identity"] {
-        let mut e = Env::standard();
-        let (backup, backup_id, live) = restore_fixture(&mut e);
-        assert_eq!(run_restore(&e, &backup, Some(point)).status.code(), Some(86), "{point}");
-        assert_eq!(facts(&e), live, "{point}: the active store is untouched");
-        e.start(); // recovery discards the unpublished candidate
-        assert_eq!(e.status(None).store_id, live.0, "{point}");
-        no_restore_leftovers(&e);
-        e.term();
-        assert!(run_restore(&e, &backup, None).status.success(), "{point}: a later restore works");
-        let (id, n) = facts(&e);
-        assert_eq!(n, 1);
-        assert!(id != live.0 && id != backup_id, "{point}: fresh identity");
-    }
+	for point in ["after_copy", "after_identity"] {
+		let mut e = Env::standard();
+		let (backup, backup_id, live) = restore_fixture(&mut e);
+		assert_eq!(run_restore(&e, &backup, Some(point)).status.code(), Some(86), "{point}");
+		assert_eq!(facts(&e), live, "{point}: the active store is untouched");
+		e.start(); // recovery discards the unpublished candidate
+		assert_eq!(e.status(None).store_id, live.0, "{point}");
+		no_restore_leftovers(&e);
+		e.term();
+		assert!(run_restore(&e, &backup, None).status.success(), "{point}: a later restore works");
+		let (id, n) = facts(&e);
+		assert_eq!(n, 1);
+		assert!(id != live.0 && id != backup_id, "{point}: fresh identity");
+	}
 }
 
 #[test]
 fn a_crash_after_the_commit_point_rolls_forward_to_the_fresh_identity() {
-    for point in ["after_marker", "after_move_wal", "before_publish", "before_marker_removal"] {
-        let mut e = Env::standard();
-        let (backup, backup_id, live) = restore_fixture(&mut e);
-        assert_eq!(run_restore(&e, &backup, Some(point)).status.code(), Some(86), "{point}");
-        e.start(); // recovery finishes the activation
-        let s = e.status(None);
-        assert!(s.store_id != live.0 && s.store_id != backup_id, "{point}: never the old identity on restored content");
-        assert_eq!(s.unacknowledged.len(), 1, "{point}: the complete restored store");
-        no_restore_leftovers(&e);
-        e.term();
-        let kept: Vec<PathBuf> = std::fs::read_dir(e.state())
-            .unwrap()
-            .filter_map(|d| d.ok())
-            .map(|d| d.path())
-            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("replaced-"))
-            .collect();
-        assert_eq!(kept.len(), 1, "{point}");
-        assert!(kept[0].join("chat.db").exists() && kept[0].join("chat.db-wal").exists(), "{point}: the old store and its WAL are kept");
-        let old = rusqlite::Connection::open(kept[0].join("chat.db")).unwrap();
-        let n: i64 = old.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 3, "{point}: the kept store opens with its own WAL intact");
-    }
+	for point in ["after_marker", "after_move_wal", "before_publish", "before_marker_removal"] {
+		let mut e = Env::standard();
+		let (backup, backup_id, live) = restore_fixture(&mut e);
+		assert_eq!(run_restore(&e, &backup, Some(point)).status.code(), Some(86), "{point}");
+		e.start(); // recovery finishes the activation
+		let s = e.status(None);
+		assert!(s.store_id != live.0 && s.store_id != backup_id, "{point}: never the old identity on restored content");
+		assert_eq!(s.unacknowledged.len(), 1, "{point}: the complete restored store");
+		no_restore_leftovers(&e);
+		e.term();
+		let kept: Vec<PathBuf> = std::fs::read_dir(e.state())
+			.unwrap()
+			.filter_map(|d| d.ok())
+			.map(|d| d.path())
+			.filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("replaced-"))
+			.collect();
+		assert_eq!(kept.len(), 1, "{point}");
+		assert!(kept[0].join("chat.db").exists() && kept[0].join("chat.db-wal").exists(), "{point}: the old store and its WAL are kept");
+		let old = rusqlite::Connection::open(kept[0].join("chat.db")).unwrap();
+		let n: i64 = old.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)).unwrap();
+		assert_eq!(n, 3, "{point}: the kept store opens with its own WAL intact");
+	}
 }
 
 #[test]
 fn an_unreadable_restore_marker_refuses_startup() {
-    let mut e = Env::standard();
-    e.start();
-    e.kill9();
-    std::fs::write(e.state().join(chatd::restore::MARKER), b"{ not json").unwrap();
-    assert!(e.try_start(false).is_none());
-    assert!(!e.daemon.as_mut().unwrap().wait().unwrap().success());
+	let mut e = Env::standard();
+	e.start();
+	e.kill9();
+	std::fs::write(e.state().join(chatd::restore::MARKER), b"{ not json").unwrap();
+	assert!(e.try_start(false).is_none());
+	assert!(!e.daemon.as_mut().unwrap().wait().unwrap().success());
 }
 
 // ---------------------------------------------------------------- bounded stderr drain
 
 #[test]
 fn a_continuous_stderr_flood_cannot_defeat_the_deadline() {
-    let mut e = Env::standard(); // adapter_timeout_ms = 1500
-    e.start();
-    let exe = fake_codex(&e, "exec yes flood >&2");
-    register(&e, &exe, "s1");
-    let id = e.send("claude", "codex", "c", Kind::Request, "flood", "f");
-    let t0 = Instant::now();
-    wait_for("the deadline under a flood", Duration::from_secs(6), || attempts(&e, &id) == vec!["uncertain"]);
-    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
-    let s = e.status(None);
-    let a = s.uncertain_or_failed_submissions.iter().find(|a| a.message_id == id).unwrap();
-    assert!(a.error.as_deref().unwrap_or("").contains("flood"), "the output is recorded: {:?}", a.error);
-    let ok = fake_codex(&e, "exit 0");
-    register(&e, &ok, "s2");
-    let next = e.send("claude", "codex", "c", Kind::Request, "after-flood", "n");
-    wait_for("the next delivery", Duration::from_secs(5), || attempts(&e, &next) == vec!["submitted"]);
+	let mut e = Env::standard(); // adapter_timeout_ms = 1500
+	e.start();
+	let exe = fake_codex(&e, "exec yes flood >&2");
+	register(&e, &exe, "s1");
+	let id = e.send("claude", "codex", "c", Kind::Request, "flood", "f");
+	let t0 = Instant::now();
+	wait_for("the deadline under a flood", Duration::from_secs(6), || attempts(&e, &id) == vec!["uncertain"]);
+	assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+	let s = e.status(None);
+	let a = s.uncertain_or_failed_submissions.iter().find(|a| a.message_id == id).unwrap();
+	assert!(a.error.as_deref().unwrap_or("").contains("flood"), "the output is recorded: {:?}", a.error);
+	let ok = fake_codex(&e, "exit 0");
+	register(&e, &ok, "s2");
+	let next = e.send("claude", "codex", "c", Kind::Request, "after-flood", "n");
+	wait_for("the next delivery", Duration::from_secs(5), || attempts(&e, &next) == vec!["submitted"]);
 }
 
 #[test]
 fn a_continuous_stderr_flood_cannot_delay_shutdown() {
-    let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 20000\n");
-    e.start();
-    let exe = fake_codex(&e, "exec yes flood >&2");
-    register(&e, &exe, "s1");
-    let id = e.send("claude", "codex", "c", Kind::Request, "flood-term", "f");
-    wait_for("the flood to start", Duration::from_secs(5), || e.dir.join("pids").exists());
-    std::thread::sleep(Duration::from_millis(300));
-    let t0 = Instant::now();
-    assert!(e.term().success());
-    assert!(t0.elapsed() < Duration::from_secs(6), "{:?}", t0.elapsed());
-    e.start();
-    assert_eq!(attempts(&e, &id), vec!["uncertain"]);
+	let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 20000\n");
+	e.start();
+	let exe = fake_codex(&e, "exec yes flood >&2");
+	register(&e, &exe, "s1");
+	let id = e.send("claude", "codex", "c", Kind::Request, "flood-term", "f");
+	wait_for("the flood to start", Duration::from_secs(5), || e.dir.join("pids").exists());
+	std::thread::sleep(Duration::from_millis(300));
+	let t0 = Instant::now();
+	assert!(e.term().success());
+	assert!(t0.elapsed() < Duration::from_secs(6), "{:?}", t0.elapsed());
+	e.start();
+	assert_eq!(attempts(&e, &id), vec!["uncertain"]);
 }
 
 // ---- plan 0002: pair ergonomics ----
 
 impl Env {
-    fn pending_files(&self) -> Vec<PathBuf> {
-        match std::fs::read_dir(self.dir.join("ctl").join("pending")) {
-            Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
-            Err(_) => vec![],
-        }
-    }
+	fn pending_files(&self) -> Vec<PathBuf> {
+		match std::fs::read_dir(self.dir.join("ctl").join("pending")) {
+			Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
+			Err(_) => vec![],
+		}
+	}
 
-    fn cli_with(&self, envs: &[(&str, &str)], args: &[&str]) -> Output {
-        let mut cmd = Command::new(CLI);
-        self.envs(&mut cmd);
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        cmd.spawn().unwrap().wait_with_output().unwrap()
-    }
+	fn cli_with(&self, envs: &[(&str, &str)], args: &[&str]) -> Output {
+		let mut cmd = Command::new(CLI);
+		self.envs(&mut cmd);
+		for (k, v) in envs {
+			cmd.env(k, v);
+		}
+		cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+		cmd.spawn().unwrap().wait_with_output().unwrap()
+	}
 }
 
 fn stderr(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
+	String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
 fn key_of(o: &Output) -> String {
-    let out = stdout(o);
-    out.split("key ").nth(1).unwrap_or_else(|| panic!("no key in {out}")).split([',', ')']).next().unwrap().to_string()
+	let out = stdout(o);
+	out.split("key ").nth(1).unwrap_or_else(|| panic!("no key in {out}")).split([',', ')']).next().unwrap().to_string()
 }
 
 #[test]
 fn a_send_without_a_key_stores_one_and_clears_it_on_receipt() {
-    let mut e = Env::standard();
-    e.start();
-    let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c"];
-    let first = e.cli(&args, Some("same body"));
-    assert_eq!(code(&first), 0, "{}", stderr(&first));
-    assert!(e.pending_files().is_empty(), "the record is cleared once the receipt is printed");
-    let second = e.cli(&args, Some("same body"));
-    assert_eq!(code(&second), 0);
-    assert_ne!(key_of(&first), key_of(&second), "a delivered send is not replayed by an identical later one");
-    assert!(!stdout(&second).contains("already stored"));
+	let mut e = Env::standard();
+	e.start();
+	let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c"];
+	let first = e.cli(&args, Some("same body"));
+	assert_eq!(code(&first), 0, "{}", stderr(&first));
+	assert!(e.pending_files().is_empty(), "the record is cleared once the receipt is printed");
+	let second = e.cli(&args, Some("same body"));
+	assert_eq!(code(&second), 0);
+	assert_ne!(key_of(&first), key_of(&second), "a delivered send is not replayed by an identical later one");
+	assert!(!stdout(&second).contains("already stored"));
 }
 
 #[test]
 fn a_lost_receipt_is_retried_with_the_same_key_and_stores_once() {
-    let mut e = Env::standard();
-    let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--summary", "s"];
-    let down = e.cli(&args, Some("body"));
-    assert_eq!(code(&down), 3);
-    let files = e.pending_files();
-    assert_eq!(files.len(), 1, "the key is stored before dispatch");
-    let stored = std::fs::read_to_string(&files[0]).unwrap().trim().to_string();
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777, 0o600);
-    e.start();
-    let retry = e.cli(&args, Some("body"));
-    assert_eq!(code(&retry), 0, "{}", stderr(&retry));
-    assert_eq!(key_of(&retry), stored);
-    assert!(stderr(&retry).contains("reusing the pending key"));
-    assert!(e.pending_files().is_empty());
-    assert_eq!(e.status(Some("codex")).unacknowledged.len(), 1);
+	let mut e = Env::standard();
+	let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--summary", "s"];
+	let down = e.cli(&args, Some("body"));
+	assert_eq!(code(&down), 3);
+	let files = e.pending_files();
+	assert_eq!(files.len(), 1, "the key is stored before dispatch");
+	let stored = std::fs::read_to_string(&files[0]).unwrap().trim().to_string();
+	use std::os::unix::fs::PermissionsExt;
+	assert_eq!(std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777, 0o600);
+	e.start();
+	let retry = e.cli(&args, Some("body"));
+	assert_eq!(code(&retry), 0, "{}", stderr(&retry));
+	assert_eq!(key_of(&retry), stored);
+	assert!(stderr(&retry).contains("reusing the pending key"));
+	assert!(e.pending_files().is_empty());
+	assert_eq!(e.status(Some("codex")).unacknowledged.len(), 1);
 }
 
 #[test]
 fn any_changed_field_gets_its_own_pending_key() {
-    let e = Env::standard();
-    let base = ["send", "--as", "claude", "--to", "codex", "--conversation", "c"];
-    e.cli(&base, Some("one"));
-    e.cli(&base, Some("two"));
-    e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--kind", "info"], Some("one"));
-    e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--summary", "x"], Some("one"));
-    e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "d"], Some("one"));
-    assert_eq!(e.pending_files().len(), 5, "no two different requests share a key");
+	let e = Env::standard();
+	let base = ["send", "--as", "claude", "--to", "codex", "--conversation", "c"];
+	e.cli(&base, Some("one"));
+	e.cli(&base, Some("two"));
+	e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--kind", "info"], Some("one"));
+	e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--summary", "x"], Some("one"));
+	e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "d"], Some("one"));
+	assert_eq!(e.pending_files().len(), 5, "no two different requests share a key");
 }
 
 #[test]
 fn an_explicit_key_is_untouched_and_a_corrupt_record_refuses_the_send() {
-    let mut e = Env::standard();
-    e.start();
-    let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "mine"];
-    assert_eq!(code(&e.cli(&args, Some("x"))), 0);
-    assert!(e.pending_files().is_empty());
-    let down = Env::standard();
-    down.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c"], Some("x"));
-    let file = down.pending_files().pop().unwrap();
-    std::fs::write(&file, "garbage!\n").unwrap();
-    let out = down.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c"], Some("x"));
-    assert_eq!(code(&out), 5);
-    assert!(stderr(&out).contains("nothing was sent"), "{}", stderr(&out));
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "garbage!\n");
+	let mut e = Env::standard();
+	e.start();
+	let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "mine"];
+	assert_eq!(code(&e.cli(&args, Some("x"))), 0);
+	assert!(e.pending_files().is_empty());
+	let down = Env::standard();
+	down.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c"], Some("x"));
+	let file = down.pending_files().pop().unwrap();
+	std::fs::write(&file, "garbage!\n").unwrap();
+	let out = down.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c"], Some("x"));
+	assert_eq!(code(&out), 5);
+	assert!(stderr(&out).contains("nothing was sent"), "{}", stderr(&out));
+	assert_eq!(std::fs::read_to_string(&file).unwrap(), "garbage!\n");
 }
 
 #[test]
 fn a_reply_without_a_key_is_retry_safe_too() {
-    let mut e = Env::standard();
-    e.start();
-    let id = e.send("codex", "claude", "c", Kind::Request, "q", "question");
-    let reply = e.cli(&["reply", "--as", "claude", "--to-message", &id, "--final"], Some("answer"));
-    assert_eq!(code(&reply), 0, "{}", stderr(&reply));
-    assert!(e.pending_files().is_empty());
-    assert_eq!(e.status(Some("claude")).unanswered.len(), 0);
+	let mut e = Env::standard();
+	e.start();
+	let id = e.send("codex", "claude", "c", Kind::Request, "q", "question");
+	let reply = e.cli(&["reply", "--as", "claude", "--to-message", &id, "--final"], Some("answer"));
+	assert_eq!(code(&reply), 0, "{}", stderr(&reply));
+	assert!(e.pending_files().is_empty());
+	assert_eq!(e.status(Some("claude")).unanswered.len(), 0);
 }
 
 #[test]
 fn take_prints_the_body_then_acknowledges() {
-    let mut e = Env::standard();
-    e.start();
-    let id = e.send("codex", "claude", "c", Kind::Request, "t", "take me");
-    let out = e.cli(&["take", "--as", "claude", "--id", &id], None);
-    assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert!(stdout(&out).contains("take me") && stdout(&out).contains("not acknowledged"), "{}", stdout(&out));
-    assert!(stderr(&out).contains("acknowledged 1 (already 0)"));
-    assert!(e.status(Some("claude")).unacknowledged.is_empty());
-    let again = e.cli(&["take", "--as", "claude", "--id", &id], None);
-    assert_eq!(code(&again), 0);
-    assert!(stdout(&again).contains("take me"));
-    assert!(stderr(&again).contains("acknowledged 0 (already 1)"));
+	let mut e = Env::standard();
+	e.start();
+	let id = e.send("codex", "claude", "c", Kind::Request, "t", "take me");
+	let out = e.cli(&["take", "--as", "claude", "--id", &id], None);
+	assert_eq!(code(&out), 0, "{}", stderr(&out));
+	assert!(stdout(&out).contains("take me") && stdout(&out).contains("not acknowledged"), "{}", stdout(&out));
+	assert!(stderr(&out).contains("acknowledged 1 (already 0)"));
+	assert!(e.status(Some("claude")).unacknowledged.is_empty());
+	let again = e.cli(&["take", "--as", "claude", "--id", &id], None);
+	assert_eq!(code(&again), 0);
+	assert!(stdout(&again).contains("take me"));
+	assert!(stderr(&again).contains("acknowledged 0 (already 1)"));
 }
 
 #[test]
 fn take_does_not_acknowledge_when_the_body_cannot_be_written() {
-    let mut e = Env::standard();
-    e.start();
-    let id = e.send("codex", "claude", "c", Kind::Request, "t2", "unseen");
-    let mut cmd = Command::new(CLI);
-    e.envs(&mut cmd);
-    let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
-    let out = cmd.args(["take", "--as", "claude", "--id", &id]).stdin(Stdio::null()).stdout(full).stderr(Stdio::piped()).output().unwrap();
-    assert_ne!(code(&out), 0);
-    assert!(stderr(&out).contains("not acknowledged"), "{}", stderr(&out));
-    assert_eq!(e.status(Some("claude")).unacknowledged.len(), 1, "the message stays unacknowledged");
+	let mut e = Env::standard();
+	e.start();
+	let id = e.send("codex", "claude", "c", Kind::Request, "t2", "unseen");
+	let mut cmd = Command::new(CLI);
+	e.envs(&mut cmd);
+	let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+	let out = cmd.args(["take", "--as", "claude", "--id", &id]).stdin(Stdio::null()).stdout(full).stderr(Stdio::piped()).output().unwrap();
+	assert_ne!(code(&out), 0);
+	assert!(stderr(&out).contains("not acknowledged"), "{}", stderr(&out));
+	assert_eq!(e.status(Some("claude")).unacknowledged.len(), 1, "the message stays unacknowledged");
 }
 
 #[test]
 fn the_participant_defaults_from_chatd_as_and_an_explicit_flag_wins() {
-    let mut e = Env::standard();
-    e.start();
-    let id = e.send("codex", "claude", "c", Kind::Request, "env", "for claude");
-    let by_env = e.cli_with(&[("CHATD_AS", "claude")], &["receive", "--id", &id]);
-    assert_eq!(code(&by_env), 0, "{}", stderr(&by_env));
-    assert!(stdout(&by_env).contains("for claude"));
-    let unknown = e.cli_with(&[("CHATD_AS", "nobody")], &["receive", "--id", &id]);
-    assert_ne!(code(&unknown), 0, "the env value is used, and an unknown participant is refused");
-    let flag_wins = e.cli_with(&[("CHATD_AS", "nobody")], &["receive", "--as", "claude", "--id", &id]);
-    assert_eq!(code(&flag_wins), 0);
-    let missing = e.cli(&["receive", "--id", &id], None);
-    assert_eq!(code(&missing), 2, "with neither, the argument is still required");
+	let mut e = Env::standard();
+	e.start();
+	let id = e.send("codex", "claude", "c", Kind::Request, "env", "for claude");
+	let by_env = e.cli_with(&[("CHATD_AS", "claude")], &["receive", "--id", &id]);
+	assert_eq!(code(&by_env), 0, "{}", stderr(&by_env));
+	assert!(stdout(&by_env).contains("for claude"));
+	let unknown = e.cli_with(&[("CHATD_AS", "nobody")], &["receive", "--id", &id]);
+	assert_ne!(code(&unknown), 0, "the env value is used, and an unknown participant is refused");
+	let flag_wins = e.cli_with(&[("CHATD_AS", "nobody")], &["receive", "--as", "claude", "--id", &id]);
+	assert_eq!(code(&flag_wins), 0);
+	let missing = e.cli(&["receive", "--id", &id], None);
+	assert_eq!(code(&missing), 2, "with neither, the argument is still required");
 }
 
 #[test]
 fn an_untimed_follow_outlives_the_old_deadline_and_a_daemon_restart() {
-    let mut e = Env::standard();
-    e.start();
-    let mut cmd = Command::new(CLI);
-    e.envs(&mut cmd);
-    let mut follower = cmd.args(["wait", "--as", "claude", "--follow"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
-    std::thread::sleep(Duration::from_millis(800));
-    assert!(follower.try_wait().unwrap().is_none(), "no default deadline ends an untimed follow");
-    e.kill9();
-    e.start();
-    let id = e.send("codex", "claude", "c", Kind::Request, "after-restart", "post restart");
-    let mut line = String::new();
-    let mut out = std::io::BufReader::new(follower.stdout.take().unwrap());
-    let t0 = Instant::now();
-    std::io::BufRead::read_line(&mut out, &mut line).unwrap();
-    let _ = follower.kill();
-    let _ = follower.wait();
-    assert!(line.contains(&id), "the watcher reconnected and was notified: {line:?}");
-    assert!(t0.elapsed() < Duration::from_secs(15));
+	let mut e = Env::standard();
+	e.start();
+	let mut cmd = Command::new(CLI);
+	e.envs(&mut cmd);
+	let mut follower = cmd.args(["wait", "--as", "claude", "--follow"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+	std::thread::sleep(Duration::from_millis(800));
+	assert!(follower.try_wait().unwrap().is_none(), "no default deadline ends an untimed follow");
+	e.kill9();
+	e.start();
+	let id = e.send("codex", "claude", "c", Kind::Request, "after-restart", "post restart");
+	let mut line = String::new();
+	let mut out = std::io::BufReader::new(follower.stdout.take().unwrap());
+	let t0 = Instant::now();
+	std::io::BufRead::read_line(&mut out, &mut line).unwrap();
+	let _ = follower.kill();
+	let _ = follower.wait();
+	assert!(line.contains(&id), "the watcher reconnected and was notified: {line:?}");
+	assert!(t0.elapsed() < Duration::from_secs(15));
 }
 
 #[test]
 fn a_receipt_that_cannot_be_written_keeps_the_pending_key_so_a_retry_stores_once() {
-    let mut e = Env::standard();
-    e.start();
-    let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c"];
-    let mut cmd = Command::new(CLI);
-    e.envs(&mut cmd);
-    let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
-    let mut child = cmd.args(args).stdin(Stdio::piped()).stdout(full).stderr(Stdio::piped()).spawn().unwrap();
-    child.stdin.take().unwrap().write_all(b"body").unwrap();
-    let broken = child.wait_with_output().unwrap();
-    assert_ne!(code(&broken), 0);
-    assert!(stderr(&broken).contains("could not write the receipt"), "{}", stderr(&broken));
-    assert_eq!(e.pending_files().len(), 1, "the key survives a lost receipt");
-    assert_eq!(e.status(Some("codex")).unacknowledged.len(), 1, "the message was stored");
-    let retry = e.cli(&args, Some("body"));
-    assert_eq!(code(&retry), 0, "{}", stderr(&retry));
-    assert!(stdout(&retry).contains("already stored"), "{}", stdout(&retry));
-    assert_eq!(e.status(Some("codex")).unacknowledged.len(), 1, "stored once");
-    assert!(e.pending_files().is_empty());
+	let mut e = Env::standard();
+	e.start();
+	let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c"];
+	let mut cmd = Command::new(CLI);
+	e.envs(&mut cmd);
+	let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+	let mut child = cmd.args(args).stdin(Stdio::piped()).stdout(full).stderr(Stdio::piped()).spawn().unwrap();
+	child.stdin.take().unwrap().write_all(b"body").unwrap();
+	let broken = child.wait_with_output().unwrap();
+	assert_ne!(code(&broken), 0);
+	assert!(stderr(&broken).contains("could not write the receipt"), "{}", stderr(&broken));
+	assert_eq!(e.pending_files().len(), 1, "the key survives a lost receipt");
+	assert_eq!(e.status(Some("codex")).unacknowledged.len(), 1, "the message was stored");
+	let retry = e.cli(&args, Some("body"));
+	assert_eq!(code(&retry), 0, "{}", stderr(&retry));
+	assert!(stdout(&retry).contains("already stored"), "{}", stdout(&retry));
+	assert_eq!(e.status(Some("codex")).unacknowledged.len(), 1, "stored once");
+	assert!(e.pending_files().is_empty());
 }
 
 // ---- plan 0002: duplicate watchers ----
 
 impl Env {
-    fn spawn_wait(&self, extra: &[&str]) -> Child {
-        let mut cmd = Command::new(CLI);
-        self.envs(&mut cmd);
-        cmd.args(["wait", "--as", "claude", "--follow"]).args(extra).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        cmd.spawn().unwrap()
-    }
+	fn spawn_wait(&self, extra: &[&str]) -> Child {
+		let mut cmd = Command::new(CLI);
+		self.envs(&mut cmd);
+		cmd.args(["wait", "--as", "claude", "--follow"]).args(extra).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+		cmd.spawn().unwrap()
+	}
 
-    fn watcher_count(&self) -> usize {
-        self.status(None).watchers.len()
-    }
+	fn watcher_count(&self) -> usize {
+		self.status(None).watchers.len()
+	}
 
-    fn until_watchers(&self, n: usize) {
-        let t0 = Instant::now();
-        while self.watcher_count() != n {
-            assert!(t0.elapsed() < Duration::from_secs(10), "expected {n} watchers, have {}", self.watcher_count());
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
+	fn until_watchers(&self, n: usize) {
+		let t0 = Instant::now();
+		while self.watcher_count() != n {
+			assert!(t0.elapsed() < Duration::from_secs(10), "expected {n} watchers, have {}", self.watcher_count());
+			std::thread::sleep(Duration::from_millis(50));
+		}
+	}
 }
 
 fn finish(mut child: Child) -> Output {
-    let _ = child.kill();
-    child.wait_with_output().unwrap()
+	let _ = child.kill();
+	child.wait_with_output().unwrap()
 }
 
 #[test]
 fn a_second_watcher_warns_and_the_first_reports_none() {
-    let mut e = Env::standard();
-    e.start();
-    let first = e.spawn_wait(&[]);
-    e.until_watchers(1);
-    let second = e.spawn_wait(&[]);
-    e.until_watchers(2);
-    let (a, b) = (finish(first), finish(second));
-    assert!(!stderr(&a).contains("other watcher"), "the first watcher had no company: {}", stderr(&a));
-    assert!(stderr(&b).contains("1 other watcher(s) for claude overlap"), "{}", stderr(&b));
+	let mut e = Env::standard();
+	e.start();
+	let first = e.spawn_wait(&[]);
+	e.until_watchers(1);
+	let second = e.spawn_wait(&[]);
+	e.until_watchers(2);
+	let (a, b) = (finish(first), finish(second));
+	assert!(!stderr(&a).contains("other watcher"), "the first watcher had no company: {}", stderr(&a));
+	assert!(stderr(&b).contains("1 other watcher(s) for claude overlap"), "{}", stderr(&b));
 }
 
 #[test]
 fn an_exclusive_watcher_is_refused_while_another_overlaps_and_allowed_after() {
-    let mut e = Env::standard();
-    e.start();
-    let first = e.spawn_wait(&[]);
-    e.until_watchers(1);
-    let refused = e.spawn_wait(&["--exclusive"]).wait_with_output().unwrap();
-    assert_eq!(code(&refused), 7, "{}", stderr(&refused));
-    assert!(stderr(&refused).contains("exclusive watch was refused"), "{}", stderr(&refused));
-    assert_eq!(e.watcher_count(), 1, "the refused watcher left no registration");
-    let id = e.send("codex", "claude", "c", Kind::Request, "x1", "still delivered to the first");
-    let mut first = first;
-    let mut line = String::new();
-    std::io::BufRead::read_line(&mut std::io::BufReader::new(first.stdout.as_mut().unwrap()), &mut line).unwrap();
-    assert!(line.contains(&id), "{line:?}");
-    let _ = finish(first);
-    e.until_watchers(0);
-    let allowed = e.spawn_wait(&["--exclusive"]);
-    e.until_watchers(1);
-    let _ = finish(allowed);
+	let mut e = Env::standard();
+	e.start();
+	let first = e.spawn_wait(&[]);
+	e.until_watchers(1);
+	let refused = e.spawn_wait(&["--exclusive"]).wait_with_output().unwrap();
+	assert_eq!(code(&refused), 7, "{}", stderr(&refused));
+	assert!(stderr(&refused).contains("exclusive watch was refused"), "{}", stderr(&refused));
+	assert_eq!(e.watcher_count(), 1, "the refused watcher left no registration");
+	let id = e.send("codex", "claude", "c", Kind::Request, "x1", "still delivered to the first");
+	let mut first = first;
+	let mut line = String::new();
+	std::io::BufRead::read_line(&mut std::io::BufReader::new(first.stdout.as_mut().unwrap()), &mut line).unwrap();
+	assert!(line.contains(&id), "{line:?}");
+	let _ = finish(first);
+	e.until_watchers(0);
+	let allowed = e.spawn_wait(&["--exclusive"]);
+	e.until_watchers(1);
+	let _ = finish(allowed);
 }
 
 #[test]
 fn exclusivity_only_counts_overlapping_filters() {
-    let mut e = Env::standard();
-    e.start();
-    let named = e.spawn_wait(&["--conversation", "a"]);
-    e.until_watchers(1);
-    let other = e.spawn_wait(&["--conversation", "b", "--exclusive"]);
-    e.until_watchers(2);
-    let wildcard = e.spawn_wait(&["--exclusive"]).wait_with_output().unwrap();
-    assert_eq!(code(&wildcard), 7, "a wildcard overlaps the named ones");
-    let same = e.spawn_wait(&["--conversation", "a", "--exclusive"]).wait_with_output().unwrap();
-    assert_eq!(code(&same), 7);
-    let _ = (finish(named), finish(other));
+	let mut e = Env::standard();
+	e.start();
+	let named = e.spawn_wait(&["--conversation", "a"]);
+	e.until_watchers(1);
+	let other = e.spawn_wait(&["--conversation", "b", "--exclusive"]);
+	e.until_watchers(2);
+	let wildcard = e.spawn_wait(&["--exclusive"]).wait_with_output().unwrap();
+	assert_eq!(code(&wildcard), 7, "a wildcard overlaps the named ones");
+	let same = e.spawn_wait(&["--conversation", "a", "--exclusive"]).wait_with_output().unwrap();
+	assert_eq!(code(&same), 7);
+	let _ = (finish(named), finish(other));
 }
 
 #[test]
 fn racing_exclusive_watchers_admit_exactly_one() {
-    let mut e = Env::standard();
-    e.start();
-    let kids: Vec<Child> = (0..6).map(|_| e.spawn_wait(&["--exclusive"])).collect();
-    std::thread::sleep(Duration::from_millis(1500));
-    assert_eq!(e.watcher_count(), 1, "exactly one exclusive watcher registered");
-    let outs: Vec<Output> = kids.into_iter().map(finish).collect();
-    let refused = outs.iter().filter(|o| code(o) == 7).count();
-    assert_eq!(refused, 5, "the other five were refused with exit 7");
+	let mut e = Env::standard();
+	e.start();
+	let kids: Vec<Child> = (0..6).map(|_| e.spawn_wait(&["--exclusive"])).collect();
+	std::thread::sleep(Duration::from_millis(1500));
+	assert_eq!(e.watcher_count(), 1, "exactly one exclusive watcher registered");
+	let outs: Vec<Output> = kids.into_iter().map(finish).collect();
+	let refused = outs.iter().filter(|o| code(o) == 7).count();
+	assert_eq!(refused, 5, "the other five were refused with exit 7");
 }
 
 #[test]
 fn the_first_watch_reports_zero_other_watchers_on_the_wire() {
-    let mut e = Env::standard();
-    e.start();
-    let mut c = e.client();
-    c.send(Request::Watch { as_: "claude".into(), conversation: None, resume_token: None, exclusive: true }).unwrap();
-    let Response::SnapshotBegin { other_watchers, .. } = c.recv().unwrap() else { panic!("no SnapshotBegin") };
-    assert_eq!(other_watchers, Some(0));
-    let mut c2 = e.client();
-    c2.send(Request::Watch { as_: "claude".into(), conversation: None, resume_token: None, exclusive: true }).unwrap();
-    let Response::Error { code, .. } = c2.recv().unwrap() else { panic!("expected a refusal") };
-    assert_eq!(code, ErrorCode::Conflict);
+	let mut e = Env::standard();
+	e.start();
+	let mut c = e.client();
+	c.send(Request::Watch { as_: "claude".into(), conversation: None, resume_token: None, exclusive: true }).unwrap();
+	let Response::SnapshotBegin { other_watchers, .. } = c.recv().unwrap() else { panic!("no SnapshotBegin") };
+	assert_eq!(other_watchers, Some(0));
+	let mut c2 = e.client();
+	c2.send(Request::Watch { as_: "claude".into(), conversation: None, resume_token: None, exclusive: true }).unwrap();
+	let Response::Error { code, .. } = c2.recv().unwrap() else { panic!("expected a refusal") };
+	assert_eq!(code, ErrorCode::Conflict);
 }
 
 // ---- plan 0002: wait --follow --full [--take] ----
 
 fn first_raw_line(child: &mut Child) -> String {
-    let mut line = String::new();
-    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.as_mut().unwrap()), &mut line).unwrap();
-    assert!(!line.is_empty(), "the stream ended before a message");
-    line.trim_end().to_string()
+	let mut line = String::new();
+	std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.as_mut().unwrap()), &mut line).unwrap();
+	assert!(!line.is_empty(), "the stream ended before a message");
+	line.trim_end().to_string()
 }
 
 fn first_json_line(child: &mut Child) -> serde_json::Value {
-    let line = first_raw_line(child);
-    serde_json::from_str(&line).unwrap_or_else(|e| panic!("not one JSON line ({e}): {line:?}"))
+	let line = first_raw_line(child);
+	serde_json::from_str(&line).unwrap_or_else(|e| panic!("not one JSON line ({e}): {line:?}"))
 }
 
 #[test]
 fn full_streams_the_whole_message_as_one_line_and_acknowledges_nothing() {
-    let mut e = Env::standard();
-    e.start();
-    let mut w = e.spawn_wait(&["--full"]);
-    e.until_watchers(1);
-    let id = e.send("codex", "claude", "conv", Kind::Request, "f1", "line one\nline two \"quoted\" ünïcode");
-    let v = first_json_line(&mut w);
-    assert_eq!(v["id"], id.as_str());
-    assert_eq!(v["from"], "codex");
-    assert_eq!(v["conversation"], "conv");
-    assert_eq!(v["kind"], "request");
-    assert_eq!(v["body"], "line one\nline two \"quoted\" ünïcode");
-    assert_eq!(v["truncated"], false);
-    assert_eq!(e.status(Some("claude")).unacknowledged.len(), 1, "without --take nothing is acknowledged");
-    let _ = finish(w);
-    let mut again = e.spawn_wait(&["--full"]);
-    assert_eq!(first_json_line(&mut again)["id"], id.as_str(), "an unacknowledged message replays on reconnect");
-    let _ = finish(again);
+	let mut e = Env::standard();
+	e.start();
+	let mut w = e.spawn_wait(&["--full"]);
+	e.until_watchers(1);
+	let id = e.send("codex", "claude", "conv", Kind::Request, "f1", "line one\nline two \"quoted\" ünïcode");
+	let v = first_json_line(&mut w);
+	assert_eq!(v["id"], id.as_str());
+	assert_eq!(v["from"], "codex");
+	assert_eq!(v["conversation"], "conv");
+	assert_eq!(v["kind"], "request");
+	assert_eq!(v["body"], "line one\nline two \"quoted\" ünïcode");
+	assert_eq!(v["truncated"], false);
+	assert_eq!(e.status(Some("claude")).unacknowledged.len(), 1, "without --take nothing is acknowledged");
+	let _ = finish(w);
+	let mut again = e.spawn_wait(&["--full"]);
+	assert_eq!(first_json_line(&mut again)["id"], id.as_str(), "an unacknowledged message replays on reconnect");
+	let _ = finish(again);
 }
 
 #[test]
 fn full_with_take_acknowledges_after_the_line_is_written() {
-    let mut e = Env::standard();
-    e.start();
-    let id = e.send("codex", "claude", "conv", Kind::Request, "t1", "from the backlog");
-    let mut w = e.spawn_wait(&["--full", "--take"]);
-    let v = first_json_line(&mut w);
-    assert_eq!(v["id"], id.as_str());
-    assert_eq!(v["body"], "from the backlog");
-    let t0 = Instant::now();
-    while !e.status(Some("claude")).unacknowledged.is_empty() {
-        assert!(t0.elapsed() < Duration::from_secs(5), "never acknowledged");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let id2 = e.send("codex", "claude", "conv", Kind::Info, "t2", "pushed after");
-    assert_eq!(first_json_line(&mut w)["id"], id2.as_str());
-    let _ = finish(w);
+	let mut e = Env::standard();
+	e.start();
+	let id = e.send("codex", "claude", "conv", Kind::Request, "t1", "from the backlog");
+	let mut w = e.spawn_wait(&["--full", "--take"]);
+	let v = first_json_line(&mut w);
+	assert_eq!(v["id"], id.as_str());
+	assert_eq!(v["body"], "from the backlog");
+	let t0 = Instant::now();
+	while !e.status(Some("claude")).unacknowledged.is_empty() {
+		assert!(t0.elapsed() < Duration::from_secs(5), "never acknowledged");
+		std::thread::sleep(Duration::from_millis(50));
+	}
+	let id2 = e.send("codex", "claude", "conv", Kind::Info, "t2", "pushed after");
+	assert_eq!(first_json_line(&mut w)["id"], id2.as_str());
+	let _ = finish(w);
 }
 
 #[test]
 fn a_line_always_fits_its_budget_and_says_it_was_cut_before_the_body() {
-    let mut e = Env::standard();
-    e.start();
-    // Escape-heavy and multi-byte: every quote and newline doubles in JSON, every é is two bytes.
-    let body = "é\"\n".repeat(20_000);
-    let id = e.send("codex", "claude", "conv", Kind::Info, "big", &body);
-    let mut w = e.spawn_wait(&["--full"]);
-    let raw = first_raw_line(&mut w);
-    let _ = finish(w);
-    assert!(raw.len() <= 480, "{} bytes", raw.len());
-    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(v["id"], id.as_str());
-    assert_eq!(v["truncated"], true);
-    assert_eq!(v["body_bytes"], body.len());
-    assert!(raw.find("\"truncated\"").unwrap() < raw.find("\"body\":").unwrap(), "the flag survives a cut tail: {raw}");
-    assert!(body.starts_with(v["body"].as_str().unwrap()), "the body shown is a prefix");
+	let mut e = Env::standard();
+	e.start();
+	// Escape-heavy and multi-byte: every quote and newline doubles in JSON, every é is two bytes.
+	let body = "é\"\n".repeat(20_000);
+	let id = e.send("codex", "claude", "conv", Kind::Info, "big", &body);
+	let mut w = e.spawn_wait(&["--full"]);
+	let raw = first_raw_line(&mut w);
+	let _ = finish(w);
+	assert!(raw.len() <= 480, "{} bytes", raw.len());
+	let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+	assert_eq!(v["id"], id.as_str());
+	assert_eq!(v["truncated"], true);
+	assert_eq!(v["body_bytes"], body.len());
+	assert!(raw.find("\"truncated\"").unwrap() < raw.find("\"body\":").unwrap(), "the flag survives a cut tail: {raw}");
+	assert!(body.starts_with(v["body"].as_str().unwrap()), "the body shown is a prefix");
 }
 
 #[test]
 fn max_line_widens_or_narrows_the_budget() {
-    let mut e = Env::standard();
-    e.start();
-    let body = "x".repeat(2_000);
-    e.send("codex", "claude", "conv", Kind::Info, "m1", &body);
-    let mut wide = e.spawn_wait(&["--full", "--max-line", "4000"]);
-    let v = first_json_line(&mut wide);
-    assert_eq!(v["truncated"], false);
-    assert_eq!(v["body"].as_str().unwrap().len(), 2_000);
-    let _ = finish(wide);
-    let mut narrow = e.spawn_wait(&["--full", "--max-line", "300"]);
-    let raw = first_raw_line(&mut narrow);
-    let _ = finish(narrow);
-    assert!(raw.len() <= 300, "{} bytes", raw.len());
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap()["truncated"], true);
+	let mut e = Env::standard();
+	e.start();
+	let body = "x".repeat(2_000);
+	e.send("codex", "claude", "conv", Kind::Info, "m1", &body);
+	let mut wide = e.spawn_wait(&["--full", "--max-line", "4000"]);
+	let v = first_json_line(&mut wide);
+	assert_eq!(v["truncated"], false);
+	assert_eq!(v["body"].as_str().unwrap().len(), 2_000);
+	let _ = finish(wide);
+	let mut narrow = e.spawn_wait(&["--full", "--max-line", "300"]);
+	let raw = first_raw_line(&mut narrow);
+	let _ = finish(narrow);
+	assert!(raw.len() <= 300, "{} bytes", raw.len());
+	assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap()["truncated"], true);
 }
 
 #[test]
 fn take_acknowledges_only_messages_shown_whole() {
-    let mut e = Env::standard();
-    e.start();
-    let long = e.send("codex", "claude", "conv", Kind::Request, "tl", &"y".repeat(5_000));
-    let short = e.send("codex", "claude", "conv", Kind::Request, "ts", "short");
-    let mut w = e.spawn_wait(&["--full", "--take"]);
-    let (a, b) = (first_json_line(&mut w), first_json_line(&mut w));
-    let (cut_one, whole_one) = if a["id"] == long.as_str() { (a, b) } else { (b, a) };
-    assert_eq!(cut_one["truncated"], true);
-    assert_eq!(whole_one["id"], short.as_str());
-    let t0 = Instant::now();
-    while e.status(Some("claude")).unacknowledged.len() != 1 {
-        assert!(t0.elapsed() < Duration::from_secs(5), "the whole message was never acknowledged");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    std::thread::sleep(Duration::from_millis(500));
-    let left = e.status(Some("claude")).unacknowledged;
-    assert_eq!(left.len(), 1, "only the cut message remains");
-    assert_eq!(left[0].id, long);
-    let _ = finish(w);
+	let mut e = Env::standard();
+	e.start();
+	let long = e.send("codex", "claude", "conv", Kind::Request, "tl", &"y".repeat(5_000));
+	let short = e.send("codex", "claude", "conv", Kind::Request, "ts", "short");
+	let mut w = e.spawn_wait(&["--full", "--take"]);
+	let (a, b) = (first_json_line(&mut w), first_json_line(&mut w));
+	let (cut_one, whole_one) = if a["id"] == long.as_str() { (a, b) } else { (b, a) };
+	assert_eq!(cut_one["truncated"], true);
+	assert_eq!(whole_one["id"], short.as_str());
+	let t0 = Instant::now();
+	while e.status(Some("claude")).unacknowledged.len() != 1 {
+		assert!(t0.elapsed() < Duration::from_secs(5), "the whole message was never acknowledged");
+		std::thread::sleep(Duration::from_millis(50));
+	}
+	std::thread::sleep(Duration::from_millis(500));
+	let left = e.status(Some("claude")).unacknowledged;
+	assert_eq!(left.len(), 1, "only the cut message remains");
+	assert_eq!(left[0].id, long);
+	let _ = finish(w);
 }
 
 #[test]
 fn take_never_acknowledges_a_line_it_could_not_write() {
-    let mut e = Env::standard();
-    e.start();
-    e.send("codex", "claude", "conv", Kind::Request, "u1", "unseen");
-    let mut cmd = Command::new(CLI);
-    e.envs(&mut cmd);
-    let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
-    let out = cmd
-        .args(["wait", "--as", "claude", "--follow", "--full", "--take"])
-        .stdin(Stdio::null())
-        .stdout(full)
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
-    assert_ne!(code(&out), 0);
-    assert!(stderr(&out).contains("not acknowledged"), "{}", stderr(&out));
-    assert_eq!(e.status(Some("claude")).unacknowledged.len(), 1);
+	let mut e = Env::standard();
+	e.start();
+	e.send("codex", "claude", "conv", Kind::Request, "u1", "unseen");
+	let mut cmd = Command::new(CLI);
+	e.envs(&mut cmd);
+	let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+	let out = cmd
+		.args(["wait", "--as", "claude", "--follow", "--full", "--take"])
+		.stdin(Stdio::null())
+		.stdout(full)
+		.stderr(Stdio::piped())
+		.output()
+		.unwrap();
+	assert_ne!(code(&out), 0);
+	assert!(stderr(&out).contains("not acknowledged"), "{}", stderr(&out));
+	assert_eq!(e.status(Some("claude")).unacknowledged.len(), 1);
 }
 
 #[test]
 fn take_needs_full() {
-    let e = Env::standard();
-    let out = e.cli(&["wait", "--as", "claude", "--follow", "--take"], None);
-    assert_eq!(code(&out), 2, "{}", stderr(&out));
+	let e = Env::standard();
+	let out = e.cli(&["wait", "--as", "claude", "--follow", "--take"], None);
+	assert_eq!(code(&out), 2, "{}", stderr(&out));
 }
 
 // ---- plan 0003: participant records and the directory ----
 
 #[test]
 fn peers_shows_product_tier_and_reachability_and_follows_a_watcher() {
-    let mut e = Env::new(
-        "participants = [\"claude\", \"codex\"]\nheartbeat_ms = 300\n[participant.claude]\nproduct = \"claude\"\ntier = \"luna\"\n[participant.codex]\nproduct = \"codex\"\ntier = \"gpt-6-luna\"\n[participant.scout]\nproduct = \"claude\"\ntier = \"astra\"\n",
-    );
-    e.start();
-    let before = stdout(&e.cli(&["peers"], None));
-    let row = |text: &str, name: &str| {
-        text.lines().find(|l| l.starts_with(name)).unwrap_or_else(|| panic!("no {name} row in {text}")).to_string()
-    };
-    assert!(row(&before, "claude").contains("luna") && row(&before, "claude").contains("no watcher attached"), "{before}");
-    assert!(
-        row(&before, "codex").contains("gpt-6-luna") && row(&before, "codex").contains("normally uses push; no endpoint registered"),
-        "{before}"
-    );
-    assert!(row(&before, "scout").contains("astra"), "a name only under [participant.*] is a participant: {before}");
-    let w = e.spawn_wait(&[]);
-    e.until_watchers(1);
-    let during = stdout(&e.cli(&["peers"], None));
-    let _ = finish(w);
-    let claude = row(&during, "claude");
-    assert!(claude.contains("pull") && claude.contains("yes"), "{claude}");
-    let json = stdout(&e.cli(&["--json", "peers"], None));
-    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    let c = v.as_array().unwrap().iter().find(|p| p["name"] == "claude").unwrap();
-    assert_eq!((c["product"].as_str(), c["tier"].as_str()), (Some("claude"), Some("luna")));
+	let mut e = Env::new(
+		"participants = [\"claude\", \"codex\"]\nheartbeat_ms = 300\n[participant.claude]\nproduct = \"claude\"\ntier = \"luna\"\n[participant.codex]\nproduct = \"codex\"\ntier = \"gpt-6-luna\"\n[participant.scout]\nproduct = \"claude\"\ntier = \"astra\"\n",
+	);
+	e.start();
+	let before = stdout(&e.cli(&["peers"], None));
+	let row = |text: &str, name: &str| {
+		text.lines().find(|l| l.starts_with(name)).unwrap_or_else(|| panic!("no {name} row in {text}")).to_string()
+	};
+	assert!(row(&before, "claude").contains("luna") && row(&before, "claude").contains("no watcher attached"), "{before}");
+	assert!(
+		row(&before, "codex").contains("gpt-6-luna") && row(&before, "codex").contains("normally uses push; no endpoint registered"),
+		"{before}"
+	);
+	assert!(row(&before, "scout").contains("astra"), "a name only under [participant.*] is a participant: {before}");
+	let w = e.spawn_wait(&[]);
+	e.until_watchers(1);
+	let during = stdout(&e.cli(&["peers"], None));
+	let _ = finish(w);
+	let claude = row(&during, "claude");
+	assert!(claude.contains("pull") && claude.contains("yes"), "{claude}");
+	let json = stdout(&e.cli(&["--json", "peers"], None));
+	let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+	let c = v.as_array().unwrap().iter().find(|p| p["name"] == "claude").unwrap();
+	assert_eq!((c["product"].as_str(), c["tier"].as_str()), (Some("claude"), Some("luna")));
 }
 
 #[test]
 fn a_codex_with_a_registered_endpoint_has_a_push_path() {
-    let mut e = Env::new("heartbeat_ms = 300\n[participant.codex]\nproduct = \"codex\"\n");
-    e.start();
-    let reg = e.cli(&["endpoint", "register", "--as", "codex", "--session", "s1", "--exe", "/bin/true"], None);
-    assert_eq!(code(&reg), 0, "{}", stderr(&reg));
-    let row = stdout(&e.cli(&["peers"], None)).lines().find(|l| l.starts_with("codex")).unwrap().to_string();
-    assert!(row.contains("push") && row.contains("yes") && !row.contains("normally"), "{row}");
+	let mut e = Env::new("heartbeat_ms = 300\n[participant.codex]\nproduct = \"codex\"\n");
+	e.start();
+	let reg = e.cli(&["endpoint", "register", "--as", "codex", "--session", "s1", "--exe", "/bin/true"], None);
+	assert_eq!(code(&reg), 0, "{}", stderr(&reg));
+	let row = stdout(&e.cli(&["peers"], None)).lines().find(|l| l.starts_with("codex")).unwrap().to_string();
+	assert!(row.contains("push") && row.contains("yes") && !row.contains("normally"), "{row}");
 }
 
 #[test]
 fn a_bad_product_token_stops_the_daemon_with_a_clear_error() {
-    let mut e = Env::new("[participant.claude]\nproduct = \"Claude Code\"\n");
-    assert!(e.try_start(false).is_none(), "the daemon must refuse an invalid product");
-    let mut err = String::new();
-    if let Some(mut d) = e.daemon.take() {
-        use std::io::Read;
-        let _ = d.stderr.take().unwrap().read_to_string(&mut err);
-    }
-    assert!(err.contains("participant.claude.product"), "{err}");
+	let mut e = Env::new("[participant.claude]\nproduct = \"Claude Code\"\n");
+	assert!(e.try_start(false).is_none(), "the daemon must refuse an invalid product");
+	let mut err = String::new();
+	if let Some(mut d) = e.daemon.take() {
+		use std::io::Read;
+		let _ = d.stderr.take().unwrap().read_to_string(&mut err);
+	}
+	assert!(err.contains("participant.claude.product"), "{err}");
 }
 
 // ---------------------------------------------------------------- wake policy and digests
 
 fn codex_row(e: &Env) -> chatd::proto::ParticipantView {
-    e.status(None).participants.unwrap().into_iter().find(|p| p.name == "codex").unwrap()
+	e.status(None).participants.unwrap().into_iter().find(|p| p.name == "codex").unwrap()
 }
 
 fn argv_log(e: &Env) -> String {
-    std::fs::read_to_string(e.dir.join("argv.log")).unwrap_or_default()
+	std::fs::read_to_string(e.dir.join("argv.log")).unwrap_or_default()
 }
 
 fn stored_id(r: Response) -> String {
-    match r {
-        Response::Stored(r) => r.id,
-        other => panic!("{other:?}"),
-    }
+	match r {
+		Response::Stored(r) => r.id,
+		other => panic!("{other:?}"),
+	}
 }
 
 #[test]
 fn only_requests_wake_a_push_participant_and_its_next_push_carries_the_rest_as_a_digest() {
-    let mut e = Env::standard();
-    e.start();
-    let exe = fake_codex(&e, "exit 0");
-    register(&e, &exe, "s1");
-    let asked = e.send("codex", "claude", "c", Kind::Request, "q", "codex asks");
-    let progress = stored_id(e.reply("claude", &asked, Kind::Progress, "p"));
-    let fin = stored_id(e.reply("claude", &asked, Kind::Final, "f"));
-    let info = e.send("claude", "codex", "c", Kind::Info, "i", "for your information");
-    std::thread::sleep(Duration::from_millis(800));
-    assert_eq!(argv_log(&e), "", "progress, final and info replies do not wake codex");
-    assert!(attempts(&e, &info).is_empty() && attempts(&e, &fin).is_empty());
-    let row = codex_row(&e);
-    assert_eq!((row.wake_kinds, row.queued_for_wake), (Some(vec![Kind::Request]), Some(3)));
-    let text = stdout(&e.cli(&["status"], None));
-    assert!(text.contains("codex        wakes on request  queued for next wake: 3"), "{text}");
+	let mut e = Env::standard();
+	e.start();
+	let exe = fake_codex(&e, "exit 0");
+	register(&e, &exe, "s1");
+	let asked = e.send("codex", "claude", "c", Kind::Request, "q", "codex asks");
+	let progress = stored_id(e.reply("claude", &asked, Kind::Progress, "p"));
+	let fin = stored_id(e.reply("claude", &asked, Kind::Final, "f"));
+	let info = e.send("claude", "codex", "c", Kind::Info, "i", "for your information");
+	std::thread::sleep(Duration::from_millis(800));
+	assert_eq!(argv_log(&e), "", "progress, final and info replies do not wake codex");
+	assert!(attempts(&e, &info).is_empty() && attempts(&e, &fin).is_empty());
+	let row = codex_row(&e);
+	assert_eq!((row.wake_kinds, row.queued_for_wake), (Some(vec![Kind::Request]), Some(3)));
+	let text = stdout(&e.cli(&["status"], None));
+	assert!(text.contains("codex        wakes on request  queued for next wake: 3"), "{text}");
 
-    let req = e.send("claude", "codex", "c", Kind::Request, "r1", "please act");
-    wait_for("the waking push", Duration::from_secs(5), || attempts(&e, &req) == vec!["submitted"]);
-    let argv = argv_log(&e);
-    let lines: Vec<&str> = argv.lines().collect();
-    assert_eq!(lines[..4], ["queue", "--thread", "s1", "--message"]);
-    assert!(
-        lines[4].starts_with(&format!("[chatd {req} claude->codex c request ")),
-        "the waking line comes first, unchanged: {}",
-        lines[4]
-    );
-    assert!(lines[4].ends_with(&format!("please act | chatctl receive --as codex --id {req}")), "{}", lines[4]);
-    assert!(lines[5].starts_with("[chatd digest for codex: 3 queued, oldest first;"), "{}", lines[5]);
-    let at = |id: &str| argv.find(id).unwrap_or_else(|| panic!("{id} is not in the digest: {argv}"));
-    assert!(at(&progress) < at(&fin) && at(&fin) < at(&info), "oldest first, newest last");
-    assert!(argv.contains(&format!("  {info} claude c info ")), "{argv}");
-    assert!(!argv.contains("more ("), "nothing beyond the cap");
+	let req = e.send("claude", "codex", "c", Kind::Request, "r1", "please act");
+	wait_for("the waking push", Duration::from_secs(5), || attempts(&e, &req) == vec!["submitted"]);
+	let argv = argv_log(&e);
+	let lines: Vec<&str> = argv.lines().collect();
+	assert_eq!(lines[..4], ["queue", "--thread", "s1", "--message"]);
+	assert!(
+		lines[4].starts_with(&format!("[chatd {req} claude->codex c request ")),
+		"the waking line comes first, unchanged: {}",
+		lines[4]
+	);
+	assert!(lines[4].ends_with(&format!("please act | chatctl receive --as codex --id {req}")), "{}", lines[4]);
+	assert!(lines[5].starts_with("[chatd digest for codex: 3 queued, oldest first;"), "{}", lines[5]);
+	let at = |id: &str| argv.find(id).unwrap_or_else(|| panic!("{id} is not in the digest: {argv}"));
+	assert!(at(&progress) < at(&fin) && at(&fin) < at(&info), "oldest first, newest last");
+	assert!(argv.contains(&format!("  {info} claude c info ")), "{argv}");
+	assert!(!argv.contains("more ("), "nothing beyond the cap");
 
-    assert_eq!(codex_row(&e).queued_for_wake, Some(0), "a digest is delivered once");
-    let s = e.status(Some("codex"));
-    for id in [&progress, &fin, &info] {
-        assert!(s.unacknowledged.iter().any(|l| l.id == *id), "a digest does not acknowledge {id}");
-    }
-    let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
-    let digested: Vec<&str> = events.iter().filter(|ev| ev.kind == "digested").filter_map(|ev| ev.message_id.as_deref()).collect();
-    assert_eq!(digested, vec![progress.as_str(), fin.as_str(), info.as_str()]);
+	assert_eq!(codex_row(&e).queued_for_wake, Some(0), "a digest is delivered once");
+	let s = e.status(Some("codex"));
+	for id in [&progress, &fin, &info] {
+		assert!(s.unacknowledged.iter().any(|l| l.id == *id), "a digest does not acknowledge {id}");
+	}
+	let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
+	let digested: Vec<&str> = events.iter().filter(|ev| ev.kind == "digested").filter_map(|ev| ev.message_id.as_deref()).collect();
+	assert_eq!(digested, vec![progress.as_str(), fin.as_str(), info.as_str()]);
 
-    let again = e.send("claude", "codex", "c", Kind::Request, "r2", "and this");
-    wait_for("the second push", Duration::from_secs(5), || attempts(&e, &again) == vec!["submitted"]);
-    assert_eq!(argv_log(&e).matches("[chatd digest").count(), 1, "nothing new was queued, so no digest");
+	let again = e.send("claude", "codex", "c", Kind::Request, "r2", "and this");
+	wait_for("the second push", Duration::from_secs(5), || attempts(&e, &again) == vec!["submitted"]);
+	assert_eq!(argv_log(&e).matches("[chatd digest").count(), 1, "nothing new was queued, so no digest");
 
-    // An explicit redelivery pushes a non-waking message on its own.
-    assert!(matches!(e.call(Request::Redeliver { id: info.clone() }), Response::Redelivery { .. }));
-    wait_for("the redelivered info", Duration::from_secs(5), || attempts(&e, &info) == vec!["submitted"]);
-    assert!(argv_log(&e).contains(&format!("chatctl receive --as codex --id {info}")));
+	// An explicit redelivery pushes a non-waking message on its own.
+	assert!(matches!(e.call(Request::Redeliver { id: info.clone() }), Response::Redelivery { .. }));
+	wait_for("the redelivered info", Duration::from_secs(5), || attempts(&e, &info) == vec!["submitted"]);
+	assert!(argv_log(&e).contains(&format!("chatctl receive --as codex --id {info}")));
 }
 
 #[test]
 fn a_digest_is_capped_and_the_rest_waits_for_the_next_wake() {
-    let mut e = Env::standard();
-    e.start();
-    let exe = fake_codex(&e, "exit 0");
-    register(&e, &exe, "s1");
-    let infos: Vec<String> = (0..25).map(|i| e.send("claude", "codex", "c", Kind::Info, &format!("i{i}"), &format!("note {i}"))).collect();
-    wait_for("all queued", Duration::from_secs(5), || codex_row(&e).queued_for_wake == Some(25));
-    let first = e.send("claude", "codex", "c", Kind::Request, "r1", "first");
-    wait_for("the first push", Duration::from_secs(5), || attempts(&e, &first) == vec!["submitted"]);
-    let argv = argv_log(&e);
-    assert!(argv.contains("[chatd digest for codex: 25 queued"), "{argv}");
-    assert!(argv.contains("\n  +5 more (chatctl status --as codex)"), "{argv}");
-    assert!(infos[..20].iter().all(|id| argv.contains(id.as_str())) && !infos[20..].iter().any(|id| argv.contains(id.as_str())));
-    let digest_bytes = argv.split_once("[chatd digest").unwrap().1.len();
-    assert!(digest_bytes <= chatd::text::DIGEST_MAX_BYTES, "{digest_bytes}");
-    assert_eq!(codex_row(&e).queued_for_wake, Some(5), "unlisted messages stay queued");
+	let mut e = Env::standard();
+	e.start();
+	let exe = fake_codex(&e, "exit 0");
+	register(&e, &exe, "s1");
+	let infos: Vec<String> = (0..25).map(|i| e.send("claude", "codex", "c", Kind::Info, &format!("i{i}"), &format!("note {i}"))).collect();
+	wait_for("all queued", Duration::from_secs(5), || codex_row(&e).queued_for_wake == Some(25));
+	let first = e.send("claude", "codex", "c", Kind::Request, "r1", "first");
+	wait_for("the first push", Duration::from_secs(5), || attempts(&e, &first) == vec!["submitted"]);
+	let argv = argv_log(&e);
+	assert!(argv.contains("[chatd digest for codex: 25 queued"), "{argv}");
+	assert!(argv.contains("\n  +5 more (chatctl status --as codex)"), "{argv}");
+	assert!(infos[..20].iter().all(|id| argv.contains(id.as_str())) && !infos[20..].iter().any(|id| argv.contains(id.as_str())));
+	let digest_bytes = argv.split_once("[chatd digest").unwrap().1.len();
+	assert!(digest_bytes <= chatd::text::DIGEST_MAX_BYTES, "{digest_bytes}");
+	assert_eq!(codex_row(&e).queued_for_wake, Some(5), "unlisted messages stay queued");
 
-    let second = e.send("claude", "codex", "c", Kind::Request, "r2", "second");
-    wait_for("the second push", Duration::from_secs(5), || attempts(&e, &second) == vec!["submitted"]);
-    let tail = argv_log(&e).split_once(&format!("--id {second}")).unwrap().1.to_string();
-    assert!(tail.contains("[chatd digest for codex: 5 queued"), "{tail}");
-    assert!(infos[20..].iter().all(|id| tail.contains(id.as_str())) && !tail.contains("more ("), "{tail}");
-    assert_eq!(codex_row(&e).queued_for_wake, Some(0));
+	let second = e.send("claude", "codex", "c", Kind::Request, "r2", "second");
+	wait_for("the second push", Duration::from_secs(5), || attempts(&e, &second) == vec!["submitted"]);
+	let tail = argv_log(&e).split_once(&format!("--id {second}")).unwrap().1.to_string();
+	assert!(tail.contains("[chatd digest for codex: 5 queued"), "{tail}");
+	assert!(infos[20..].iter().all(|id| tail.contains(id.as_str())) && !tail.contains("more ("), "{tail}");
+	assert_eq!(codex_row(&e).queued_for_wake, Some(0));
 }
 
 #[test]
 fn a_failed_push_leaves_its_digest_queued() {
-    let mut e = Env::standard();
-    e.start();
-    let exe = fake_codex(&e, "echo 'session not found' >&2; exit 2");
-    register(&e, &exe, "s1");
-    e.send("claude", "codex", "c", Kind::Info, "i", "fyi");
-    let req = e.send("claude", "codex", "c", Kind::Request, "r", "act");
-    wait_for("the retry bound", Duration::from_secs(10), || attempts(&e, &req) == vec!["failed", "failed", "failed"]);
-    assert!(argv_log(&e).contains("[chatd digest for codex: 1 queued"));
-    assert_eq!(codex_row(&e).queued_for_wake, Some(1), "only a submitted push delivers its digest");
+	let mut e = Env::standard();
+	e.start();
+	let exe = fake_codex(&e, "echo 'session not found' >&2; exit 2");
+	register(&e, &exe, "s1");
+	e.send("claude", "codex", "c", Kind::Info, "i", "fyi");
+	let req = e.send("claude", "codex", "c", Kind::Request, "r", "act");
+	wait_for("the retry bound", Duration::from_secs(10), || attempts(&e, &req) == vec!["failed", "failed", "failed"]);
+	assert!(argv_log(&e).contains("[chatd digest for codex: 1 queued"));
+	assert_eq!(codex_row(&e).queued_for_wake, Some(1), "only a submitted push delivers its digest");
 }
 
 #[test]
 fn wake_kinds_all_keeps_pushing_every_message() {
-    let mut e = Env::new(
-        "heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\n[participant.codex]\nproduct = \"codex\"\nwake_kinds = [\"all\"]\n",
-    );
-    e.start();
-    let exe = fake_codex(&e, "exit 0");
-    register(&e, &exe, "s1");
-    let info = e.send("claude", "codex", "c", Kind::Info, "i", "fyi");
-    wait_for("the info push", Duration::from_secs(5), || attempts(&e, &info) == vec!["submitted"]);
-    let row = codex_row(&e);
-    assert_eq!((row.wake_kinds, row.queued_for_wake), (Some(Kind::ALL.to_vec()), Some(0)));
-    assert!(!argv_log(&e).contains("digest"));
+	let mut e = Env::new(
+		"heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\n[participant.codex]\nproduct = \"codex\"\nwake_kinds = [\"all\"]\n",
+	);
+	e.start();
+	let exe = fake_codex(&e, "exit 0");
+	register(&e, &exe, "s1");
+	let info = e.send("claude", "codex", "c", Kind::Info, "i", "fyi");
+	wait_for("the info push", Duration::from_secs(5), || attempts(&e, &info) == vec!["submitted"]);
+	let row = codex_row(&e);
+	assert_eq!((row.wake_kinds, row.queued_for_wake), (Some(Kind::ALL.to_vec()), Some(0)));
+	assert!(!argv_log(&e).contains("digest"));
 }
 
 #[test]
 fn pull_participants_see_every_kind_whatever_their_wake_kinds() {
-    let mut e = Env::new("heartbeat_ms = 300\n[participant.claude]\nproduct = \"claude\"\nwake_kinds = [\"request\"]\n");
-    e.start();
-    let asked = e.send("claude", "codex", "c", Kind::Request, "q", "claude asks");
-    let fin = stored_id(e.reply("codex", &asked, Kind::Final, "f"));
-    let info = e.send("codex", "claude", "c", Kind::Info, "i", "fyi");
-    let req = e.send("codex", "claude", "c", Kind::Request, "r", "act");
-    let out = e.cli(&["wait", "--as", "claude", "--follow", "--timeout", "1"], None);
-    let text = stdout(&out);
-    for id in [&fin, &info, &req] {
-        assert!(text.contains(id.as_str()), "{id} missing from: {text}");
-    }
-    let row = e.status(None).participants.unwrap().into_iter().find(|p| p.name == "claude").unwrap();
-    assert_eq!((row.wake_kinds, row.queued_for_wake), (None, None), "no push policy for a pull participant");
+	let mut e = Env::new("heartbeat_ms = 300\n[participant.claude]\nproduct = \"claude\"\nwake_kinds = [\"request\"]\n");
+	e.start();
+	let asked = e.send("claude", "codex", "c", Kind::Request, "q", "claude asks");
+	let fin = stored_id(e.reply("codex", &asked, Kind::Final, "f"));
+	let info = e.send("codex", "claude", "c", Kind::Info, "i", "fyi");
+	let req = e.send("codex", "claude", "c", Kind::Request, "r", "act");
+	let out = e.cli(&["wait", "--as", "claude", "--follow", "--timeout", "1"], None);
+	let text = stdout(&out);
+	for id in [&fin, &info, &req] {
+		assert!(text.contains(id.as_str()), "{id} missing from: {text}");
+	}
+	let row = e.status(None).participants.unwrap().into_iter().find(|p| p.name == "claude").unwrap();
+	assert_eq!((row.wake_kinds, row.queued_for_wake), (None, None), "no push policy for a pull participant");
 }
 
 #[test]
 fn an_unknown_wake_kind_stops_the_daemon_with_a_clear_error() {
-    let mut e = Env::new("[participant.codex]\nwake_kinds = [\"request\", \"reply\"]\n");
-    assert!(e.try_start(false).is_none(), "the daemon must refuse an unknown kind");
-    let mut err = String::new();
-    if let Some(mut d) = e.daemon.take() {
-        use std::io::Read;
-        let _ = d.stderr.take().unwrap().read_to_string(&mut err);
-    }
-    assert!(err.contains("participant.codex.wake_kinds") && err.contains("\"reply\""), "{err}");
+	let mut e = Env::new("[participant.codex]\nwake_kinds = [\"request\", \"reply\"]\n");
+	assert!(e.try_start(false).is_none(), "the daemon must refuse an unknown kind");
+	let mut err = String::new();
+	if let Some(mut d) = e.daemon.take() {
+		use std::io::Read;
+		let _ = d.stderr.take().unwrap().read_to_string(&mut err);
+	}
+	assert!(err.contains("participant.codex.wake_kinds") && err.contains("\"reply\""), "{err}");
 }
 
 // ---------------------------------------------------------------- endpoint unregister
 
 fn unregister(e: &Env, who: &str) -> Response {
-    e.call(Request::EndpointUnregister { name: who.into() })
+	e.call(Request::EndpointUnregister { name: who.into() })
 }
 
 #[test]
 fn unregister_makes_the_participant_pull_and_stops_pushes_and_its_inbox_stays_readable() {
-    let mut e = Env::new(
-        "heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\n[participant.codex]\nproduct = \"codex\"\n",
-    );
-    e.start();
-    let exe = fake_codex(&e, "exit 0");
-    register(&e, &exe, "s1");
-    let pushed = e.send("claude", "codex", "c", Kind::Request, "before", "pushed while bound");
-    wait_for("the push", Duration::from_secs(5), || attempts(&e, &pushed) == vec!["submitted"]);
-    let queued = e.send("claude", "codex", "c", Kind::Info, "queued", "waits for a wake");
-    assert_eq!(codex_row(&e).queued_for_wake, Some(1));
+	let mut e = Env::new(
+		"heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\n[participant.codex]\nproduct = \"codex\"\n",
+	);
+	e.start();
+	let exe = fake_codex(&e, "exit 0");
+	register(&e, &exe, "s1");
+	let pushed = e.send("claude", "codex", "c", Kind::Request, "before", "pushed while bound");
+	wait_for("the push", Duration::from_secs(5), || attempts(&e, &pushed) == vec!["submitted"]);
+	let queued = e.send("claude", "codex", "c", Kind::Info, "queued", "waits for a wake");
+	assert_eq!(codex_row(&e).queued_for_wake, Some(1));
 
-    let out = e.cli(&["endpoint", "unregister", "--as", "codex"], None);
-    assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert!(stdout(&out).contains("unregistered codex's endpoint (session s1, generation 1); codex now pulls"), "{}", stdout(&out));
-    let row = codex_row(&e);
-    assert_eq!((row.transport.as_str(), row.path_ready, row.session.as_deref()), ("pull", false, None));
-    assert_eq!((row.wake_kinds, row.queued_for_wake, row.health), (None, None, None), "no push policy and no inspection");
-    assert!(e.status(None).endpoints.is_empty());
-    let peers = stdout(&e.cli(&["peers"], None));
-    let line = peers.lines().find(|l| l.starts_with("codex")).unwrap();
-    assert!(line.contains("pull") && line.contains("no endpoint registered"), "{peers}");
+	let out = e.cli(&["endpoint", "unregister", "--as", "codex"], None);
+	assert_eq!(code(&out), 0, "{}", stderr(&out));
+	assert!(stdout(&out).contains("unregistered codex's endpoint (session s1, generation 1); codex now pulls"), "{}", stdout(&out));
+	let row = codex_row(&e);
+	assert_eq!((row.transport.as_str(), row.path_ready, row.session.as_deref()), ("pull", false, None));
+	assert_eq!((row.wake_kinds, row.queued_for_wake, row.health), (None, None, None), "no push policy and no inspection");
+	assert!(e.status(None).endpoints.is_empty());
+	let peers = stdout(&e.cli(&["peers"], None));
+	let line = peers.lines().find(|l| l.starts_with("codex")).unwrap();
+	assert!(line.contains("pull") && line.contains("no endpoint registered"), "{peers}");
 
-    let after = e.send("claude", "codex", "c", Kind::Request, "after", "sent after unregister");
-    std::thread::sleep(Duration::from_millis(800));
-    assert!(attempts(&e, &after).is_empty() && attempts(&e, &queued).is_empty(), "nothing is pushed after unregister");
-    assert_eq!(argv_log(&e).matches("queue").count(), 1, "only the push made while bound");
+	let after = e.send("claude", "codex", "c", Kind::Request, "after", "sent after unregister");
+	std::thread::sleep(Duration::from_millis(800));
+	assert!(attempts(&e, &after).is_empty() && attempts(&e, &queued).is_empty(), "nothing is pushed after unregister");
+	assert_eq!(argv_log(&e).matches("queue").count(), 1, "only the push made while bound");
 
-    let s = e.status(Some("codex"));
-    for id in [&pushed, &queued, &after] {
-        assert!(s.unacknowledged.iter().any(|l| l.id == *id && !l.received), "{id} stays unacknowledged");
-    }
-    let take = e.cli(&["take", "--as", "codex", "--id", &after], None);
-    assert_eq!(code(&take), 0, "{}", stderr(&take));
-    assert!(stdout(&take).contains("sent after unregister"));
-    let w = e.cli(&["wait", "--as", "codex", "--timeout", "5"], None);
-    assert_eq!(code(&w), 0, "{}", stderr(&w));
-    assert!(stdout(&w).contains(&pushed), "the oldest unacknowledged message is pulled: {}", stdout(&w));
+	let s = e.status(Some("codex"));
+	for id in [&pushed, &queued, &after] {
+		assert!(s.unacknowledged.iter().any(|l| l.id == *id && !l.received), "{id} stays unacknowledged");
+	}
+	let take = e.cli(&["take", "--as", "codex", "--id", &after], None);
+	assert_eq!(code(&take), 0, "{}", stderr(&take));
+	assert!(stdout(&take).contains("sent after unregister"));
+	let w = e.cli(&["wait", "--as", "codex", "--timeout", "5"], None);
+	assert_eq!(code(&w), 0, "{}", stderr(&w));
+	assert!(stdout(&w).contains(&pushed), "the oldest unacknowledged message is pulled: {}", stdout(&w));
 
-    let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
-    let ev = events.iter().find(|ev| ev.kind == "endpoint_unregistered").expect("an endpoint_unregistered event");
-    assert_eq!((ev.audience.as_str(), ev.detail["generation"].as_i64(), ev.detail["session"].as_str()), ("codex", Some(1), Some("s1")));
+	let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
+	let ev = events.iter().find(|ev| ev.kind == "endpoint_unregistered").expect("an endpoint_unregistered event");
+	assert_eq!((ev.audience.as_str(), ev.detail["generation"].as_i64(), ev.detail["session"].as_str()), ("codex", Some(1), Some("s1")));
 }
 
 #[test]
 fn unregister_is_idempotent_and_refuses_unknown_and_reserved_names() {
-    let mut e = Env::standard();
-    e.start();
-    register(&e, Path::new("/bin/true"), "s1");
-    assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), in_flight: 0, .. }));
-    let Response::Unregistered { name, removed, in_flight } = unregister(&e, "codex") else { panic!() };
-    assert_eq!((name.as_str(), removed, in_flight), ("codex", None, 0), "a second unregister changes nothing");
-    let out = e.cli(&["endpoint", "unregister", "--as", "codex"], None);
-    assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert!(stdout(&out).contains("codex has no endpoint; nothing to unregister"), "{}", stdout(&out));
-    let out = e.cli(&["--json", "endpoint", "unregister", "--as", "claude"], None);
-    assert_eq!(code(&out), 0, "a participant that never had an endpoint: {}", stderr(&out));
-    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-    assert_eq!((v["r"].as_str(), v["removed"].is_null()), (Some("unregistered"), true), "{v}");
-    let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
-    assert_eq!(events.iter().filter(|ev| ev.kind == "endpoint_unregistered").count(), 1, "a no-op writes no event");
+	let mut e = Env::standard();
+	e.start();
+	register(&e, Path::new("/bin/true"), "s1");
+	assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), in_flight: 0, .. }));
+	let Response::Unregistered { name, removed, in_flight } = unregister(&e, "codex") else { panic!() };
+	assert_eq!((name.as_str(), removed, in_flight), ("codex", None, 0), "a second unregister changes nothing");
+	let out = e.cli(&["endpoint", "unregister", "--as", "codex"], None);
+	assert_eq!(code(&out), 0, "{}", stderr(&out));
+	assert!(stdout(&out).contains("codex has no endpoint; nothing to unregister"), "{}", stdout(&out));
+	let out = e.cli(&["--json", "endpoint", "unregister", "--as", "claude"], None);
+	assert_eq!(code(&out), 0, "a participant that never had an endpoint: {}", stderr(&out));
+	let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	assert_eq!((v["r"].as_str(), v["removed"].is_null()), (Some("unregistered"), true), "{v}");
+	let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
+	assert_eq!(events.iter().filter(|ev| ev.kind == "endpoint_unregistered").count(), 1, "a no-op writes no event");
 
-    match unregister(&e, "nobody") {
-        Response::Error { code, .. } => assert_eq!(code, ErrorCode::UnknownParticipant),
-        other => panic!("{other:?}"),
-    }
-    let out = e.cli(&["endpoint", "unregister", "--as", "nobody"], None);
-    assert_eq!(code(&out), 5, "{}", stderr(&out));
-    match unregister(&e, "chatd") {
-        Response::Error { code, message } => assert!(code == ErrorCode::BadRequest && message.contains("reserved"), "{message}"),
-        other => panic!("{other:?}"),
-    }
+	match unregister(&e, "nobody") {
+		Response::Error { code, .. } => assert_eq!(code, ErrorCode::UnknownParticipant),
+		other => panic!("{other:?}"),
+	}
+	let out = e.cli(&["endpoint", "unregister", "--as", "nobody"], None);
+	assert_eq!(code(&out), 5, "{}", stderr(&out));
+	match unregister(&e, "chatd") {
+		Response::Error { code, message } => assert!(code == ErrorCode::BadRequest && message.contains("reserved"), "{message}"),
+		other => panic!("{other:?}"),
+	}
 }
 
 #[test]
 fn re_registering_after_unregister_gets_a_higher_generation_and_pushes_again() {
-    let mut e = Env::standard();
-    e.start();
-    let exe = fake_codex(&e, "exit 0");
-    assert_eq!(register(&e, &exe, "s1"), 1);
-    assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), .. }));
-    // No attempt was ever made under generation 1, so only the recorded generation keeps this monotonic.
-    assert_eq!(register(&e, &exe, "s2"), 2);
-    assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), .. }));
-    let waiting = e.send("claude", "codex", "c", Kind::Request, "waiting", "sent while pulling");
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(attempts(&e, &waiting).is_empty());
-    assert_eq!(register(&e, &exe, "s3"), 3);
-    assert_eq!(codex_row(&e).transport, "push");
-    wait_for("the push to the new session", Duration::from_secs(5), || attempts(&e, &waiting) == vec!["submitted"]);
-    assert!(argv_log(&e).contains("s3"));
-    // Generations survive a restart too.
-    assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), .. }));
-    e.term();
-    e.start();
-    assert_eq!(register(&e, &exe, "s4"), 4);
+	let mut e = Env::standard();
+	e.start();
+	let exe = fake_codex(&e, "exit 0");
+	assert_eq!(register(&e, &exe, "s1"), 1);
+	assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), .. }));
+	// No attempt was ever made under generation 1, so only the recorded generation keeps this monotonic.
+	assert_eq!(register(&e, &exe, "s2"), 2);
+	assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), .. }));
+	let waiting = e.send("claude", "codex", "c", Kind::Request, "waiting", "sent while pulling");
+	std::thread::sleep(Duration::from_millis(500));
+	assert!(attempts(&e, &waiting).is_empty());
+	assert_eq!(register(&e, &exe, "s3"), 3);
+	assert_eq!(codex_row(&e).transport, "push");
+	wait_for("the push to the new session", Duration::from_secs(5), || attempts(&e, &waiting) == vec!["submitted"]);
+	assert!(argv_log(&e).contains("s3"));
+	// Generations survive a restart too.
+	assert!(matches!(unregister(&e, "codex"), Response::Unregistered { removed: Some(_), .. }));
+	e.term();
+	e.start();
+	assert_eq!(register(&e, &exe, "s4"), 4);
 }
 
 #[test]
 fn a_submission_in_flight_during_unregister_finishes_fenced_and_is_never_retried() {
-    let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 5000\nretry_backoff_ms = [200, 200, 200]\n");
-    e.start();
-    let exe = fake_codex(&e, "sleep 1; exit 1");
-    register(&e, &exe, "s1");
-    let id = e.send("claude", "codex", "c", Kind::Request, "inflight", "in flight");
-    wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
-    let Response::Unregistered { removed, in_flight, .. } = unregister(&e, "codex") else { panic!() };
-    assert_eq!((removed.map(|r| r.generation), in_flight), (Some(1), 1));
-    wait_for("the in-flight attempt's result", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed"]);
-    let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
-    let last = events.iter().rev().find(|ev| ev.kind == "submission" && ev.message_id.as_deref() == Some(&id)).unwrap();
-    assert_eq!((last.detail["state"].as_str(), last.detail["stale_generation"].as_bool()), (Some("failed"), Some(true)));
-    std::thread::sleep(Duration::from_millis(800));
-    assert_eq!(attempts(&e, &id), vec!["failed"], "a failure under the removed binding is not retried");
-    let ok = fake_codex(&e, "exit 0");
-    assert_eq!(register(&e, &ok, "s2"), 2);
-    std::thread::sleep(Duration::from_millis(800));
-    assert_eq!(attempts(&e, &id), vec!["failed"], "nor against the next binding (fenced, like a rebind)");
-    assert!(e.status(Some("codex")).unacknowledged.iter().any(|l| l.id == id), "the message stays in the inbox");
-    let Response::Message(m) = e.call(Request::Receive { as_: "codex".into(), id: id.clone() }) else { panic!() };
-    assert_eq!(m.body.as_deref(), Some("in flight"));
-    e.call(Request::Redeliver { id: id.clone() });
-    wait_for("an explicit redelivery under generation 2", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed", "submitted"]);
+	let mut e = Env::new("heartbeat_ms = 300\nadapter_timeout_ms = 5000\nretry_backoff_ms = [200, 200, 200]\n");
+	e.start();
+	let exe = fake_codex(&e, "sleep 1; exit 1");
+	register(&e, &exe, "s1");
+	let id = e.send("claude", "codex", "c", Kind::Request, "inflight", "in flight");
+	wait_for("the attempt to start", Duration::from_secs(5), || attempts(&e, &id) == vec!["started"]);
+	let Response::Unregistered { removed, in_flight, .. } = unregister(&e, "codex") else { panic!() };
+	assert_eq!((removed.map(|r| r.generation), in_flight), (Some(1), 1));
+	wait_for("the in-flight attempt's result", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed"]);
+	let Response::Log { events } = e.call(Request::Log { conversation: None, since_seq: None, limit: 1000 }) else { panic!() };
+	let last = events.iter().rev().find(|ev| ev.kind == "submission" && ev.message_id.as_deref() == Some(&id)).unwrap();
+	assert_eq!((last.detail["state"].as_str(), last.detail["stale_generation"].as_bool()), (Some("failed"), Some(true)));
+	std::thread::sleep(Duration::from_millis(800));
+	assert_eq!(attempts(&e, &id), vec!["failed"], "a failure under the removed binding is not retried");
+	let ok = fake_codex(&e, "exit 0");
+	assert_eq!(register(&e, &ok, "s2"), 2);
+	std::thread::sleep(Duration::from_millis(800));
+	assert_eq!(attempts(&e, &id), vec!["failed"], "nor against the next binding (fenced, like a rebind)");
+	assert!(e.status(Some("codex")).unacknowledged.iter().any(|l| l.id == id), "the message stays in the inbox");
+	let Response::Message(m) = e.call(Request::Receive { as_: "codex".into(), id: id.clone() }) else { panic!() };
+	assert_eq!(m.body.as_deref(), Some("in flight"));
+	e.call(Request::Redeliver { id: id.clone() });
+	wait_for("an explicit redelivery under generation 2", Duration::from_secs(5), || attempts(&e, &id) == vec!["failed", "submitted"]);
 }
 
 #[test]
 fn current_work_cli_retains_received_requests_and_explicit_history() {
-    let mut e = Env::standard();
-    e.start();
-    let old = e.send("claude", "codex", "current-work", Kind::Request, "old", "old task");
-    let new = e.send("claude", "codex", "current-work", Kind::Request, "new", "new task");
-    assert_eq!(code(&e.cli(&["ack", "--as", "codex", &old], None)), 0);
-    let text = stdout(&e.cli(&["status", "--current", "--as", "codex"], None));
-    assert!(text.starts_with("endpoints / threads:"));
-    assert!(text.contains("[received-pending]"));
-    assert_eq!(code(&e.cli(&["supersede", "--as", "codex", "--id", &old, "--by", &new, "--reason", "new request"], None)), 5);
-    assert_eq!(code(&e.cli(&["supersede", "--as", "claude", "--id", &old, "--by", &new, "--reason", "new request"], None)), 0);
-    let out = e.cli(&["--json", "status", "--current", "--as", "codex"], None);
-    let current: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-    assert_eq!(current["total"], 1);
-    assert_eq!(current["rows"][0]["message"]["id"], new);
-    let text = stdout(&e.cli(&["status", "--current", "--history", "--as", "codex"], None));
-    assert!(text.contains("[superseded]"));
-    assert!(text.contains("new request"));
-    assert_eq!(e.status(Some("codex")).unanswered_total, 2);
-    assert_eq!(code(&e.cli(&["rehearsal", "--as", "claude", "--id", &new, "--reason", "synthetic probe"], None)), 0);
-    let out = e.cli(&["--json", "status", "--current"], None);
-    let current: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-    assert_eq!(current["total"], 0);
+	let mut e = Env::standard();
+	e.start();
+	let old = e.send("claude", "codex", "current-work", Kind::Request, "old", "old task");
+	let new = e.send("claude", "codex", "current-work", Kind::Request, "new", "new task");
+	assert_eq!(code(&e.cli(&["ack", "--as", "codex", &old], None)), 0);
+	let text = stdout(&e.cli(&["status", "--current", "--as", "codex"], None));
+	assert!(text.starts_with("endpoints / threads:"));
+	assert!(text.contains("[received-pending]"));
+	assert_eq!(code(&e.cli(&["supersede", "--as", "codex", "--id", &old, "--by", &new, "--reason", "new request"], None)), 5);
+	assert_eq!(code(&e.cli(&["supersede", "--as", "claude", "--id", &old, "--by", &new, "--reason", "new request"], None)), 0);
+	let out = e.cli(&["--json", "status", "--current", "--as", "codex"], None);
+	let current: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	assert_eq!(current["total"], 1);
+	assert_eq!(current["rows"][0]["message"]["id"], new);
+	let text = stdout(&e.cli(&["status", "--current", "--history", "--as", "codex"], None));
+	assert!(text.contains("[superseded]"));
+	assert!(text.contains("new request"));
+	assert_eq!(e.status(Some("codex")).unanswered_total, 2);
+	assert_eq!(code(&e.cli(&["rehearsal", "--as", "claude", "--id", &new, "--reason", "synthetic probe"], None)), 0);
+	let out = e.cli(&["--json", "status", "--current"], None);
+	let current: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	assert_eq!(current["total"], 0);
 }
 
 #[test]
 fn schema_one_backup_restores_then_migrates_without_touching_the_backup() {
-    let mut e = Env::standard();
-    let (backup, _, _) = restore_fixture(&mut e);
-    {
-        let c = rusqlite::Connection::open(&backup).unwrap();
-        c.execute_batch("DROP TABLE work_annotations; UPDATE meta SET value='1' WHERE key='schema_version'").unwrap();
-    }
-    let original = std::fs::read(&backup).unwrap();
-    assert!(run_restore(&e, &backup, None).status.success());
-    e.start();
-    assert_eq!(facts(&e).1, 1);
-    assert!(matches!(e.call(Request::Health), Response::Health { schema_version: 2, .. }));
-    assert_eq!(std::fs::read(&backup).unwrap(), original);
+	let mut e = Env::standard();
+	let (backup, _, _) = restore_fixture(&mut e);
+	{
+		let c = rusqlite::Connection::open(&backup).unwrap();
+		c.execute_batch("DROP TABLE work_annotations; UPDATE meta SET value='1' WHERE key='schema_version'").unwrap();
+	}
+	let original = std::fs::read(&backup).unwrap();
+	assert!(run_restore(&e, &backup, None).status.success());
+	e.start();
+	assert_eq!(facts(&e).1, 1);
+	assert!(matches!(e.call(Request::Health), Response::Health { schema_version: 2, .. }));
+	assert_eq!(std::fs::read(&backup).unwrap(), original);
 }
 
 #[test]
 fn a_burst_to_a_busy_agent_is_one_push_then_one_digest_after_the_interval() {
-    // The 2026-10-23 storm: sluice notices arrived as requests while Codex was mid-turn, and each became its
-    // own queued prompt. One push may be in flight; the rest ride in the next push's digest.
-    let mut e = Env::new(
-        "heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\npush_min_interval_ms = 1000\npush_inflight_ms = 60000\n",
-    );
-    e.start();
-    let exe = fake_codex(&e, "exit 0");
-    register(&e, &exe, "s1");
-    let ids: Vec<String> = (0..30).map(|i| e.send("claude", "codex", "c", Kind::Request, &format!("n{i}"), &format!("exit {i}"))).collect();
-    wait_for("the first push", Duration::from_secs(5), || attempts(&e, &ids[0]) == vec!["submitted"]);
-    std::thread::sleep(Duration::from_millis(1500));
-    assert_eq!(argv_log(&e).matches("--message").count(), 1, "an unacknowledged push blocks the next one");
+	// The 2026-10-23 storm: sluice notices arrived as requests while Codex was mid-turn, and each became its
+	// own queued prompt. One push may be in flight; the rest ride in the next push's digest.
+	let mut e = Env::new(
+		"heartbeat_ms = 300\nadapter_timeout_ms = 1500\nretry_backoff_ms = [200, 200, 200]\npush_min_interval_ms = 1000\npush_inflight_ms = 60000\n",
+	);
+	e.start();
+	let exe = fake_codex(&e, "exit 0");
+	register(&e, &exe, "s1");
+	let ids: Vec<String> = (0..30).map(|i| e.send("claude", "codex", "c", Kind::Request, &format!("n{i}"), &format!("exit {i}"))).collect();
+	wait_for("the first push", Duration::from_secs(5), || attempts(&e, &ids[0]) == vec!["submitted"]);
+	std::thread::sleep(Duration::from_millis(1500));
+	assert_eq!(argv_log(&e).matches("--message").count(), 1, "an unacknowledged push blocks the next one");
 
-    e.call(Request::Ack { as_: "codex".into(), ids: vec![ids[0].clone()] });
-    wait_for("the second push", Duration::from_secs(5), || argv_log(&e).matches("--message").count() == 2);
-    let argv = argv_log(&e);
-    assert!(argv.contains("[chatd digest for codex:"), "the rest ride in a digest: {argv}");
-    assert!(argv.contains(&ids[29]) || argv.contains("more ("), "the digest reaches the newest or says how many remain");
-    let individually_pushed = ids.iter().filter(|id| !attempts(&e, id).is_empty()).count();
-    assert_eq!(individually_pushed, 2, "only the two waking messages were pushed on their own");
-    std::thread::sleep(Duration::from_millis(1500));
-    assert_eq!(argv_log(&e).matches("--message").count(), 2, "the second push is in flight, so nothing more is sent");
+	e.call(Request::Ack { as_: "codex".into(), ids: vec![ids[0].clone()] });
+	wait_for("the second push", Duration::from_secs(5), || argv_log(&e).matches("--message").count() == 2);
+	let argv = argv_log(&e);
+	assert!(argv.contains("[chatd digest for codex:"), "the rest ride in a digest: {argv}");
+	assert!(argv.contains(&ids[29]) || argv.contains("more ("), "the digest reaches the newest or says how many remain");
+	let individually_pushed = ids.iter().filter(|id| !attempts(&e, id).is_empty()).count();
+	assert_eq!(individually_pushed, 2, "only the two waking messages were pushed on their own");
+	std::thread::sleep(Duration::from_millis(1500));
+	assert_eq!(argv_log(&e).matches("--message").count(), 2, "the second push is in flight, so nothing more is sent");
 }
 
 #[test]
 fn a_rebound_endpoint_pushes_fresh_work_without_waiting_for_the_old_unacknowledged_push() {
-    let mut e = Env::new("push_min_interval_ms = 300000\npush_inflight_ms = 3600000\n");
-    e.start();
-    let exe = fake_codex(&e, "exit 0");
-    register(&e, &exe, "old-session");
-    let old = e.send("claude", "codex", "c", Kind::Request, "old", "old request");
-    wait_for("old submitted push", Duration::from_secs(5), || attempts(&e, &old) == vec!["submitted"]);
-    register(&e, &exe, "new-session");
-    let fresh = e.send("claude", "codex", "c", Kind::Request, "fresh", "fresh request");
-    wait_for("new-generation push", Duration::from_secs(5), || attempts(&e, &fresh) == vec!["submitted"]);
-    assert_eq!(attempts(&e, &old), vec!["submitted"], "old submission is not retried");
-    let argv = argv_log(&e);
-    assert!(argv.contains("old-session") && argv.contains("new-session"), "{argv}");
-    assert_eq!(argv.matches("--message").count(), 2);
-    let take = e.cli(&["take", "--as", "codex", "--id", &old], None);
-    assert!(take.status.success(), "the old message remains unacknowledged and readable");
+	let mut e = Env::new("push_min_interval_ms = 300000\npush_inflight_ms = 3600000\n");
+	e.start();
+	let exe = fake_codex(&e, "exit 0");
+	register(&e, &exe, "old-session");
+	let old = e.send("claude", "codex", "c", Kind::Request, "old", "old request");
+	wait_for("old submitted push", Duration::from_secs(5), || attempts(&e, &old) == vec!["submitted"]);
+	register(&e, &exe, "new-session");
+	let fresh = e.send("claude", "codex", "c", Kind::Request, "fresh", "fresh request");
+	wait_for("new-generation push", Duration::from_secs(5), || attempts(&e, &fresh) == vec!["submitted"]);
+	assert_eq!(attempts(&e, &old), vec!["submitted"], "old submission is not retried");
+	let argv = argv_log(&e);
+	assert!(argv.contains("old-session") && argv.contains("new-session"), "{argv}");
+	assert_eq!(argv.matches("--message").count(), 2);
+	let take = e.cli(&["take", "--as", "codex", "--id", &old], None);
+	assert!(take.status.success(), "the old message remains unacknowledged and readable");
 }
 
 // ---- plan 0008: CLI-only pull wake filtering ----
 
 fn json_message_ids(out: &Output) -> Vec<String> {
-    stdout(out)
-        .lines()
-        .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).expect("only message JSON on stdout")["id"].as_str().unwrap().to_owned()
-        })
-        .collect()
+	stdout(out)
+		.lines()
+		.map(|line| {
+			serde_json::from_str::<serde_json::Value>(line).expect("only message JSON on stdout")["id"].as_str().unwrap().to_owned()
+		})
+		.collect()
 }
 
 #[test]
 fn wake_filter_rejects_invalid_sets_before_connecting() {
-    let e = Env::standard(); // Deliberately no daemon: these are argument errors.
-    for kinds in ["", "request,", ",info", "Request", "all,bogus"] {
-        let out = e.cli(&["wait", "--as", "claude", "--wake-on", kinds], None);
-        assert_eq!(code(&out), 2, "{kinds:?}: {}", stderr(&out));
-        assert!(stderr(&out).contains("invalid wake kind"));
-    }
+	let e = Env::standard(); // Deliberately no daemon: these are argument errors.
+	for kinds in ["", "request,", ",info", "Request", "all,bogus"] {
+		let out = e.cli(&["wait", "--as", "claude", "--wake-on", kinds], None);
+		assert_eq!(code(&out), 2, "{kinds:?}: {}", stderr(&out));
+		assert!(stderr(&out).contains("invalid wake kind"));
+	}
 }
 
 #[test]
 fn filtered_one_shot_prints_selected_first_then_context_and_takes_only_whole_bodies() {
-    for take in [false, true] {
-        let mut e = Env::standard();
-        e.start();
-        let info = e.send("codex", "claude", "c", Kind::Info, "i", "context");
-        let long = e.send("codex", "claude", "c", Kind::Info, "long", &"x".repeat(5000));
-        let req = e.send("codex", "claude", "c", Kind::Request, "r", "act");
-        let later = e.send("codex", "claude", "c", Kind::Info, "later", "after the trigger");
-        let mut args = vec!["wait", "--as", "claude", "--wake-on", "request,final", "--full"];
-        if take {
-            args.push("--take");
-        }
-        let out = e.cli(&args, None);
-        assert_eq!(code(&out), 0, "{}", stderr(&out));
-        assert_eq!(json_message_ids(&out), vec![req.clone(), info.clone(), long.clone()]);
-        let remaining: Vec<_> = e.status(Some("claude")).unacknowledged.into_iter().map(|m| m.id).collect();
-        assert_eq!(remaining, if take { vec![long, later] } else { vec![info, long, req, later] });
-    }
+	for take in [false, true] {
+		let mut e = Env::standard();
+		e.start();
+		let info = e.send("codex", "claude", "c", Kind::Info, "i", "context");
+		let long = e.send("codex", "claude", "c", Kind::Info, "long", &"x".repeat(5000));
+		let req = e.send("codex", "claude", "c", Kind::Request, "r", "act");
+		let later = e.send("codex", "claude", "c", Kind::Info, "later", "after the trigger");
+		let mut args = vec!["wait", "--as", "claude", "--wake-on", "request,final", "--full"];
+		if take {
+			args.push("--take");
+		}
+		let out = e.cli(&args, None);
+		assert_eq!(code(&out), 0, "{}", stderr(&out));
+		assert_eq!(json_message_ids(&out), vec![req.clone(), info.clone(), long.clone()]);
+		let remaining: Vec<_> = e.status(Some("claude")).unacknowledged.into_iter().map(|m| m.id).collect();
+		assert_eq!(remaining, if take { vec![long, later] } else { vec![info, long, req, later] });
+	}
 }
 
 #[test]
 fn filtered_snapshot_pages_preserve_every_selected_message_and_bound_context() {
-    let mut e = Env::standard();
-    e.start();
-    let mut held = Vec::new();
-    for i in 0..205 {
-        held.push(e.send("codex", "claude", "c", Kind::Info, &format!("i{i}"), "held"));
-    }
-    let first = e.send("codex", "claude", "c", Kind::Request, "r1", "first trigger on page two");
-    let between = e.send("codex", "claude", "c", Kind::Info, "between", "buffer already full");
-    let second = e.send("codex", "claude", "c", Kind::Request, "r2", "another trigger");
-    // One-shot waits for the snapshot, but takes only the first trigger and bounded context.
-    let out = e.cli(&["wait", "--as", "claude", "--wake-on", "request", "--full"], None);
-    let mut expected = vec![first.clone()];
-    expected.extend_from_slice(&held[..20]);
-    assert_eq!(json_message_ids(&out), expected);
-    assert!(stderr(&out).contains("more held messages may remain"));
-    // Follow must retain both triggers across pages; overflow is not silently recovered or acked.
-    let out = e.cli(&["wait", "--as", "claude", "--wake-on", "request", "--full", "--take", "--follow", "--timeout", "1"], None);
-    expected.push(second);
-    assert_eq!(code(&out), 6);
-    assert_eq!(json_message_ids(&out), expected);
-    assert_eq!(stderr(&out).matches("more held messages may remain").count(), 2);
-    let remaining = e.status(Some("claude")).unacknowledged;
-    let mut expected_left = held[20..].to_vec();
-    expected_left.push(between);
-    assert_eq!(remaining.into_iter().map(|m| m.id).collect::<Vec<_>>(), expected_left);
+	let mut e = Env::standard();
+	e.start();
+	let mut held = Vec::new();
+	for i in 0..205 {
+		held.push(e.send("codex", "claude", "c", Kind::Info, &format!("i{i}"), "held"));
+	}
+	let first = e.send("codex", "claude", "c", Kind::Request, "r1", "first trigger on page two");
+	let between = e.send("codex", "claude", "c", Kind::Info, "between", "buffer already full");
+	let second = e.send("codex", "claude", "c", Kind::Request, "r2", "another trigger");
+	// One-shot waits for the snapshot, but takes only the first trigger and bounded context.
+	let out = e.cli(&["wait", "--as", "claude", "--wake-on", "request", "--full"], None);
+	let mut expected = vec![first.clone()];
+	expected.extend_from_slice(&held[..20]);
+	assert_eq!(json_message_ids(&out), expected);
+	assert!(stderr(&out).contains("more held messages may remain"));
+	// Follow must retain both triggers across pages; overflow is not silently recovered or acked.
+	let out = e.cli(&["wait", "--as", "claude", "--wake-on", "request", "--full", "--take", "--follow", "--timeout", "1"], None);
+	expected.push(second);
+	assert_eq!(code(&out), 6);
+	assert_eq!(json_message_ids(&out), expected);
+	assert_eq!(stderr(&out).matches("more held messages may remain").count(), 2);
+	let remaining = e.status(Some("claude")).unacknowledged;
+	let mut expected_left = held[20..].to_vec();
+	expected_left.push(between);
+	assert_eq!(remaining.into_iter().map(|m| m.id).collect::<Vec<_>>(), expected_left);
 }
 
 #[test]
 fn filtered_follow_assigns_context_to_the_next_trigger_only() {
-    let mut e = Env::standard();
-    e.start();
-    let a = e.send("codex", "claude", "c", Kind::Info, "a", "before first");
-    let first = e.send("codex", "claude", "c", Kind::Request, "r1", "first");
-    let b = e.send("codex", "claude", "c", Kind::Info, "b", "between");
-    let second = e.send("codex", "claude", "c", Kind::Request, "r2", "second");
-    let out = e.cli(&["wait", "--as", "claude", "--wake-on", "request", "--full", "--follow", "--timeout", "1"], None);
-    assert_eq!(code(&out), 6);
-    assert_eq!(json_message_ids(&out), vec![first, a, second, b]);
-    assert_eq!(e.status(Some("claude")).unacknowledged.len(), 4);
+	let mut e = Env::standard();
+	e.start();
+	let a = e.send("codex", "claude", "c", Kind::Info, "a", "before first");
+	let first = e.send("codex", "claude", "c", Kind::Request, "r1", "first");
+	let b = e.send("codex", "claude", "c", Kind::Info, "b", "between");
+	let second = e.send("codex", "claude", "c", Kind::Request, "r2", "second");
+	let out = e.cli(&["wait", "--as", "claude", "--wake-on", "request", "--full", "--follow", "--timeout", "1"], None);
+	assert_eq!(code(&out), 6);
+	assert_eq!(json_message_ids(&out), vec![first, a, second, b]);
+	assert_eq!(e.status(Some("claude")).unacknowledged.len(), 4);
 }
 
 #[test]
 fn filtered_live_messages_form_batches_and_reconnect_rebuilds_unacked_context() {
-    use std::io::{BufRead, BufReader};
-    let mut e = Env::standard();
-    e.start();
-    let ready = e.send("codex", "claude", "c", Kind::Request, "ready", "snapshot trigger");
-    let mut child = e.spawn_wait(&["--wake-on", "request,final", "--full", "--timeout", "10"]);
-    let mut lines = BufReader::new(child.stdout.take().unwrap());
-    let read_id = |lines: &mut BufReader<std::process::ChildStdout>| {
-        let mut line = String::new();
-        lines.read_line(&mut line).unwrap();
-        serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"].as_str().unwrap().to_owned()
-    };
-    assert_eq!(read_id(&mut lines), ready);
-    let ask = e.send("claude", "codex", "c", Kind::Request, "ask", "work");
-    let progress = stored_id(e.reply("codex", &ask, Kind::Progress, "step"));
-    let info = e.send("codex", "claude", "c", Kind::Info, "info", "context");
-    let final_id = stored_id(e.reply("codex", &ask, Kind::Final, "done"));
-    assert_eq!(read_id(&mut lines), final_id);
-    assert_eq!(read_id(&mut lines), progress);
-    assert_eq!(read_id(&mut lines), info);
-    let next = e.send("codex", "claude", "c", Kind::Request, "next", "no repeated context");
-    assert_eq!(read_id(&mut lines), next);
-    e.kill9();
-    e.start();
-    // All messages were unacked. Restart gives a new snapshot and restores held context.
-    assert_eq!(read_id(&mut lines), ready);
-    assert_eq!(read_id(&mut lines), final_id);
-    assert_eq!(read_id(&mut lines), progress);
-    assert_eq!(read_id(&mut lines), info);
-    assert_eq!(read_id(&mut lines), next);
-    let _ = finish(child);
+	use std::io::{BufRead, BufReader};
+	let mut e = Env::standard();
+	e.start();
+	let ready = e.send("codex", "claude", "c", Kind::Request, "ready", "snapshot trigger");
+	let mut child = e.spawn_wait(&["--wake-on", "request,final", "--full", "--timeout", "10"]);
+	let mut lines = BufReader::new(child.stdout.take().unwrap());
+	let read_id = |lines: &mut BufReader<std::process::ChildStdout>| {
+		let mut line = String::new();
+		lines.read_line(&mut line).unwrap();
+		serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"].as_str().unwrap().to_owned()
+	};
+	assert_eq!(read_id(&mut lines), ready);
+	let ask = e.send("claude", "codex", "c", Kind::Request, "ask", "work");
+	let progress = stored_id(e.reply("codex", &ask, Kind::Progress, "step"));
+	let info = e.send("codex", "claude", "c", Kind::Info, "info", "context");
+	let final_id = stored_id(e.reply("codex", &ask, Kind::Final, "done"));
+	assert_eq!(read_id(&mut lines), final_id);
+	assert_eq!(read_id(&mut lines), progress);
+	assert_eq!(read_id(&mut lines), info);
+	let next = e.send("codex", "claude", "c", Kind::Request, "next", "no repeated context");
+	assert_eq!(read_id(&mut lines), next);
+	e.kill9();
+	e.start();
+	// All messages were unacked. Restart gives a new snapshot and restores held context.
+	assert_eq!(read_id(&mut lines), ready);
+	assert_eq!(read_id(&mut lines), final_id);
+	assert_eq!(read_id(&mut lines), progress);
+	assert_eq!(read_id(&mut lines), info);
+	assert_eq!(read_id(&mut lines), next);
+	let _ = finish(child);
 }
 
 #[test]
 fn held_only_wait_times_out_without_output_or_acknowledgement() {
-    for take in [false, true] {
-        let mut e = Env::standard();
-        e.start();
-        let id = e.send("codex", "claude", "c", Kind::Info, "held", "not a trigger");
-        let mut args = vec!["wait", "--as", "claude", "--wake-on", "request", "--full", "--timeout", "1"];
-        if take {
-            args.push("--take");
-        }
-        let out = e.cli(&args, None);
-        assert_eq!(code(&out), 6);
-        assert!(stdout(&out).is_empty());
-        assert!(stderr(&out).contains("timeout"));
-        assert_eq!(e.status(Some("claude")).unacknowledged[0].id, id);
-    }
+	for take in [false, true] {
+		let mut e = Env::standard();
+		e.start();
+		let id = e.send("codex", "claude", "c", Kind::Info, "held", "not a trigger");
+		let mut args = vec!["wait", "--as", "claude", "--wake-on", "request", "--full", "--timeout", "1"];
+		if take {
+			args.push("--take");
+		}
+		let out = e.cli(&args, None);
+		assert_eq!(code(&out), 6);
+		assert!(stdout(&out).is_empty());
+		assert!(stderr(&out).contains("timeout"));
+		assert_eq!(e.status(Some("claude")).unacknowledged[0].id, id);
+	}
 }
 
 #[test]
 fn all_wake_kinds_preserve_the_unfiltered_one_shot() {
-    let mut e = Env::standard();
-    e.start();
-    let info = e.send("codex", "claude", "c", Kind::Info, "first", "first");
-    e.send("codex", "claude", "c", Kind::Request, "next", "next");
-    for kinds in [None, Some("all"), Some("info,request,final,progress"), Some("all,request")] {
-        let mut args = vec!["wait", "--as", "claude", "--full"];
-        if let Some(kinds) = kinds {
-            args.extend(["--wake-on", kinds]);
-        }
-        let out = e.cli(&args, None);
-        assert_eq!(code(&out), 0);
-        assert_eq!(json_message_ids(&out), vec![info.clone()]);
-    }
+	let mut e = Env::standard();
+	e.start();
+	let info = e.send("codex", "claude", "c", Kind::Info, "first", "first");
+	e.send("codex", "claude", "c", Kind::Request, "next", "next");
+	for kinds in [None, Some("all"), Some("info,request,final,progress"), Some("all,request")] {
+		let mut args = vec!["wait", "--as", "claude", "--full"];
+		if let Some(kinds) = kinds {
+			args.extend(["--wake-on", kinds]);
+		}
+		let out = e.cli(&args, None);
+		assert_eq!(code(&out), 0);
+		assert_eq!(json_message_ids(&out), vec![info.clone()]);
+	}
 }
 
 #[test]
 fn filtered_batch_write_failure_keeps_unprinted_context_unacknowledged() {
-    use std::os::unix::process::CommandExt;
-    let mut e = Env::standard();
-    e.start();
-    let held = e.send("codex", "claude", "c", Kind::Info, "held", "context body");
-    let later = e.send("codex", "claude", "c", Kind::Info, "later", "never printed");
-    let selected = e.send("codex", "claude", "c", Kind::Request, "selected", "trigger");
-    let args = ["wait", "--as", "claude", "--wake-on", "request", "--full"];
-    let baseline = e.cli(&args, None);
-    assert_eq!(code(&baseline), 0);
-    let first_len = stdout(&baseline).lines().next().unwrap().len() + 1;
-    let path = e.dir.join("bounded-output");
-    let file = std::fs::File::create(&path).unwrap();
-    let mut cmd = Command::new(CLI);
-    e.envs(&mut cmd);
-    // The selected JSON line fits; the next line writes partially and then fails with EFBIG.
-    unsafe {
-        cmd.pre_exec(move || {
-            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-            let limit = libc::rlimit { rlim_cur: (first_len + 10) as _, rlim_max: (first_len + 10) as _ };
-            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let out = cmd.args(args).arg("--take").stdout(file).stderr(Stdio::piped()).output().unwrap();
-    assert_eq!(code(&out), 1);
-    assert!(stderr(&out).contains("not acknowledged"));
-    let printed = std::fs::read_to_string(path).unwrap();
-    let first: serde_json::Value = serde_json::from_str(printed.lines().next().unwrap()).unwrap();
-    assert_eq!(first["id"], selected);
-    assert_eq!(e.status(Some("claude")).unacknowledged.into_iter().map(|m| m.id).collect::<Vec<_>>(), vec![held, later]);
+	use std::os::unix::process::CommandExt;
+	let mut e = Env::standard();
+	e.start();
+	let held = e.send("codex", "claude", "c", Kind::Info, "held", "context body");
+	let later = e.send("codex", "claude", "c", Kind::Info, "later", "never printed");
+	let selected = e.send("codex", "claude", "c", Kind::Request, "selected", "trigger");
+	let args = ["wait", "--as", "claude", "--wake-on", "request", "--full"];
+	let baseline = e.cli(&args, None);
+	assert_eq!(code(&baseline), 0);
+	let first_len = stdout(&baseline).lines().next().unwrap().len() + 1;
+	let path = e.dir.join("bounded-output");
+	let file = std::fs::File::create(&path).unwrap();
+	let mut cmd = Command::new(CLI);
+	e.envs(&mut cmd);
+	// The selected JSON line fits; the next line writes partially and then fails with EFBIG.
+	unsafe {
+		cmd.pre_exec(move || {
+			libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+			let limit = libc::rlimit { rlim_cur: (first_len + 10) as _, rlim_max: (first_len + 10) as _ };
+			if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+				return Err(std::io::Error::last_os_error());
+			}
+			Ok(())
+		});
+	}
+	let out = cmd.args(args).arg("--take").stdout(file).stderr(Stdio::piped()).output().unwrap();
+	assert_eq!(code(&out), 1);
+	assert!(stderr(&out).contains("not acknowledged"));
+	let printed = std::fs::read_to_string(path).unwrap();
+	let first: serde_json::Value = serde_json::from_str(printed.lines().next().unwrap()).unwrap();
+	assert_eq!(first["id"], selected);
+	assert_eq!(e.status(Some("claude")).unacknowledged.into_iter().map(|m| m.id).collect::<Vec<_>>(), vec![held, later]);
 }
 
 #[test]
 fn unfiltered_wait_returns_before_snapshot_end_but_filtered_wait_waits_for_it() {
-    use chatd::proto::{ClientFrame, MessageView, PROTOCOL_VERSION, ServerFrame, read_frame, write_frame};
-    use std::os::unix::net::UnixListener;
-    for kinds in [None, Some("all"), Some("info")] {
-        let e = Env::standard();
-        let listener = UnixListener::bind(e.socket()).unwrap();
-        // An isolated protocol fixture deliberately withholds SnapshotEnd until the CLI disconnects.
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let request: ClientFrame = read_frame(&mut socket).unwrap().unwrap();
-            assert!(matches!(request.req, Request::Watch { .. }));
-            let message = MessageView {
-                id: "00000000-0000-4000-8000-000000000001".into(),
-                seq: 1,
-                conversation: "c".into(),
-                sender: "codex".into(),
-                recipient: "claude".into(),
-                kind: Kind::Info,
-                reply_to: None,
-                summary: "from first page".into(),
-                created_at_ms: 0,
-                idempotency_key: "key".into(),
-                body: None,
-                received_at_ms: None,
-                answered_by: None,
-            };
-            for resp in [
-                Response::SnapshotBegin {
-                    head_seq: 1,
-                    resume_token: "token".into(),
-                    unacknowledged_total: 1,
-                    resynchronized: None,
-                    other_watchers: Some(0),
-                },
-                Response::SnapshotPage { unacknowledged: vec![message] },
-            ] {
-                write_frame(&mut socket, &ServerFrame { v: PROTOCOL_VERSION, resp }).unwrap();
-            }
-            let mut byte = [0];
-            assert_eq!(socket.read(&mut byte).unwrap(), 0, "CLI disconnects without SnapshotEnd");
-        });
-        let mut args = vec!["wait", "--as", "claude", "--timeout", "1"];
-        if let Some(kinds) = kinds {
-            args.extend(["--wake-on", kinds]);
-        }
-        let out = e.cli(&args, None);
-        server.join().unwrap();
-        if kinds == Some("info") {
-            assert_eq!(code(&out), 6);
-            assert!(stdout(&out).is_empty(), "filtered snapshot waits for its boundary");
-        } else {
-            assert_eq!(code(&out), 0);
-            assert!(stdout(&out).contains("from first page"));
-        }
-    }
+	use chatd::proto::{ClientFrame, MessageView, PROTOCOL_VERSION, ServerFrame, read_frame, write_frame};
+	use std::os::unix::net::UnixListener;
+	for kinds in [None, Some("all"), Some("info")] {
+		let e = Env::standard();
+		let listener = UnixListener::bind(e.socket()).unwrap();
+		// An isolated protocol fixture deliberately withholds SnapshotEnd until the CLI disconnects.
+		let server = std::thread::spawn(move || {
+			let (mut socket, _) = listener.accept().unwrap();
+			socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+			let request: ClientFrame = read_frame(&mut socket).unwrap().unwrap();
+			assert!(matches!(request.req, Request::Watch { .. }));
+			let message = MessageView {
+				id: "00000000-0000-4000-8000-000000000001".into(),
+				seq: 1,
+				conversation: "c".into(),
+				sender: "codex".into(),
+				recipient: "claude".into(),
+				kind: Kind::Info,
+				reply_to: None,
+				summary: "from first page".into(),
+				created_at_ms: 0,
+				idempotency_key: "key".into(),
+				body: None,
+				received_at_ms: None,
+				answered_by: None,
+			};
+			for resp in [
+				Response::SnapshotBegin {
+					head_seq: 1,
+					resume_token: "token".into(),
+					unacknowledged_total: 1,
+					resynchronized: None,
+					other_watchers: Some(0),
+				},
+				Response::SnapshotPage { unacknowledged: vec![message] },
+			] {
+				write_frame(&mut socket, &ServerFrame { v: PROTOCOL_VERSION, resp }).unwrap();
+			}
+			let mut byte = [0];
+			assert_eq!(socket.read(&mut byte).unwrap(), 0, "CLI disconnects without SnapshotEnd");
+		});
+		let mut args = vec!["wait", "--as", "claude", "--timeout", "1"];
+		if let Some(kinds) = kinds {
+			args.extend(["--wake-on", kinds]);
+		}
+		let out = e.cli(&args, None);
+		server.join().unwrap();
+		if kinds == Some("info") {
+			assert_eq!(code(&out), 6);
+			assert!(stdout(&out).is_empty(), "filtered snapshot waits for its boundary");
+		} else {
+			assert_eq!(code(&out), 0);
+			assert!(stdout(&out).contains("from first page"));
+		}
+	}
 }
 
 // ---- plan 0009: receipt policy observations ----
 
 #[test]
 fn receipt_cli_keeps_stdout_stable_and_json_structured_for_send_and_reply() {
-    let mut e = Env::standard();
-    e.start();
-    let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "receipt"];
-    let plain = e.cli(&args, Some("body"));
-    assert_eq!(code(&plain), 0);
-    let id = stdout(&plain).split_whitespace().next().unwrap().to_owned();
-    let Response::Found(found) = e.call(Request::Lookup { sender: "claude".into(), idempotency_key: "receipt".into() }) else { panic!() };
-    assert!(found.delivery.is_none(), "lookup remains unenriched");
-    assert_eq!(stdout(&plain), format!("{id} (seq {}, key receipt)\n", found.seq));
-    assert!(stderr(&plain).contains("chatctl: delivery: pull inbox; no watcher for this conversation"));
-    let mut json_args = args.to_vec();
-    json_args.push("--json");
-    let out = e.cli(&json_args, Some("body"));
-    let receipt: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-    assert_eq!(receipt["duplicate"], true);
-    assert_eq!(receipt["delivery"]["policy"]["state"], "pull");
-    assert_eq!(receipt["delivery"]["policy"]["matching_watcher"], false);
-    assert!(receipt["delivery"]["observed_at_ms"].as_i64().unwrap() > 0);
-    assert!(!stderr(&out).contains("chatctl: delivery:"));
-    let reply = e.cli(&["reply", "--as", "codex", "--to-message", &id, "--final", "--json"], Some("done"));
-    assert_eq!(code(&reply), 0);
-    let reply: serde_json::Value = serde_json::from_str(&stdout(&reply)).unwrap();
-    assert_eq!(reply["delivery"]["policy"]["recipient"], "claude");
-    let out = e.cli(&json_args, Some("body"));
-    let receipt: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-    assert_eq!(receipt["delivery"]["evidence"]["final_reply_id"], reply["id"]);
-    assert!(receipt["delivery"]["evidence"]["acknowledged_at_ms"].is_i64());
-    assert!(e.pending_files().is_empty());
+	let mut e = Env::standard();
+	e.start();
+	let args = ["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "receipt"];
+	let plain = e.cli(&args, Some("body"));
+	assert_eq!(code(&plain), 0);
+	let id = stdout(&plain).split_whitespace().next().unwrap().to_owned();
+	let Response::Found(found) = e.call(Request::Lookup { sender: "claude".into(), idempotency_key: "receipt".into() }) else { panic!() };
+	assert!(found.delivery.is_none(), "lookup remains unenriched");
+	assert_eq!(stdout(&plain), format!("{id} (seq {}, key receipt)\n", found.seq));
+	assert!(stderr(&plain).contains("chatctl: delivery: pull inbox; no watcher for this conversation"));
+	let mut json_args = args.to_vec();
+	json_args.push("--json");
+	let out = e.cli(&json_args, Some("body"));
+	let receipt: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	assert_eq!(receipt["duplicate"], true);
+	assert_eq!(receipt["delivery"]["policy"]["state"], "pull");
+	assert_eq!(receipt["delivery"]["policy"]["matching_watcher"], false);
+	assert!(receipt["delivery"]["observed_at_ms"].as_i64().unwrap() > 0);
+	assert!(!stderr(&out).contains("chatctl: delivery:"));
+	let reply = e.cli(&["reply", "--as", "codex", "--to-message", &id, "--final", "--json"], Some("done"));
+	assert_eq!(code(&reply), 0);
+	let reply: serde_json::Value = serde_json::from_str(&stdout(&reply)).unwrap();
+	assert_eq!(reply["delivery"]["policy"]["recipient"], "claude");
+	let out = e.cli(&json_args, Some("body"));
+	let receipt: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	assert_eq!(receipt["delivery"]["evidence"]["final_reply_id"], reply["id"]);
+	assert!(receipt["delivery"]["evidence"]["acknowledged_at_ms"].is_i64());
+	assert!(e.pending_files().is_empty());
 }
 
 #[test]
 fn protocol_receipts_match_watchers_by_conversation_and_report_configured_push_kinds() {
-    for (filter, matching) in [(Some("other"), false), (Some("c"), true), (None, true)] {
-        let mut e = Env::standard();
-        e.start();
-        let mut watcher = e.client();
-        watcher
-            .send(Request::Watch { as_: "claude".into(), conversation: filter.map(str::to_owned), resume_token: None, exclusive: false })
-            .unwrap();
-        assert!(matches!(watcher.recv().unwrap(), Response::SnapshotBegin { .. }));
-        let out = e.cli(&["send", "--as", "codex", "--to", "claude", "--conversation", "c", "--json"], Some("body"));
-        assert_eq!(code(&out), 0);
-        let r: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-        assert_eq!(r["delivery"]["policy"]["matching_watcher"], matching);
-    }
-    for config in ["", "[participant.codex]\nwake_kinds=[\"info\",\"final\"]\n"] {
-        let mut e = Env::new(config);
-        e.start();
-        let exe = fake_codex(&e, "exit 0");
-        register(&e, &exe, "isolated");
-        for kind in ["info", "request"] {
-            let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--kind", kind, "--json"], Some("body"));
-            let r: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-            assert_eq!(r["delivery"]["policy"]["state"], "push");
-            assert_eq!(r["delivery"]["policy"]["is_wake_kind"], if config.is_empty() { kind == "request" } else { kind == "info" });
-            assert_eq!(r["delivery"]["policy"]["completion_checked"], false);
-        }
-        let parent = e.send("codex", "claude", "c", Kind::Request, "parent", "answer me");
-        let Response::Stored(r) = e.reply("claude", &parent, Kind::Final, "final") else { panic!() };
-        let policy = serde_json::to_value(r.delivery.unwrap()).unwrap();
-        assert_eq!(policy["policy"]["is_wake_kind"], !config.is_empty());
-    }
+	for (filter, matching) in [(Some("other"), false), (Some("c"), true), (None, true)] {
+		let mut e = Env::standard();
+		e.start();
+		let mut watcher = e.client();
+		watcher
+			.send(Request::Watch { as_: "claude".into(), conversation: filter.map(str::to_owned), resume_token: None, exclusive: false })
+			.unwrap();
+		assert!(matches!(watcher.recv().unwrap(), Response::SnapshotBegin { .. }));
+		let out = e.cli(&["send", "--as", "codex", "--to", "claude", "--conversation", "c", "--json"], Some("body"));
+		assert_eq!(code(&out), 0);
+		let r: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+		assert_eq!(r["delivery"]["policy"]["matching_watcher"], matching);
+	}
+	for config in ["", "[participant.codex]\nwake_kinds=[\"info\",\"final\"]\n"] {
+		let mut e = Env::new(config);
+		e.start();
+		let exe = fake_codex(&e, "exit 0");
+		register(&e, &exe, "isolated");
+		for kind in ["info", "request"] {
+			let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--kind", kind, "--json"], Some("body"));
+			let r: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+			assert_eq!(r["delivery"]["policy"]["state"], "push");
+			assert_eq!(r["delivery"]["policy"]["is_wake_kind"], if config.is_empty() { kind == "request" } else { kind == "info" });
+			assert_eq!(r["delivery"]["policy"]["completion_checked"], false);
+		}
+		let parent = e.send("codex", "claude", "c", Kind::Request, "parent", "answer me");
+		let Response::Stored(r) = e.reply("claude", &parent, Kind::Final, "final") else { panic!() };
+		let policy = serde_json::to_value(r.delivery.unwrap()).unwrap();
+		assert_eq!(policy["policy"]["is_wake_kind"], !config.is_empty());
+	}
 }
 
 #[test]
 fn old_receipt_without_delivery_is_accepted_and_new_receipt_is_readable_by_old_shape() {
-    use chatd::proto::{ClientFrame, PROTOCOL_VERSION, read_frame, write_frame};
-    use std::os::unix::net::UnixListener;
-    let e = Env::standard();
-    let listener = UnixListener::bind(e.socket()).unwrap();
-    let old = serde_json::json!({"id":"00000000-0000-4000-8000-000000000001", "seq":1, "idempotency_key":"compat", "duplicate":false});
-    let wire = serde_json::to_value(chatd::proto::ServerFrame {
-        v: PROTOCOL_VERSION,
-        resp: Response::Stored(serde_json::from_value(old.clone()).unwrap()),
-    })
-    .unwrap();
-    assert!(wire.to_string().find("delivery").is_none());
-    let server = std::thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let _: ClientFrame = read_frame(&mut socket).unwrap().unwrap();
-        write_frame(&mut socket, &wire).unwrap();
-    });
-    let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "compat"], Some("body"));
-    server.join().unwrap();
-    assert_eq!(code(&out), 0);
-    assert!(!stderr(&out).contains("delivery:"));
-    assert_eq!(stdout(&out), "00000000-0000-4000-8000-000000000001 (seq 1, key compat)\n");
+	use chatd::proto::{ClientFrame, PROTOCOL_VERSION, read_frame, write_frame};
+	use std::os::unix::net::UnixListener;
+	let e = Env::standard();
+	let listener = UnixListener::bind(e.socket()).unwrap();
+	let old = serde_json::json!({"id":"00000000-0000-4000-8000-000000000001", "seq":1, "idempotency_key":"compat", "duplicate":false});
+	let wire = serde_json::to_value(chatd::proto::ServerFrame {
+		v: PROTOCOL_VERSION,
+		resp: Response::Stored(serde_json::from_value(old.clone()).unwrap()),
+	})
+	.unwrap();
+	assert!(wire.to_string().find("delivery").is_none());
+	let server = std::thread::spawn(move || {
+		let (mut socket, _) = listener.accept().unwrap();
+		socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+		let _: ClientFrame = read_frame(&mut socket).unwrap().unwrap();
+		write_frame(&mut socket, &wire).unwrap();
+	});
+	let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--idempotency-key", "compat"], Some("body"));
+	server.join().unwrap();
+	assert_eq!(code(&out), 0);
+	assert!(!stderr(&out).contains("delivery:"));
+	assert_eq!(stdout(&out), "00000000-0000-4000-8000-000000000001 (seq 1, key compat)\n");
 
-    #[derive(serde::Deserialize, serde::Serialize)]
-    struct OldReceipt {
-        id: String,
-        seq: i64,
-        idempotency_key: String,
-        duplicate: bool,
-    }
-    let mut e = Env::standard();
-    e.start();
-    let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--json"], Some("body"));
-    let new: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-    let old: OldReceipt = serde_json::from_value(new.clone()).unwrap();
-    assert_eq!(old.id, new["id"].as_str().unwrap());
-    assert_eq!(serde_json::to_value(old).unwrap()["seq"], new["seq"]);
+	#[derive(serde::Deserialize, serde::Serialize)]
+	struct OldReceipt {
+		id: String,
+		seq: i64,
+		idempotency_key: String,
+		duplicate: bool,
+	}
+	let mut e = Env::standard();
+	e.start();
+	let out = e.cli(&["send", "--as", "claude", "--to", "codex", "--conversation", "c", "--json"], Some("body"));
+	let new: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	let old: OldReceipt = serde_json::from_value(new.clone()).unwrap();
+	assert_eq!(old.id, new["id"].as_str().unwrap());
+	assert_eq!(serde_json::to_value(old).unwrap()["seq"], new["seq"]);
 }
 
 // ---- plan 0010: guarded endpoint registration ----
 
 #[test]
 fn guarded_cli_reports_noop_and_requires_explicit_replacement() {
-    let mut e = Env::standard();
-    e.start();
-    let args = ["endpoint", "register", "--as", "codex", "--session", "original", "--exe", "/bin/true"];
-    let first = e.cli(&args, None);
-    assert_eq!(code(&first), 0);
-    assert!(stdout(&first).starts_with("registered codex:"));
-    let again = e.cli(&args, None);
-    assert_eq!(code(&again), 0);
-    assert!(stdout(&again).starts_with("already registered codex:"));
-    let different = ["endpoint", "register", "--as", "codex", "--session", "new", "--exe", "/bin/true"];
-    let refused = e.cli(&different, None);
-    assert_eq!(code(&refused), 5);
-    assert!(stderr(&refused).contains("--replace-generation 1"));
-    assert!(!stderr(&refused).contains("predates guarded"));
-    let mut replace = different.to_vec();
-    replace.extend(["--replace-generation", "1", "--json"]);
-    let out = e.cli(&replace, None);
-    assert_eq!(code(&out), 0);
-    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-    assert_eq!(v["changed"], true);
-    assert_eq!(v["endpoint"]["generation"], 2);
-    assert_eq!(code(&e.cli(&replace, None)), 5, "CAS is checked before same-binding no-op");
-    let mut unconditional = args.to_vec();
-    unconditional.push("--replace");
-    assert_eq!(code(&e.cli(&unconditional, None)), 0);
+	let mut e = Env::standard();
+	e.start();
+	let args = ["endpoint", "register", "--as", "codex", "--session", "original", "--exe", "/bin/true"];
+	let first = e.cli(&args, None);
+	assert_eq!(code(&first), 0);
+	assert!(stdout(&first).starts_with("registered codex:"));
+	let again = e.cli(&args, None);
+	assert_eq!(code(&again), 0);
+	assert!(stdout(&again).starts_with("already registered codex:"));
+	let different = ["endpoint", "register", "--as", "codex", "--session", "new", "--exe", "/bin/true"];
+	let refused = e.cli(&different, None);
+	assert_eq!(code(&refused), 5);
+	assert!(stderr(&refused).contains("--replace-generation 1"));
+	assert!(!stderr(&refused).contains("predates guarded"));
+	let mut replace = different.to_vec();
+	replace.extend(["--replace-generation", "1", "--json"]);
+	let out = e.cli(&replace, None);
+	assert_eq!(code(&out), 0);
+	let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	assert_eq!(v["changed"], true);
+	assert_eq!(v["endpoint"]["generation"], 2);
+	assert_eq!(code(&e.cli(&replace, None)), 5, "CAS is checked before same-binding no-op");
+	let mut unconditional = args.to_vec();
+	unconditional.push("--replace");
+	assert_eq!(code(&e.cli(&unconditional, None)), 0);
 }
 
 #[test]
 fn guarded_cli_refuses_conflicting_flags_and_nonpositive_generations() {
-    let e = Env::standard(); // Argument validation needs no daemon.
-    let base = ["endpoint", "register", "--as", "codex", "--session", "s", "--exe", "/bin/true"];
-    for extra in [vec!["--replace-generation=0"], vec!["--replace-generation=-1"], vec!["--replace", "--replace-generation=1"]] {
-        let mut args = base.to_vec();
-        args.extend(extra);
-        assert_eq!(code(&e.cli(&args, None)), 2);
-    }
+	let e = Env::standard(); // Argument validation needs no daemon.
+	let base = ["endpoint", "register", "--as", "codex", "--session", "s", "--exe", "/bin/true"];
+	for extra in [vec!["--replace-generation=0"], vec!["--replace-generation=-1"], vec!["--replace", "--replace-generation=1"]] {
+		let mut args = base.to_vec();
+		args.extend(extra);
+		assert_eq!(code(&e.cli(&args, None)), 2);
+	}
 }
 
 #[test]
 fn racing_guarded_replacements_change_exactly_once_even_for_the_same_new_binding() {
-    use chatd::proto::BindMode;
-    use std::sync::{Arc, Barrier};
-    for same_target in [false, true] {
-        let mut e = Env::standard();
-        e.start();
-        let generation = register(&e, Path::new("/bin/true"), "original");
-        let barrier = Arc::new(Barrier::new(2));
-        let handles: Vec<_> = (0..2)
-            .map(|i| {
-                let socket = e.socket();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    let mut c = Client::connect(&socket, Some(Duration::from_secs(5))).unwrap();
-                    barrier.wait();
-                    c.call(Request::EndpointBind {
-                        name: "codex".into(),
-                        session: format!("new-{}", if same_target { 0 } else { i }),
-                        exe: "/bin/true".into(),
-                        mode: BindMode::ReplaceGeneration { generation },
-                    })
-                    .unwrap()
-                })
-            })
-            .collect();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_eq!(results.iter().filter(|r| matches!(r, Response::Bound(b) if b.changed)).count(), 1);
-        assert_eq!(results.iter().filter(|r| matches!(r, Response::Error { code: ErrorCode::Conflict, .. })).count(), 1);
-        assert_eq!(e.status(None).endpoints[0].generation, generation + 1);
-    }
+	use chatd::proto::BindMode;
+	use std::sync::{Arc, Barrier};
+	for same_target in [false, true] {
+		let mut e = Env::standard();
+		e.start();
+		let generation = register(&e, Path::new("/bin/true"), "original");
+		let barrier = Arc::new(Barrier::new(2));
+		let handles: Vec<_> = (0..2)
+			.map(|i| {
+				let socket = e.socket();
+				let barrier = barrier.clone();
+				std::thread::spawn(move || {
+					let mut c = Client::connect(&socket, Some(Duration::from_secs(5))).unwrap();
+					barrier.wait();
+					c.call(Request::EndpointBind {
+						name: "codex".into(),
+						session: format!("new-{}", if same_target { 0 } else { i }),
+						exe: "/bin/true".into(),
+						mode: BindMode::ReplaceGeneration { generation },
+					})
+					.unwrap()
+				})
+			})
+			.collect();
+		let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+		assert_eq!(results.iter().filter(|r| matches!(r, Response::Bound(b) if b.changed)).count(), 1);
+		assert_eq!(results.iter().filter(|r| matches!(r, Response::Error { code: ErrorCode::Conflict, .. })).count(), 1);
+		assert_eq!(e.status(None).endpoints[0].generation, generation + 1);
+	}
 }
 
 #[test]
 fn guarded_registration_never_falls_back_and_only_unknown_operation_gets_upgrade_diagnostic() {
-    use chatd::proto::{PROTOCOL_VERSION, ServerFrame, read_frame, write_frame};
-    use std::os::unix::net::UnixListener;
-    #[derive(serde::Deserialize)]
-    #[serde(tag = "op", rename_all = "snake_case")]
-    enum OldRequest {
-        EndpointRegister { name: String, session: String, exe: String },
-    }
-    for scenario in ["old", "bad_input", "disconnect"] {
-        let e = Env::standard();
-        let listener = UnixListener::bind(e.socket()).unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let wire: serde_json::Value = read_frame(&mut socket).unwrap().unwrap();
-            assert_eq!(wire["req"]["op"], "endpoint_bind");
-            let mut binding = "original".to_owned();
-            let old_error = match serde_json::from_value::<OldRequest>(wire["req"].clone()) {
-                Ok(OldRequest::EndpointRegister { name, session, exe }) => {
-                    assert_eq!(name, "codex");
-                    assert_eq!(exe, "/bin/true");
-                    binding = session;
-                    None
-                }
-                Err(e) => Some(e.to_string()),
-            };
-            assert_eq!(binding, "original", "old decoder rejects before the upsert");
-            if scenario != "disconnect" {
-                let message =
-                    if scenario == "old" { format!("unreadable frame: {}", old_error.unwrap()) } else { "session must be valid".into() };
-                write_frame(
-                    &mut socket,
-                    &ServerFrame { v: PROTOCOL_VERSION, resp: Response::Error { code: ErrorCode::BadRequest, message } },
-                )
-                .unwrap();
-                let mut byte = [0];
-                assert_eq!(socket.read(&mut byte).unwrap(), 0, "no fallback frame on this connection");
-            }
-            drop(socket);
-            listener
-        });
-        let out = e.cli(&["endpoint", "register", "--as", "codex", "--session", "new", "--exe", "/bin/true"], None);
-        let listener = server.join().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        assert!(matches!(listener.accept(), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock), "no fallback connection");
-        assert_eq!(code(&out), if scenario == "disconnect" { 3 } else { 5 });
-        assert_eq!(stderr(&out).contains("predates guarded registration"), scenario == "old");
-    }
+	use chatd::proto::{PROTOCOL_VERSION, ServerFrame, read_frame, write_frame};
+	use std::os::unix::net::UnixListener;
+	#[derive(serde::Deserialize)]
+	#[serde(tag = "op", rename_all = "snake_case")]
+	enum OldRequest {
+		EndpointRegister { name: String, session: String, exe: String },
+	}
+	for scenario in ["old", "bad_input", "disconnect"] {
+		let e = Env::standard();
+		let listener = UnixListener::bind(e.socket()).unwrap();
+		let server = std::thread::spawn(move || {
+			let (mut socket, _) = listener.accept().unwrap();
+			socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+			let wire: serde_json::Value = read_frame(&mut socket).unwrap().unwrap();
+			assert_eq!(wire["req"]["op"], "endpoint_bind");
+			let mut binding = "original".to_owned();
+			let old_error = match serde_json::from_value::<OldRequest>(wire["req"].clone()) {
+				Ok(OldRequest::EndpointRegister { name, session, exe }) => {
+					assert_eq!(name, "codex");
+					assert_eq!(exe, "/bin/true");
+					binding = session;
+					None
+				}
+				Err(e) => Some(e.to_string()),
+			};
+			assert_eq!(binding, "original", "old decoder rejects before the upsert");
+			if scenario != "disconnect" {
+				let message =
+					if scenario == "old" { format!("unreadable frame: {}", old_error.unwrap()) } else { "session must be valid".into() };
+				write_frame(
+					&mut socket,
+					&ServerFrame { v: PROTOCOL_VERSION, resp: Response::Error { code: ErrorCode::BadRequest, message } },
+				)
+				.unwrap();
+				let mut byte = [0];
+				assert_eq!(socket.read(&mut byte).unwrap(), 0, "no fallback frame on this connection");
+			}
+			drop(socket);
+			listener
+		});
+		let out = e.cli(&["endpoint", "register", "--as", "codex", "--session", "new", "--exe", "/bin/true"], None);
+		let listener = server.join().unwrap();
+		listener.set_nonblocking(true).unwrap();
+		assert!(matches!(listener.accept(), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock), "no fallback connection");
+		assert_eq!(code(&out), if scenario == "disconnect" { 3 } else { 5 });
+		assert_eq!(stderr(&out).contains("predates guarded registration"), scenario == "old");
+	}
 }
 
 fn config_candidate(e: &Env, extra: &str) -> String {
-    let path = e.dir.join("config.toml");
-    let mut config = std::fs::read_to_string(&path).unwrap();
-    config.push_str(extra);
-    std::fs::write(path, config).unwrap();
-    let out = e.cli(&["--json", "config", "preview"], None);
-    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
-    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-    value["candidate_revision"].as_str().unwrap().to_string()
+	let path = e.dir.join("config.toml");
+	let mut config = std::fs::read_to_string(&path).unwrap();
+	config.push_str(extra);
+	std::fs::write(path, config).unwrap();
+	let out = e.cli(&["--json", "config", "preview"], None);
+	assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+	let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	value["candidate_revision"].as_str().unwrap().to_string()
 }
 
 #[test]
 fn config_apply_keeps_existing_watch_and_send_and_has_restart_parity() {
-    let mut e = Env::standard();
-    e.start();
-    let (mut watcher, _) = open_watch(&e, "claude", None);
-    let mut inflight = e.client();
-    inflight
-        .send(Request::Send(SendReq {
-            from: "codex".into(),
-            to: Some("claude".into()),
-            conversation: Some("config".into()),
-            kind: Kind::Request,
-            reply_to: None,
-            idempotency_key: "during-refresh".into(),
-            summary: None,
-            body: "existing pair".into(),
-        }))
-        .unwrap();
-    let revision = config_candidate(
-        &e,
-        "\n[participant.team-c]\nproduct='claude'\ntier='luna'\n[participant.team-x]\nproduct='codex'\nwake_kinds=['final']\n",
-    );
-    let out = e.cli(&["config", "apply", "--revision", &revision], None);
-    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout(&out).contains("added: team-c, team-x"));
-    assert!(matches!(inflight.recv().unwrap(), Response::Stored(_)));
-    next_event(&mut watcher); // the same connection survives apply
-    let (mut new_watcher, _) = open_watch(&e, "team-c", None);
-    let id = e.send("team-x", "team-c", "config", Kind::Request, "new-team", "new pair");
-    next_event(&mut new_watcher);
-    assert!(matches!(e.call(Request::Receive { as_: "team-c".into(), id }), Response::Message(_)));
-    assert!(matches!(
-        e.call(Request::EndpointBind {
-            name: "team-x".into(),
-            session: "private-session".into(),
-            exe: "/nonexistent-private-test-exe".into(),
-            mode: chatd::proto::BindMode::Plain,
-        }),
-        Response::Bound(_)
-    ));
-    let policies = |e: &Env| {
-        let mut rows: Vec<_> =
-            e.status(None).participants.unwrap().into_iter().map(|p| (p.name, p.product, p.tier, p.wake_kinds)).collect();
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        rows
-    };
-    let before = policies(&e);
-    drop(watcher);
-    drop(new_watcher);
-    drop(inflight);
-    assert!(e.term().success());
-    if e.try_start(false).is_none() {
-        let child = e.daemon.take().unwrap();
-        let output = child.wait_with_output().unwrap();
-        panic!("restart failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    assert_eq!(before, policies(&e));
+	let mut e = Env::standard();
+	e.start();
+	let (mut watcher, _) = open_watch(&e, "claude", None);
+	let mut inflight = e.client();
+	inflight
+		.send(Request::Send(SendReq {
+			from: "codex".into(),
+			to: Some("claude".into()),
+			conversation: Some("config".into()),
+			kind: Kind::Request,
+			reply_to: None,
+			idempotency_key: "during-refresh".into(),
+			summary: None,
+			body: "existing pair".into(),
+		}))
+		.unwrap();
+	let revision = config_candidate(
+		&e,
+		"\n[participant.team-c]\nproduct='claude'\ntier='luna'\n[participant.team-x]\nproduct='codex'\nwake_kinds=['final']\n",
+	);
+	let out = e.cli(&["config", "apply", "--revision", &revision], None);
+	assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+	assert!(stdout(&out).contains("added: team-c, team-x"));
+	assert!(matches!(inflight.recv().unwrap(), Response::Stored(_)));
+	next_event(&mut watcher); // the same connection survives apply
+	let (mut new_watcher, _) = open_watch(&e, "team-c", None);
+	let id = e.send("team-x", "team-c", "config", Kind::Request, "new-team", "new pair");
+	next_event(&mut new_watcher);
+	assert!(matches!(e.call(Request::Receive { as_: "team-c".into(), id }), Response::Message(_)));
+	assert!(matches!(
+		e.call(Request::EndpointBind {
+			name: "team-x".into(),
+			session: "private-session".into(),
+			exe: "/nonexistent-private-test-exe".into(),
+			mode: chatd::proto::BindMode::Plain,
+		}),
+		Response::Bound(_)
+	));
+	let policies = |e: &Env| {
+		let mut rows: Vec<_> =
+			e.status(None).participants.unwrap().into_iter().map(|p| (p.name, p.product, p.tier, p.wake_kinds)).collect();
+		rows.sort_by(|a, b| a.0.cmp(&b.0));
+		rows
+	};
+	let before = policies(&e);
+	drop(watcher);
+	drop(new_watcher);
+	drop(inflight);
+	assert!(e.term().success());
+	if e.try_start(false).is_none() {
+		let child = e.daemon.take().unwrap();
+		let output = child.wait_with_output().unwrap();
+		panic!("restart failed: {}", String::from_utf8_lossy(&output.stderr));
+	}
+	assert_eq!(before, policies(&e));
 }
 
 #[test]
 fn config_cli_uses_daemon_path_and_reports_refusal_and_noop() {
-    let mut e = Env::standard();
-    e.start();
-    let revision = config_candidate(&e, "\n[participant.extra]\n");
-    let mut cmd = Command::new(CLI);
-    e.envs(&mut cmd);
-    let out = cmd
-        .env("CHATD_CONFIG", "/nonexistent-client-only-config")
-        .args(["--json", "config", "apply", "--revision", &revision])
-        .output()
-        .unwrap();
-    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
-    let out = e.cli(&["config", "apply", "--revision", &revision], None);
-    assert!(stdout(&out).lines().any(|line| line == "no change: nothing to add"));
-    let path = e.dir.join("config.toml");
-    let config = std::fs::read_to_string(&path).unwrap();
-    std::fs::write(&path, format!("{config}\n# changed bytes")).unwrap();
-    assert_eq!(code(&e.cli(&["config", "apply", "--revision", &revision], None)), 5);
-    std::fs::write(&path, "participants=['claude']\nheartbeat_ms=3\n[participant.claude]\nproduct='changed'").unwrap();
-    let out = e.cli(&["config", "preview"], None);
-    assert_eq!(code(&out), 5);
-    let error = String::from_utf8_lossy(&out.stderr);
-    for word in ["codex", "extra", "claude", "heartbeat_ms"] {
-        assert!(error.contains(word), "{error}");
-    }
-    assert!(e.status(None).participants.unwrap().iter().any(|p| p.name == "extra"));
+	let mut e = Env::standard();
+	e.start();
+	let revision = config_candidate(&e, "\n[participant.extra]\n");
+	let mut cmd = Command::new(CLI);
+	e.envs(&mut cmd);
+	let out = cmd
+		.env("CHATD_CONFIG", "/nonexistent-client-only-config")
+		.args(["--json", "config", "apply", "--revision", &revision])
+		.output()
+		.unwrap();
+	assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+	let out = e.cli(&["config", "apply", "--revision", &revision], None);
+	assert!(stdout(&out).lines().any(|line| line == "no change: nothing to add"));
+	let path = e.dir.join("config.toml");
+	let config = std::fs::read_to_string(&path).unwrap();
+	std::fs::write(&path, format!("{config}\n# changed bytes")).unwrap();
+	assert_eq!(code(&e.cli(&["config", "apply", "--revision", &revision], None)), 5);
+	std::fs::write(&path, "participants=['claude']\nheartbeat_ms=3\n[participant.claude]\nproduct='changed'").unwrap();
+	let out = e.cli(&["config", "preview"], None);
+	assert_eq!(code(&out), 5);
+	let error = String::from_utf8_lossy(&out.stderr);
+	for word in ["codex", "extra", "claude", "heartbeat_ms"] {
+		assert!(error.contains(word), "{error}");
+	}
+	assert!(e.status(None).participants.unwrap().iter().any(|p| p.name == "extra"));
 }
 
 #[test]
 fn config_apply_concurrent_admissions_agree_with_directory() {
-    let mut e = Env::standard();
-    e.start();
-    let revision = config_candidate(&e, "\n[participant.new-team]\n");
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-    let mut joins = Vec::new();
-    for register in [false, true] {
-        let mut client = e.client();
-        let barrier = barrier.clone();
-        joins.push(std::thread::spawn(move || {
-            barrier.wait();
-            let response = client
-                .call(if register {
-                    Request::EndpointBind {
-                        name: "new-team".into(),
-                        session: "private".into(),
-                        exe: "/nonexistent-private-test-exe".into(),
-                        mode: chatd::proto::BindMode::Plain,
-                    }
-                } else {
-                    Request::Send(SendReq {
-                        from: "new-team".into(),
-                        to: Some("claude".into()),
-                        conversation: Some("race".into()),
-                        kind: Kind::Info,
-                        reply_to: None,
-                        idempotency_key: "race".into(),
-                        summary: None,
-                        body: "race".into(),
-                    })
-                })
-                .unwrap();
-            match response {
-                Response::Error { code: ErrorCode::UnknownParticipant, .. } => {} // linearized before apply
-                Response::Stored(_) | Response::Bound(_) => {
-                    let Response::Status(s) = client
-                        .call(Request::Status {
-                            as_: None,
-                            conversation: None,
-                            limit: 1,
-                            unacknowledged_after: None,
-                            unanswered_after: None,
-                        })
-                        .unwrap()
-                    else {
-                        panic!()
-                    };
-                    assert!(s.participants.unwrap().iter().any(|p| p.name == "new-team"));
-                }
-                other => panic!("{other:?}"),
-            }
-        }));
-    }
-    barrier.wait();
-    assert!(matches!(e.call(Request::ConfigApply { revision }), Response::ConfigRefresh { applied: true, .. }));
-    for join in joins {
-        join.join().unwrap();
-    }
-    let (_, snap) = open_watch(&e, "new-team", None);
-    assert_eq!(snap.total, 0);
+	let mut e = Env::standard();
+	e.start();
+	let revision = config_candidate(&e, "\n[participant.new-team]\n");
+	let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+	let mut joins = Vec::new();
+	for register in [false, true] {
+		let mut client = e.client();
+		let barrier = barrier.clone();
+		joins.push(std::thread::spawn(move || {
+			barrier.wait();
+			let response = client
+				.call(if register {
+					Request::EndpointBind {
+						name: "new-team".into(),
+						session: "private".into(),
+						exe: "/nonexistent-private-test-exe".into(),
+						mode: chatd::proto::BindMode::Plain,
+					}
+				} else {
+					Request::Send(SendReq {
+						from: "new-team".into(),
+						to: Some("claude".into()),
+						conversation: Some("race".into()),
+						kind: Kind::Info,
+						reply_to: None,
+						idempotency_key: "race".into(),
+						summary: None,
+						body: "race".into(),
+					})
+				})
+				.unwrap();
+			match response {
+				Response::Error { code: ErrorCode::UnknownParticipant, .. } => {} // linearized before apply
+				Response::Stored(_) | Response::Bound(_) => {
+					let Response::Status(s) = client
+						.call(Request::Status {
+							as_: None,
+							conversation: None,
+							limit: 1,
+							unacknowledged_after: None,
+							unanswered_after: None,
+						})
+						.unwrap()
+					else {
+						panic!()
+					};
+					assert!(s.participants.unwrap().iter().any(|p| p.name == "new-team"));
+				}
+				other => panic!("{other:?}"),
+			}
+		}));
+	}
+	barrier.wait();
+	assert!(matches!(e.call(Request::ConfigApply { revision }), Response::ConfigRefresh { applied: true, .. }));
+	for join in joins {
+		join.join().unwrap();
+	}
+	let (_, snap) = open_watch(&e, "new-team", None);
+	assert_eq!(snap.total, 0);
 }

@@ -21,603 +21,603 @@ pub const MAX_LOG_PAGE: u32 = 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    /// Expects a final reply; shows as unanswered until one is stored.
-    Request,
-    /// Information only; never shows as unanswered.
-    Info,
-    /// A non-final reply to a request; does not answer it.
-    Progress,
-    /// The final reply to a request; answers it.
-    Final,
+	/// Expects a final reply; shows as unanswered until one is stored.
+	Request,
+	/// Information only; never shows as unanswered.
+	Info,
+	/// A non-final reply to a request; does not answer it.
+	Progress,
+	/// The final reply to a request; answers it.
+	Final,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Request, Kind::Info, Kind::Progress, Kind::Final];
+	pub const ALL: [Kind; 4] = [Kind::Request, Kind::Info, Kind::Progress, Kind::Final];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Kind::Request => "request",
-            Kind::Info => "info",
-            Kind::Progress => "progress",
-            Kind::Final => "final",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Kind> {
-        Some(match s {
-            "request" => Kind::Request,
-            "info" => Kind::Info,
-            "progress" => Kind::Progress,
-            "final" => Kind::Final,
-            _ => return None,
-        })
-    }
-    pub fn is_reply(self) -> bool {
-        matches!(self, Kind::Progress | Kind::Final)
-    }
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Kind::Request => "request",
+			Kind::Info => "info",
+			Kind::Progress => "progress",
+			Kind::Final => "final",
+		}
+	}
+	pub fn parse(s: &str) -> Option<Kind> {
+		Some(match s {
+			"request" => Kind::Request,
+			"info" => Kind::Info,
+			"progress" => Kind::Progress,
+			"final" => Kind::Final,
+			_ => return None,
+		})
+	}
+	pub fn is_reply(self) -> bool {
+		matches!(self, Kind::Progress | Kind::Final)
+	}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendReq {
-    pub from: String,
-    /// Required for request/info; derived from the replied-to message for progress/final.
-    pub to: Option<String>,
-    /// Required for request/info; must match the replied-to message for progress/final.
-    pub conversation: Option<String>,
-    pub kind: Kind,
-    pub reply_to: Option<String>,
-    pub idempotency_key: String,
-    pub summary: Option<String>,
-    pub body: String,
+	pub from: String,
+	/// Required for request/info; derived from the replied-to message for progress/final.
+	pub to: Option<String>,
+	/// Required for request/info; must match the replied-to message for progress/final.
+	pub conversation: Option<String>,
+	pub kind: Kind,
+	pub reply_to: Option<String>,
+	pub idempotency_key: String,
+	pub summary: Option<String>,
+	pub body: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BindMode {
-    #[default]
-    Plain,
-    Replace,
-    ReplaceGeneration {
-        generation: i64,
-    },
+	#[default]
+	Plain,
+	Replace,
+	ReplaceGeneration {
+		generation: i64,
+	},
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BindResult {
-    pub endpoint: EndpointView,
-    pub changed: bool,
+	pub endpoint: EndpointView,
+	pub changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    ConfigPreview,
-    ConfigApply {
-        revision: String,
-    },
-    Health,
-    Current {
-        as_: Option<String>,
-        conversation: Option<String>,
-        limit: u32,
-        after: Option<String>,
-        history: bool,
-    },
-    Supersede {
-        as_: String,
-        id: String,
-        by: String,
-        reason: String,
-    },
-    ClassifyRehearsal {
-        as_: String,
-        id: String,
-        reason: String,
-    },
-    Send(SendReq),
-    Receive {
-        as_: String,
-        id: String,
-    },
-    Ack {
-        as_: String,
-        ids: Vec<String>,
-    },
-    Lookup {
-        sender: String,
-        idempotency_key: String,
-    },
-    /// Lists are bounded by `limit` (at most MAX_PAGE) and continue after the given sequences.
-    Status {
-        as_: Option<String>,
-        conversation: Option<String>,
-        limit: u32,
-        unacknowledged_after: Option<i64>,
-        unanswered_after: Option<i64>,
-    },
-    Log {
-        conversation: Option<String>,
-        since_seq: Option<i64>,
-        limit: u32,
-    },
-    /// Guarded registration. Old daemons reject this operation before any mutation.
-    EndpointBind {
-        name: String,
-        session: String,
-        exe: String,
-        #[serde(default)]
-        mode: BindMode,
-    },
-    EndpointRegister {
-        name: String,
-        session: String,
-        exe: String,
-    },
-    /// Removes a participant's endpoint: it becomes a pull participant. Idempotent.
-    EndpointUnregister {
-        name: String,
-    },
-    Redeliver {
-        id: String,
-    },
-    Watch {
-        as_: String,
-        conversation: Option<String>,
-        resume_token: Option<String>,
-        /// Refuse (Conflict) if another watcher of this participant overlaps this filter. The check
-        /// and the registration are one step, so two racing exclusive watchers cannot both win.
-        #[serde(default)]
-        exclusive: bool,
-    },
-    Backup {
-        path: String,
-    },
-    ImportLegacy {
-        paths: Vec<String>,
-        dry_run: bool,
-    },
+	ConfigPreview,
+	ConfigApply {
+		revision: String,
+	},
+	Health,
+	Current {
+		as_: Option<String>,
+		conversation: Option<String>,
+		limit: u32,
+		after: Option<String>,
+		history: bool,
+	},
+	Supersede {
+		as_: String,
+		id: String,
+		by: String,
+		reason: String,
+	},
+	ClassifyRehearsal {
+		as_: String,
+		id: String,
+		reason: String,
+	},
+	Send(SendReq),
+	Receive {
+		as_: String,
+		id: String,
+	},
+	Ack {
+		as_: String,
+		ids: Vec<String>,
+	},
+	Lookup {
+		sender: String,
+		idempotency_key: String,
+	},
+	/// Lists are bounded by `limit` (at most MAX_PAGE) and continue after the given sequences.
+	Status {
+		as_: Option<String>,
+		conversation: Option<String>,
+		limit: u32,
+		unacknowledged_after: Option<i64>,
+		unanswered_after: Option<i64>,
+	},
+	Log {
+		conversation: Option<String>,
+		since_seq: Option<i64>,
+		limit: u32,
+	},
+	/// Guarded registration. Old daemons reject this operation before any mutation.
+	EndpointBind {
+		name: String,
+		session: String,
+		exe: String,
+		#[serde(default)]
+		mode: BindMode,
+	},
+	EndpointRegister {
+		name: String,
+		session: String,
+		exe: String,
+	},
+	/// Removes a participant's endpoint: it becomes a pull participant. Idempotent.
+	EndpointUnregister {
+		name: String,
+	},
+	Redeliver {
+		id: String,
+	},
+	Watch {
+		as_: String,
+		conversation: Option<String>,
+		resume_token: Option<String>,
+		/// Refuse (Conflict) if another watcher of this participant overlaps this filter. The check
+		/// and the registration are one step, so two racing exclusive watchers cannot both win.
+		#[serde(default)]
+		exclusive: bool,
+	},
+	Backup {
+		path: String,
+	},
+	ImportLegacy {
+		paths: Vec<String>,
+		dry_run: bool,
+	},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientFrame {
-    pub v: u32,
-    pub req: Request,
+	pub v: u32,
+	pub req: Request,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageView {
-    pub id: String,
-    pub seq: i64,
-    pub conversation: String,
-    pub sender: String,
-    pub recipient: String,
-    pub kind: Kind,
-    pub reply_to: Option<String>,
-    pub summary: String,
-    pub created_at_ms: i64,
-    pub idempotency_key: String,
-    /// Present on `receive`; absent in notifications and listings.
-    pub body: Option<String>,
-    pub received_at_ms: Option<i64>,
-    pub answered_by: Option<String>,
+	pub id: String,
+	pub seq: i64,
+	pub conversation: String,
+	pub sender: String,
+	pub recipient: String,
+	pub kind: Kind,
+	pub reply_to: Option<String>,
+	pub summary: String,
+	pub created_at_ms: i64,
+	pub idempotency_key: String,
+	/// Present on `receive`; absent in notifications and listings.
+	pub body: Option<String>,
+	pub received_at_ms: Option<i64>,
+	pub answered_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Receipt {
-    pub id: String,
-    pub seq: i64,
-    pub idempotency_key: String,
-    /// True when an identical earlier send was found: the original id is returned.
-    pub duplicate: bool,
-    /// Set when the recipient's last observed health is FILTERED or ERRORED. Delivery is never
-    /// refused for it; the sender is told.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub warning: Option<String>,
-    /// Advisory post-store observation; missing on old daemons and lookup receipts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivery: Option<DeliveryObservation>,
+	pub id: String,
+	pub seq: i64,
+	pub idempotency_key: String,
+	/// True when an identical earlier send was found: the original id is returned.
+	pub duplicate: bool,
+	/// Set when the recipient's last observed health is FILTERED or ERRORED. Delivery is never
+	/// refused for it; the sender is told.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub warning: Option<String>,
+	/// Advisory post-store observation; missing on old daemons and lookup receipts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub delivery: Option<DeliveryObservation>,
 }
 
 /// Policy is separate from historical evidence: neither implies current retry eligibility.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeliveryObservation {
-    pub observed_at_ms: i64,
-    pub policy: DeliveryPolicy,
-    pub evidence: Option<DeliveryEvidence>,
-    pub text: String,
+	pub observed_at_ms: i64,
+	pub policy: DeliveryPolicy,
+	pub evidence: Option<DeliveryEvidence>,
+	pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum DeliveryPolicy {
-    Push {
-        recipient: String,
-        generation: i64,
-        wake_kinds: Vec<Kind>,
-        is_wake_kind: bool,
-        throttle_candidate: Option<PushHold>,
-        completion_checked: bool,
-    },
-    Pull {
-        recipient: String,
-        matching_watcher: bool,
-    },
-    Unavailable,
+	Push {
+		recipient: String,
+		generation: i64,
+		wake_kinds: Vec<Kind>,
+		is_wake_kind: bool,
+		throttle_candidate: Option<PushHold>,
+		completion_checked: bool,
+	},
+	Pull {
+		recipient: String,
+		matching_watcher: bool,
+	},
+	Unavailable,
 }
 
 /// Shared throttle result. It is effective only with the same completed-turn evidence as the adapter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum PushHold {
-    MinimumInterval { attempt: i64, message_id: String, started_at_ms: i64, until_ms: i64 },
-    InFlight { attempt: i64, message_id: String, state: String, started_at_ms: i64, until_ms: i64 },
+	MinimumInterval { attempt: i64, message_id: String, started_at_ms: i64, until_ms: i64 },
+	InFlight { attempt: i64, message_id: String, state: String, started_at_ms: i64, until_ms: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeliveryEvidence {
-    /// Most recent 20 attempts, newest first. The total makes truncation explicit.
-    pub attempts: Vec<AttemptView>,
-    pub attempts_total: i64,
-    pub acknowledged_at_ms: Option<i64>,
-    pub final_reply_id: Option<String>,
-    pub digest: Option<DigestEvidence>,
-    pub retirement: Option<RetirementEvidence>,
-    pub redelivery: Option<RedeliveryEvidence>,
+	/// Most recent 20 attempts, newest first. The total makes truncation explicit.
+	pub attempts: Vec<AttemptView>,
+	pub attempts_total: i64,
+	pub acknowledged_at_ms: Option<i64>,
+	pub final_reply_id: Option<String>,
+	pub digest: Option<DigestEvidence>,
+	pub retirement: Option<RetirementEvidence>,
+	pub redelivery: Option<RedeliveryEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DigestEvidence {
-    pub attempt: i64,
-    pub generation: i64,
-    pub with_message_id: String,
-    pub at_ms: i64,
+	pub attempt: i64,
+	pub generation: i64,
+	pub with_message_id: String,
+	pub at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetirementEvidence {
-    pub superseded_by: Option<String>,
-    pub rehearsal: bool,
+	pub superseded_by: Option<String>,
+	pub rehearsal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RedeliveryEvidence {
-    pub after_attempt: i64,
-    pub at_ms: i64,
+	pub after_attempt: i64,
+	pub at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventView {
-    pub seq: i64,
-    pub at_ms: i64,
-    pub kind: String,
-    pub audience: String,
-    pub message_id: Option<String>,
-    pub conversation: Option<String>,
-    pub detail: serde_json::Value,
+	pub seq: i64,
+	pub at_ms: i64,
+	pub kind: String,
+	pub audience: String,
+	pub message_id: Option<String>,
+	pub conversation: Option<String>,
+	pub detail: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttemptView {
-    pub attempt: i64,
-    pub message_id: String,
-    pub endpoint: String,
-    pub generation: i64,
-    pub state: String,
-    pub started_at_ms: i64,
-    pub finished_at_ms: Option<i64>,
-    pub exit_code: Option<i32>,
-    pub error: Option<String>,
+	pub attempt: i64,
+	pub message_id: String,
+	pub endpoint: String,
+	pub generation: i64,
+	pub state: String,
+	pub started_at_ms: i64,
+	pub finished_at_ms: Option<i64>,
+	pub exit_code: Option<i32>,
+	pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CurrentLine {
-    pub seq: i64,
-    pub activity_seq: i64,
-    pub message: StatusLine,
-    pub state: String,
-    pub delivery_state: Option<String>,
-    pub annotation_reason: Option<String>,
-    pub superseded_by: Option<String>,
-    pub rehearsal_reason: Option<String>,
-    pub latest_progress: Option<StatusLine>,
+	pub seq: i64,
+	pub activity_seq: i64,
+	pub message: StatusLine,
+	pub state: String,
+	pub delivery_state: Option<String>,
+	pub annotation_reason: Option<String>,
+	pub superseded_by: Option<String>,
+	pub rehearsal_reason: Option<String>,
+	pub latest_progress: Option<StatusLine>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CurrentView {
-    pub endpoints: Vec<EndpointView>,
-    pub rows: Vec<CurrentLine>,
-    pub total: i64,
-    pub next_after: Option<String>,
-    pub snapshot_seq: i64,
+	pub endpoints: Vec<EndpointView>,
+	pub rows: Vec<CurrentLine>,
+	pub total: i64,
+	pub next_after: Option<String>,
+	pub snapshot_seq: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusLine {
-    pub id: String,
-    pub conversation: String,
-    pub sender: String,
-    pub recipient: String,
-    pub kind: Kind,
-    pub summary: String,
-    pub age_ms: i64,
-    pub received: bool,
-    pub answered_by: Option<String>,
-    pub submission: Option<String>,
+	pub id: String,
+	pub conversation: String,
+	pub sender: String,
+	pub recipient: String,
+	pub kind: Kind,
+	pub summary: String,
+	pub age_ms: i64,
+	pub received: bool,
+	pub answered_by: Option<String>,
+	pub submission: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusView {
-    pub store_id: String,
-    pub head_seq: i64,
-    /// Messages for the filtered participant(s) not yet acknowledged by their recipient (one page).
-    pub unacknowledged: Vec<StatusLine>,
-    pub unacknowledged_total: i64,
-    /// Present when more follow: pass it as `unacknowledged_after`.
-    pub next_unacknowledged_after: Option<i64>,
-    /// Requests without a stored final reply ("no final reply recorded in chatd"; one page).
-    pub unanswered: Vec<StatusLine>,
-    pub unanswered_total: i64,
-    pub next_unanswered_after: Option<i64>,
-    /// Latest attempt per message where it is failed, uncertain or in flight (oldest first, one page).
-    pub uncertain_or_failed_submissions: Vec<AttemptView>,
-    pub uncertain_or_failed_total: i64,
-    pub endpoints: Vec<EndpointView>,
-    pub watchers: Vec<WatcherView>,
-    /// Every participant with its configured product and tier and the delivery path in place now.
-    /// `None` only from a daemon that predates the directory, so a daemon with no participants is
-    /// distinguishable from an old one.
-    #[serde(default)]
-    pub participants: Option<Vec<ParticipantView>>,
+	pub store_id: String,
+	pub head_seq: i64,
+	/// Messages for the filtered participant(s) not yet acknowledged by their recipient (one page).
+	pub unacknowledged: Vec<StatusLine>,
+	pub unacknowledged_total: i64,
+	/// Present when more follow: pass it as `unacknowledged_after`.
+	pub next_unacknowledged_after: Option<i64>,
+	/// Requests without a stored final reply ("no final reply recorded in chatd"; one page).
+	pub unanswered: Vec<StatusLine>,
+	pub unanswered_total: i64,
+	pub next_unanswered_after: Option<i64>,
+	/// Latest attempt per message where it is failed, uncertain or in flight (oldest first, one page).
+	pub uncertain_or_failed_submissions: Vec<AttemptView>,
+	pub uncertain_or_failed_total: i64,
+	pub endpoints: Vec<EndpointView>,
+	pub watchers: Vec<WatcherView>,
+	/// Every participant with its configured product and tier and the delivery path in place now.
+	/// `None` only from a daemon that predates the directory, so a daemon with no participants is
+	/// distinguishable from an old one.
+	#[serde(default)]
+	pub participants: Option<Vec<ParticipantView>>,
 }
 
 /// One row of the directory (plan 0003). `product` and `tier` come from the configuration and are
 /// metadata; `transport`, `path_ready` and the watcher fields come from what is attached now.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParticipantView {
-    pub name: String,
-    pub product: Option<String>,
-    pub tier: Option<String>,
-    /// "push" when an endpoint is registered for the participant, otherwise "pull".
-    pub transport: String,
-    /// What the configured product normally uses: "push" for codex, "pull" for claude, else absent.
-    pub expected_transport: Option<String>,
-    /// A delivery path is in place: a push participant has a registered endpoint, a pull participant has
-    /// at least one attached watcher. It does not prove delivery or that the agent is awake. Recent push
-    /// failures are per message and stay a separate signal (`status` submissions).
-    pub path_ready: bool,
-    pub watchers: u32,
-    /// When the oldest attached watcher connected.
-    pub watching_since_ms: Option<i64>,
-    /// The endpoint's session, for a push participant.
-    pub session: Option<String>,
-    /// The last health observation of the participant's session log. Absent when it is not inspected
-    /// (no session to locate, no inspector for its product, or a daemon that predates health).
-    #[serde(default)]
-    pub health: Option<HealthView>,
-    /// The kinds that wake the participant when it is pushed to (`wake_kinds` in the configuration).
-    /// Absent for a pull participant, which sees every message, and from a daemon that predates it.
-    #[serde(default)]
-    pub wake_kinds: Option<Vec<Kind>>,
-    /// For a push participant: unacknowledged messages of a non-waking kind that no push has carried
-    /// yet. They go out in the digest of the next waking push.
-    #[serde(default)]
-    pub queued_for_wake: Option<i64>,
+	pub name: String,
+	pub product: Option<String>,
+	pub tier: Option<String>,
+	/// "push" when an endpoint is registered for the participant, otherwise "pull".
+	pub transport: String,
+	/// What the configured product normally uses: "push" for codex, "pull" for claude, else absent.
+	pub expected_transport: Option<String>,
+	/// A delivery path is in place: a push participant has a registered endpoint, a pull participant has
+	/// at least one attached watcher. It does not prove delivery or that the agent is awake. Recent push
+	/// failures are per message and stay a separate signal (`status` submissions).
+	pub path_ready: bool,
+	pub watchers: u32,
+	/// When the oldest attached watcher connected.
+	pub watching_since_ms: Option<i64>,
+	/// The endpoint's session, for a push participant.
+	pub session: Option<String>,
+	/// The last health observation of the participant's session log. Absent when it is not inspected
+	/// (no session to locate, no inspector for its product, or a daemon that predates health).
+	#[serde(default)]
+	pub health: Option<HealthView>,
+	/// The kinds that wake the participant when it is pushed to (`wake_kinds` in the configuration).
+	/// Absent for a pull participant, which sees every message, and from a daemon that predates it.
+	#[serde(default)]
+	pub wake_kinds: Option<Vec<Kind>>,
+	/// For a push participant: unacknowledged messages of a non-waking kind that no push has carried
+	/// yet. They go out in the digest of the next waking push.
+	#[serde(default)]
+	pub queued_for_wake: Option<i64>,
 }
 
 /// What a participant's session log says, as seen by the daemon's health check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthState {
-    /// The log was found and nothing below applies.
-    Ok,
-    /// The last turn ended with the provider's content filter (`cyber_policy`).
-    Filtered,
-    /// The last turn ended with another error; `detail` names it.
-    Errored,
-    /// No log write for the stall threshold while requests addressed to the participant are unanswered.
-    Stalled,
-    /// The session log was not found.
-    Unknown,
+	/// The log was found and nothing below applies.
+	Ok,
+	/// The last turn ended with the provider's content filter (`cyber_policy`).
+	Filtered,
+	/// The last turn ended with another error; `detail` names it.
+	Errored,
+	/// No log write for the stall threshold while requests addressed to the participant are unanswered.
+	Stalled,
+	/// The session log was not found.
+	Unknown,
 }
 
 impl HealthState {
-    pub fn label(self) -> &'static str {
-        match self {
-            HealthState::Ok => "OK",
-            HealthState::Filtered => "FILTERED",
-            HealthState::Errored => "ERRORED",
-            HealthState::Stalled => "STALLED",
-            HealthState::Unknown => "UNKNOWN",
-        }
-    }
+	pub fn label(self) -> &'static str {
+		match self {
+			HealthState::Ok => "OK",
+			HealthState::Filtered => "FILTERED",
+			HealthState::Errored => "ERRORED",
+			HealthState::Stalled => "STALLED",
+			HealthState::Unknown => "UNKNOWN",
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthView {
-    pub state: HealthState,
-    /// The error name for FILTERED and ERRORED (`cyber_policy`, ...); absent otherwise.
-    pub detail: Option<String>,
-    /// When this state began: the failed turn's end, the last log write for STALLED, otherwise when
-    /// the daemon first saw it.
-    pub since_ms: i64,
-    pub checked_at_ms: i64,
-    /// The session log that was read, when one was found.
-    pub log: Option<String>,
-    pub log_modified_ms: Option<i64>,
+	pub state: HealthState,
+	/// The error name for FILTERED and ERRORED (`cyber_policy`, ...); absent otherwise.
+	pub detail: Option<String>,
+	/// When this state began: the failed turn's end, the last log write for STALLED, otherwise when
+	/// the daemon first saw it.
+	pub since_ms: i64,
+	pub checked_at_ms: i64,
+	/// The session log that was read, when one was found.
+	pub log: Option<String>,
+	pub log_modified_ms: Option<i64>,
 }
 
 impl HealthView {
-    /// `FILTERED (cyber_policy)`, `STALLED`, ...
-    pub fn label(&self) -> String {
-        match &self.detail {
-            Some(d) => format!("{} ({d})", self.state.label()),
-            None => self.state.label().to_string(),
-        }
-    }
+	/// `FILTERED (cyber_policy)`, `STALLED`, ...
+	pub fn label(&self) -> String {
+		match &self.detail {
+			Some(d) => format!("{} ({d})", self.state.label()),
+			None => self.state.label().to_string(),
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EndpointView {
-    pub name: String,
-    pub session: String,
-    pub exe: String,
-    pub generation: i64,
-    pub registered_at_ms: i64,
+	pub name: String,
+	pub session: String,
+	pub exe: String,
+	pub generation: i64,
+	pub registered_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatcherView {
-    pub participant: String,
-    pub conversation: Option<String>,
-    pub connected_at_ms: i64,
-    pub last_event_seq: i64,
+	pub participant: String,
+	pub conversation: Option<String>,
+	pub connected_at_ms: i64,
+	pub last_event_seq: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LegacyReport {
-    pub dry_run: bool,
-    pub files: Vec<LegacyFileReport>,
+	pub dry_run: bool,
+	pub files: Vec<LegacyFileReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LegacyFileReport {
-    pub path: String,
-    pub sha256: String,
-    pub bytes: u64,
-    pub blocks: u64,
-    pub malformed: u64,
-    pub newly_imported: u64,
-    pub already_present: u64,
+	pub path: String,
+	pub sha256: String,
+	pub bytes: u64,
+	pub blocks: u64,
+	pub malformed: u64,
+	pub newly_imported: u64,
+	pub already_present: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "r", rename_all = "snake_case")]
 pub enum Response {
-    ConfigRefresh {
-        base_revision: String,
-        candidate_revision: String,
-        effective_revision: String,
-        added: Vec<String>,
-        applied: bool,
-        no_op: bool,
-    },
-    Health {
-        store_id: String,
-        head_seq: i64,
-        schema_version: i64,
-        pid: u32,
-    },
-    Stored(Receipt),
-    Message(MessageView),
-    Acked {
-        acknowledged: Vec<String>,
-        already: Vec<String>,
-    },
-    Found(Receipt),
-    Status(StatusView),
-    Current(CurrentView),
-    Annotated {
-        id: String,
-    },
-    Log {
-        events: Vec<EventView>,
-    },
-    Registered(EndpointView),
-    Bound(BindResult),
-    /// `removed` is the binding that was removed, absent when there was none (nothing changed).
-    /// `in_flight` counts its submissions still running: they finish and are recorded under the removed
-    /// generation, and are never retried automatically.
-    Unregistered {
-        name: String,
-        removed: Option<EndpointView>,
-        in_flight: i64,
-    },
-    Redelivery {
-        message_id: String,
-    },
-    BackedUp {
-        path: String,
-        head_seq: i64,
-    },
-    Legacy(LegacyReport),
-    /// A watch starts with SnapshotBegin, then SnapshotPage frames (oldest first, each at most
-    /// MAX_PAGE messages) holding the authoritative unacknowledged inbox at `head_seq`, then
-    /// SnapshotEnd; events after `head_seq` follow.
-    SnapshotBegin {
-        head_seq: i64,
-        resume_token: String,
-        unacknowledged_total: i64,
-        resynchronized: Option<String>,
-        /// Other watchers of this participant whose filters overlap this one, when this watch was
-        /// registered. Absent from a daemon that predates the field, which is how a client knows
-        /// `exclusive` was not honoured.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        other_watchers: Option<u32>,
-    },
-    SnapshotPage {
-        unacknowledged: Vec<MessageView>,
-    },
-    SnapshotEnd {
-        head_seq: i64,
-        pages: u64,
-    },
-    Event {
-        event: EventView,
-        resume_token: String,
-    },
-    Heartbeat {
-        head_seq: i64,
-        at_ms: i64,
-    },
-    Error {
-        code: ErrorCode,
-        message: String,
-    },
+	ConfigRefresh {
+		base_revision: String,
+		candidate_revision: String,
+		effective_revision: String,
+		added: Vec<String>,
+		applied: bool,
+		no_op: bool,
+	},
+	Health {
+		store_id: String,
+		head_seq: i64,
+		schema_version: i64,
+		pid: u32,
+	},
+	Stored(Receipt),
+	Message(MessageView),
+	Acked {
+		acknowledged: Vec<String>,
+		already: Vec<String>,
+	},
+	Found(Receipt),
+	Status(StatusView),
+	Current(CurrentView),
+	Annotated {
+		id: String,
+	},
+	Log {
+		events: Vec<EventView>,
+	},
+	Registered(EndpointView),
+	Bound(BindResult),
+	/// `removed` is the binding that was removed, absent when there was none (nothing changed).
+	/// `in_flight` counts its submissions still running: they finish and are recorded under the removed
+	/// generation, and are never retried automatically.
+	Unregistered {
+		name: String,
+		removed: Option<EndpointView>,
+		in_flight: i64,
+	},
+	Redelivery {
+		message_id: String,
+	},
+	BackedUp {
+		path: String,
+		head_seq: i64,
+	},
+	Legacy(LegacyReport),
+	/// A watch starts with SnapshotBegin, then SnapshotPage frames (oldest first, each at most
+	/// MAX_PAGE messages) holding the authoritative unacknowledged inbox at `head_seq`, then
+	/// SnapshotEnd; events after `head_seq` follow.
+	SnapshotBegin {
+		head_seq: i64,
+		resume_token: String,
+		unacknowledged_total: i64,
+		resynchronized: Option<String>,
+		/// Other watchers of this participant whose filters overlap this one, when this watch was
+		/// registered. Absent from a daemon that predates the field, which is how a client knows
+		/// `exclusive` was not honoured.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		other_watchers: Option<u32>,
+	},
+	SnapshotPage {
+		unacknowledged: Vec<MessageView>,
+	},
+	SnapshotEnd {
+		head_seq: i64,
+		pages: u64,
+	},
+	Event {
+		event: EventView,
+		resume_token: String,
+	},
+	Heartbeat {
+		head_seq: i64,
+		at_ms: i64,
+	},
+	Error {
+		code: ErrorCode,
+		message: String,
+	},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
-    BadRequest,
-    UnknownParticipant,
-    NotFound,
-    Conflict,
-    InvalidReply,
-    TooLarge,
-    VersionMismatch,
-    Busy,
-    Storage,
-    Unavailable,
+	BadRequest,
+	UnknownParticipant,
+	NotFound,
+	Conflict,
+	InvalidReply,
+	TooLarge,
+	VersionMismatch,
+	Busy,
+	Storage,
+	Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerFrame {
-    pub v: u32,
-    pub resp: Response,
+	pub v: u32,
+	pub resp: Response,
 }
 
 pub fn write_frame<W: Write, T: Serialize>(w: &mut W, value: &T) -> io::Result<()> {
-    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-    if bytes.len() > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame exceeds MAX_FRAME"));
-    }
-    let len = u32::try_from(bytes.len()).map_err(io::Error::other)?;
-    w.write_all(&len.to_be_bytes())?;
-    w.write_all(&bytes)?;
-    w.flush()
+	let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+	if bytes.len() > MAX_FRAME {
+		return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame exceeds MAX_FRAME"));
+	}
+	let len = u32::try_from(bytes.len()).map_err(io::Error::other)?;
+	w.write_all(&len.to_be_bytes())?;
+	w.write_all(&bytes)?;
+	w.flush()
 }
 
 /// Reads one frame. `Ok(None)` is a clean end of stream before a length prefix.
 pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> io::Result<Option<T>> {
-    let mut len = [0u8; 4];
-    match r.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("declared frame length {len} exceeds {MAX_FRAME}")));
-    }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    serde_json::from_slice(&buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+	let mut len = [0u8; 4];
+	match r.read_exact(&mut len) {
+		Ok(()) => {}
+		Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+		Err(e) => return Err(e),
+	}
+	let len = u32::from_be_bytes(len) as usize;
+	if len > MAX_FRAME {
+		return Err(io::Error::new(io::ErrorKind::InvalidData, format!("declared frame length {len} exceeds {MAX_FRAME}")));
+	}
+	let mut buf = vec![0u8; len];
+	r.read_exact(&mut buf)?;
+	serde_json::from_slice(&buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }

@@ -70,9 +70,32 @@ sections of `ci/README.md` at
 `1a3196d4ea88dcb397f544644d44bd4d784a81e2`. rnx in turn attributes its original
 checker to ket at `9e7e3ad122f9ca6a3042bd12845f89ab9c1426ce`.
 
-chatd keeps tab-indented Python from that source. Rust retains its existing
-space-based rustfmt configuration. The port removes rnx's engine/import/follower
+chatd keeps tab-indented Python from that source. Rust uses tabs through
+`hard_tabs = true` in `rustfmt.toml` (ADR 0013). The port removes rnx's engine/import/follower
 exceptions, subtree paths, second sequencing boundary and domain-specific label
 list. It uses chatd's own cutoff and numbering, underscore-only paired paths,
 and the one-implementation cap. rnx's measurement launchers, execute guard,
 hygiene checker, and disk-admission tooling are not imported by this record.
+
+
+## Rust formatting
+
+`cargo test` runs `cargo fmt --check` from the repository root using Cargo's supplied
+executable, through `tests/formatting.rs`. It reports the formatter's output on failure.
+Only an explicit missing rustfmt/cargo-fmt component diagnostic from the selected
+Rustup toolchain permits a visible skip. Missing Cargo, other toolchain errors,
+invalid formatter configuration and formatting differences fail. A suite reporting
+that skip has **not verified formatting**; install the selected toolchain's rustfmt
+component and rerun it. Controls exercise malformed source and config in temporary
+Cargo projects, without modifying repository files.
+
+ADR 0013 reformats pre-existing Rust files mechanically. To avoid that indentation
+noise in blame, use `git blame --ignore-rev <reformat-commit> -- <path>`. Find the
+commit after implementation with:
+
+```sh
+git log --format='%H %s' --grep='^impl: adr 0013 tab indentation$'
+```
+
+The reformat commit also adds the enforcement test and updates configuration/docs;
+those additions are reviewed separately from the mechanical changes.
