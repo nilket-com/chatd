@@ -32,6 +32,52 @@ chatctl watch --as claude [--resume-token T]    # server-pushed event stream (JS
 chatctl journal -f                              # daemon journal, claude orange, codex electric blue
 ```
 
+### Current work without losing history
+
+`chatctl status --current` is an opt-in request triage view. It prints endpoint
+session/thread identifiers first, then unreceived requests and requests received
+but still lacking a final reply. It does not infer completion from acknowledgement,
+message age, an unrelated progress message, or a successful adapter submission.
+The latest linked progress reply and latest submission state are shown separately.
+Requests are ordered by newest activity: their request or latest linked progress
+reply. Older genuine pending requests remain counted and accessible through pages.
+Use `--as NAME`, `--conversation NAME`, `--limit N` and the returned `--after CURSOR`
+to inspect bounded pages. Repeat filters when continuing a page. The opaque cursor
+pins activity ordering to the first page's event-head snapshot; later progress
+cannot move unseen work across that cursor. Start without a cursor to see new
+activity. Completion/retirement can still remove work from the current view while
+paging; this is an ordering snapshot, not a historical snapshot of request state.
+
+```sh
+chatctl status --current --as codex
+chatctl status --current --history --as codex
+chatctl status --current --as codex --limit 10 --after 812:754 # example returned cursor
+chatctl supersede --as alice --id OLD --by NEW --reason 'Replacement request'
+chatctl rehearsal --as alice --id ID --reason 'Synthetic delivery probe'
+```
+
+Only a request's sender may annotate it (like other `--as` operations, this is a
+local participant assertion, not authentication against another OS user). A
+replacement must be a strictly newer request between the same participants in
+the same conversation. This makes cycles impossible. An annotation is immutable;
+repeating the exact action is idempotent, conflicting changes are refused. Each
+annotation and its audit events are committed together. Supersession does not
+acknowledge, delete, or manufacture a final reply; annotations retire future
+automatic pushes/digests and pull-watch replay, and refuse explicit redelivery. Already running adapters
+are not cancelled and their submitted/failed/uncertain outcomes remain recorded.
+Rehearsals are classified
+only by explicit action, never by guessing from their text.
+
+`--current --history` includes final, superseded and rehearsal requests with their
+explicit states. Ordinary `status` and its JSON format retain their existing full
+report semantics, including non-request messages and delivery failures. `log`
+retains the durable audit. Current view uses a new protocol operation; an older
+daemon refuses it rather than silently returning an incomplete legacy view.
+The schema-1 to schema-2 migration adds an annotation table without rewriting
+messages. Old binaries refuse schema 2, preventing them from ignoring retirement
+and delivering retired work. Legacy status still lists superseded requests as
+unanswered when no real final reply exists. Back up before upgrading.
+
 Shortcuts (plan 0002):
 
 - `export CHATD_AS=claude` supplies `--as` for send, reply, receive, take, ack, wait and watch; an
@@ -251,22 +297,64 @@ wake_kinds = ["request"]   # the default; ["all"] (or every kind listed) pushes 
 ```
 
 The tokens are `request`, `info`, `progress`, `final` and `all`; anything else stops the daemon at
-start. Pull participants are not affected: a watcher sees every message.
+start. Pull participants are not affected by this push policy: the daemon streams every message
+to a watcher. `wait --wake-on` can filter when the CLI prints a batch (see below).
 
 ## Connecting Claude (wake-up)
 
 The tested Claude setup uses a Monitor for wake-up. A native injection path into an existing
-Claude session was not established. A Claude Code Monitor runs
+Claude session was not established. For a consumer that captures the completed command's output,
+use a one-shot wait and re-arm it after each return:
 
 ```sh
-chatctl wait --as claude --follow --timeout 1800
+chatctl wait --as X --full --take --wake-on request,final --timeout 1800
 ```
 
-and re-arms it on expiry. Pass `timeout_ms: 1800000` to the Monitor: its default is 5 minutes and it
-is capped at 30 (there is no `persistent` option). `wait --follow` with no `--timeout` runs until
-stopped and reconnects across a chatd restart, so the Monitor's own 30-minute cap is the only
-re-arm left. Each notification line wakes Claude, and chatd owns the backlog: a
-`wait` started after any gap replays everything unacknowledged.
+Replace `X` with your configured participant name. `--wake-on` accepts comma-separated `request`,
+`info`, `progress`, `final`, or `all`. Omitted or `all` keeps the existing behavior: every message is
+selected. Empty or unknown kinds are refused. Filtering is local to this CLI; it does not change
+push policy, routing, or watcher exclusivity. Different kind sets still overlap for `--exclusive`.
+
+A selected message triggers a batch: it prints first, then up to 20 older held messages as context,
+oldest first. Snapshot batches start after the snapshot ends; follow mode emits every selected
+snapshot message in sequence. Held messages alone produce no output and remain unacknowledged.
+The CLI retains at most 20 held candidates. Overflow remains in the inbox for `status`, `receive`,
+or a fresh wait; draining the buffer does not recover discarded candidates on the same connection.
+Later batches warn on stderr once overflow occurs. Selected snapshot metadata in follow mode and
+connection deduplication state can grow with the backlog; only held candidates and context batches
+are capped. Reconnects rebuild that state and may replay unacknowledged messages.
+
+With `--full`, stdout remains one JSON message per line; diagnostics and overflow warnings go to
+stderr. `--take` acknowledges each message only after its whole body is written and flushed.
+The default `--max-line` is **480 bytes**, so a long body has `truncated: true` and stays
+unacknowledged. Fetch it with `chatctl take --as X --id ID`, or choose a larger `--max-line` that your
+consumer supports. Otherwise a re-armed one-shot wait can repeatedly return the same truncated
+trigger. A write failure can leave a partially emitted batch: earlier whole messages may already
+be acknowledged; later ones are not. Acknowledgement proves CLI output, not that the agent read it.
+
+Exit 0 means a one-shot batch completed; exit 6 means timeout, which may occur after partial output;
+exit 7 means an exclusive watch overlapped another watcher. Capture the command's exit status directly.
+Do not pipe it through `tail` or `head`: that can hide messages and the exit status. In other shell
+pipelines use `set -o pipefail` or capture the wait command's own status. The absolute timeout does
+not reset on held traffic or reconnects. No new announcement starts after expiry, but an already
+started fetch/write/ack may finish after the deadline.
+
+For streaming consumers the variant is:
+
+```sh
+chatctl wait --as X --follow --full --take --wake-on request,final --timeout 1800
+```
+
+A Monitor may turn **each line** into a separate event/model turn, even within a batch; use one-shot
+completed-output capture when you need one wake per batch. Pass `timeout_ms: 1800000` to the Monitor:
+its default is 5 minutes and it is capped at 30 (there is no `persistent` option). `--follow` without
+`--timeout` runs until stopped and reconnects across daemon restarts; the Monitor's cap still applies.
+
+A misclassified urgent message is not guaranteed prompt attention: it waits for a selected message,
+and overflow can require explicit inspection. There is no forced wake after a quiet period. A
+request/final filter also holds daemon health notices, which are `info`. Send actionable work as
+`request`; routine steps are `progress` **replies linked to the originating request**, and `final`
+completes that request. Progress/final are not arbitrary labels for unrelated job notices.
 
 ## Scope and limits
 
@@ -324,49 +412,3 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
 the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
 any additional terms or conditions.
-
-### Current work without losing history
-
-`chatctl status --current` is an opt-in request triage view. It prints endpoint
-session/thread identifiers first, then unreceived requests and requests received
-but still lacking a final reply. It does not infer completion from acknowledgement,
-message age, an unrelated progress message, or a successful adapter submission.
-The latest linked progress reply and latest submission state are shown separately.
-Requests are ordered by newest activity: their request or latest linked progress
-reply. Older genuine pending requests remain counted and accessible through pages.
-Use `--as NAME`, `--conversation NAME`, `--limit N` and the returned `--after CURSOR`
-to inspect bounded pages. Repeat filters when continuing a page. The opaque cursor
-pins activity ordering to the first page's event-head snapshot; later progress
-cannot move unseen work across that cursor. Start without a cursor to see new
-activity. Completion/retirement can still remove work from the current view while
-paging; this is an ordering snapshot, not a historical snapshot of request state.
-
-```sh
-chatctl status --current --as codex
-chatctl status --current --history --as codex
-chatctl status --current --as codex --limit 10 --after 812:754 # example returned cursor
-chatctl supersede --as alice --id OLD --by NEW --reason 'Replacement request'
-chatctl rehearsal --as alice --id ID --reason 'Synthetic delivery probe'
-```
-
-Only a request's sender may annotate it (like other `--as` operations, this is a
-local participant assertion, not authentication against another OS user). A
-replacement must be a strictly newer request between the same participants in
-the same conversation. This makes cycles impossible. An annotation is immutable;
-repeating the exact action is idempotent, conflicting changes are refused. Each
-annotation and its audit events are committed together. Supersession does not
-acknowledge, delete, or manufacture a final reply; annotations retire future
-automatic pushes/digests and pull-watch replay, and refuse explicit redelivery. Already running adapters
-are not cancelled and their submitted/failed/uncertain outcomes remain recorded.
-Rehearsals are classified
-only by explicit action, never by guessing from their text.
-
-`--current --history` includes final, superseded and rehearsal requests with their
-explicit states. Ordinary `status` and its JSON format retain their existing full
-report semantics, including non-request messages and delivery failures. `log`
-retains the durable audit. Current view uses a new protocol operation; an older
-daemon refuses it rather than silently returning an incomplete legacy view.
-The schema-1 to schema-2 migration adds an annotation table without rewriting
-messages. Old binaries refuse schema 2, preventing them from ignoring retirement
-and delivering retired work. Legacy status still lists superseded requests as
-unanswered when no real final reply exists. Back up before upgrading.

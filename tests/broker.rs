@@ -2297,3 +2297,252 @@ fn a_rebound_endpoint_pushes_fresh_work_without_waiting_for_the_old_unacknowledg
     let take = e.cli(&["take", "--as", "codex", "--id", &old], None);
     assert!(take.status.success(), "the old message remains unacknowledged and readable");
 }
+
+// ---- plan 0008: CLI-only pull wake filtering ----
+
+fn json_message_ids(out: &Output) -> Vec<String> {
+    stdout(out)
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("only message JSON on stdout")["id"].as_str().unwrap().to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn wake_filter_rejects_invalid_sets_before_connecting() {
+    let e = Env::standard(); // Deliberately no daemon: these are argument errors.
+    for kinds in ["", "request,", ",info", "Request", "all,bogus"] {
+        let out = e.cli(&["wait", "--as", "claude", "--wake-on", kinds], None);
+        assert_eq!(code(&out), 2, "{kinds:?}: {}", stderr(&out));
+        assert!(stderr(&out).contains("invalid wake kind"));
+    }
+}
+
+#[test]
+fn filtered_one_shot_prints_selected_first_then_context_and_takes_only_whole_bodies() {
+    for take in [false, true] {
+        let mut e = Env::standard();
+        e.start();
+        let info = e.send("codex", "claude", "c", Kind::Info, "i", "context");
+        let long = e.send("codex", "claude", "c", Kind::Info, "long", &"x".repeat(5000));
+        let req = e.send("codex", "claude", "c", Kind::Request, "r", "act");
+        let later = e.send("codex", "claude", "c", Kind::Info, "later", "after the trigger");
+        let mut args = vec!["wait", "--as", "claude", "--wake-on", "request,final", "--full"];
+        if take {
+            args.push("--take");
+        }
+        let out = e.cli(&args, None);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert_eq!(json_message_ids(&out), vec![req.clone(), info.clone(), long.clone()]);
+        let remaining: Vec<_> = e.status(Some("claude")).unacknowledged.into_iter().map(|m| m.id).collect();
+        assert_eq!(remaining, if take { vec![long, later] } else { vec![info, long, req, later] });
+    }
+}
+
+#[test]
+fn filtered_snapshot_pages_preserve_every_selected_message_and_bound_context() {
+    let mut e = Env::standard();
+    e.start();
+    let mut held = Vec::new();
+    for i in 0..205 {
+        held.push(e.send("codex", "claude", "c", Kind::Info, &format!("i{i}"), "held"));
+    }
+    let first = e.send("codex", "claude", "c", Kind::Request, "r1", "first trigger on page two");
+    let between = e.send("codex", "claude", "c", Kind::Info, "between", "buffer already full");
+    let second = e.send("codex", "claude", "c", Kind::Request, "r2", "another trigger");
+    // One-shot waits for the snapshot, but takes only the first trigger and bounded context.
+    let out = e.cli(&["wait", "--as", "claude", "--wake-on", "request", "--full"], None);
+    let mut expected = vec![first.clone()];
+    expected.extend_from_slice(&held[..20]);
+    assert_eq!(json_message_ids(&out), expected);
+    assert!(stderr(&out).contains("more held messages may remain"));
+    // Follow must retain both triggers across pages; overflow is not silently recovered or acked.
+    let out = e.cli(&["wait", "--as", "claude", "--wake-on", "request", "--full", "--take", "--follow", "--timeout", "1"], None);
+    expected.push(second);
+    assert_eq!(code(&out), 6);
+    assert_eq!(json_message_ids(&out), expected);
+    assert_eq!(stderr(&out).matches("more held messages may remain").count(), 2);
+    let remaining = e.status(Some("claude")).unacknowledged;
+    let mut expected_left = held[20..].to_vec();
+    expected_left.push(between);
+    assert_eq!(remaining.into_iter().map(|m| m.id).collect::<Vec<_>>(), expected_left);
+}
+
+#[test]
+fn filtered_follow_assigns_context_to_the_next_trigger_only() {
+    let mut e = Env::standard();
+    e.start();
+    let a = e.send("codex", "claude", "c", Kind::Info, "a", "before first");
+    let first = e.send("codex", "claude", "c", Kind::Request, "r1", "first");
+    let b = e.send("codex", "claude", "c", Kind::Info, "b", "between");
+    let second = e.send("codex", "claude", "c", Kind::Request, "r2", "second");
+    let out = e.cli(&["wait", "--as", "claude", "--wake-on", "request", "--full", "--follow", "--timeout", "1"], None);
+    assert_eq!(code(&out), 6);
+    assert_eq!(json_message_ids(&out), vec![first, a, second, b]);
+    assert_eq!(e.status(Some("claude")).unacknowledged.len(), 4);
+}
+
+#[test]
+fn filtered_live_messages_form_batches_and_reconnect_rebuilds_unacked_context() {
+    use std::io::{BufRead, BufReader};
+    let mut e = Env::standard();
+    e.start();
+    let ready = e.send("codex", "claude", "c", Kind::Request, "ready", "snapshot trigger");
+    let mut child = e.spawn_wait(&["--wake-on", "request,final", "--full", "--timeout", "10"]);
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    let read_id = |lines: &mut BufReader<std::process::ChildStdout>| {
+        let mut line = String::new();
+        lines.read_line(&mut line).unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"].as_str().unwrap().to_owned()
+    };
+    assert_eq!(read_id(&mut lines), ready);
+    let ask = e.send("claude", "codex", "c", Kind::Request, "ask", "work");
+    let progress = stored_id(e.reply("codex", &ask, Kind::Progress, "step"));
+    let info = e.send("codex", "claude", "c", Kind::Info, "info", "context");
+    let final_id = stored_id(e.reply("codex", &ask, Kind::Final, "done"));
+    assert_eq!(read_id(&mut lines), final_id);
+    assert_eq!(read_id(&mut lines), progress);
+    assert_eq!(read_id(&mut lines), info);
+    let next = e.send("codex", "claude", "c", Kind::Request, "next", "no repeated context");
+    assert_eq!(read_id(&mut lines), next);
+    e.kill9();
+    e.start();
+    // All messages were unacked. Restart gives a new snapshot and restores held context.
+    assert_eq!(read_id(&mut lines), ready);
+    assert_eq!(read_id(&mut lines), final_id);
+    assert_eq!(read_id(&mut lines), progress);
+    assert_eq!(read_id(&mut lines), info);
+    assert_eq!(read_id(&mut lines), next);
+    let _ = finish(child);
+}
+
+#[test]
+fn held_only_wait_times_out_without_output_or_acknowledgement() {
+    for take in [false, true] {
+        let mut e = Env::standard();
+        e.start();
+        let id = e.send("codex", "claude", "c", Kind::Info, "held", "not a trigger");
+        let mut args = vec!["wait", "--as", "claude", "--wake-on", "request", "--full", "--timeout", "1"];
+        if take {
+            args.push("--take");
+        }
+        let out = e.cli(&args, None);
+        assert_eq!(code(&out), 6);
+        assert!(stdout(&out).is_empty());
+        assert!(stderr(&out).contains("timeout"));
+        assert_eq!(e.status(Some("claude")).unacknowledged[0].id, id);
+    }
+}
+
+#[test]
+fn all_wake_kinds_preserve_the_unfiltered_one_shot() {
+    let mut e = Env::standard();
+    e.start();
+    let info = e.send("codex", "claude", "c", Kind::Info, "first", "first");
+    e.send("codex", "claude", "c", Kind::Request, "next", "next");
+    for kinds in [None, Some("all"), Some("info,request,final,progress"), Some("all,request")] {
+        let mut args = vec!["wait", "--as", "claude", "--full"];
+        if let Some(kinds) = kinds {
+            args.extend(["--wake-on", kinds]);
+        }
+        let out = e.cli(&args, None);
+        assert_eq!(code(&out), 0);
+        assert_eq!(json_message_ids(&out), vec![info.clone()]);
+    }
+}
+
+#[test]
+fn filtered_batch_write_failure_keeps_unprinted_context_unacknowledged() {
+    use std::os::unix::process::CommandExt;
+    let mut e = Env::standard();
+    e.start();
+    let held = e.send("codex", "claude", "c", Kind::Info, "held", "context body");
+    let later = e.send("codex", "claude", "c", Kind::Info, "later", "never printed");
+    let selected = e.send("codex", "claude", "c", Kind::Request, "selected", "trigger");
+    let args = ["wait", "--as", "claude", "--wake-on", "request", "--full"];
+    let baseline = e.cli(&args, None);
+    assert_eq!(code(&baseline), 0);
+    let first_len = stdout(&baseline).lines().next().unwrap().len() + 1;
+    let path = e.dir.join("bounded-output");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut cmd = Command::new(CLI);
+    e.envs(&mut cmd);
+    // The selected JSON line fits; the next line writes partially and then fails with EFBIG.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit { rlim_cur: (first_len + 10) as _, rlim_max: (first_len + 10) as _ };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.args(args).arg("--take").stdout(file).stderr(Stdio::piped()).output().unwrap();
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("not acknowledged"));
+    let printed = std::fs::read_to_string(path).unwrap();
+    let first: serde_json::Value = serde_json::from_str(printed.lines().next().unwrap()).unwrap();
+    assert_eq!(first["id"], selected);
+    assert_eq!(e.status(Some("claude")).unacknowledged.into_iter().map(|m| m.id).collect::<Vec<_>>(), vec![held, later]);
+}
+
+#[test]
+fn unfiltered_wait_returns_before_snapshot_end_but_filtered_wait_waits_for_it() {
+    use chatd::proto::{ClientFrame, MessageView, PROTOCOL_VERSION, ServerFrame, read_frame, write_frame};
+    use std::os::unix::net::UnixListener;
+    for kinds in [None, Some("all"), Some("info")] {
+        let e = Env::standard();
+        let listener = UnixListener::bind(e.socket()).unwrap();
+        // An isolated protocol fixture deliberately withholds SnapshotEnd until the CLI disconnects.
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let request: ClientFrame = read_frame(&mut socket).unwrap().unwrap();
+            assert!(matches!(request.req, Request::Watch { .. }));
+            let message = MessageView {
+                id: "00000000-0000-4000-8000-000000000001".into(),
+                seq: 1,
+                conversation: "c".into(),
+                sender: "codex".into(),
+                recipient: "claude".into(),
+                kind: Kind::Info,
+                reply_to: None,
+                summary: "from first page".into(),
+                created_at_ms: 0,
+                idempotency_key: "key".into(),
+                body: None,
+                received_at_ms: None,
+                answered_by: None,
+            };
+            for resp in [
+                Response::SnapshotBegin {
+                    head_seq: 1,
+                    resume_token: "token".into(),
+                    unacknowledged_total: 1,
+                    resynchronized: None,
+                    other_watchers: Some(0),
+                },
+                Response::SnapshotPage { unacknowledged: vec![message] },
+            ] {
+                write_frame(&mut socket, &ServerFrame { v: PROTOCOL_VERSION, resp }).unwrap();
+            }
+            let mut byte = [0];
+            assert_eq!(socket.read(&mut byte).unwrap(), 0, "CLI disconnects without SnapshotEnd");
+        });
+        let mut args = vec!["wait", "--as", "claude", "--timeout", "1"];
+        if let Some(kinds) = kinds {
+            args.extend(["--wake-on", kinds]);
+        }
+        let out = e.cli(&args, None);
+        server.join().unwrap();
+        if kinds == Some("info") {
+            assert_eq!(code(&out), 6);
+            assert!(stdout(&out).is_empty(), "filtered snapshot waits for its boundary");
+        } else {
+            assert_eq!(code(&out), 0);
+            assert!(stdout(&out).contains("from first page"));
+        }
+    }
+}

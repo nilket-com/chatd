@@ -1,6 +1,6 @@
 //! chatctl: the chatd command-line client.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
@@ -90,8 +90,12 @@ enum Cmd {
         #[arg(required = true)]
         ids: Vec<String>,
     },
-    /// Block until an unacknowledged message is available; print one notification line and exit.
+    /// Wait for a message; use --full --take --wake-on request,final for a context batch.
     Wait {
+        /// Comma-separated kinds that trigger output (request, info, progress, final, or all).
+        /// Other kinds stay unread until shown as bounded context after a selected message.
+        #[arg(long, value_parser = parse_wake_kinds)]
+        wake_on: Option<WakeKinds>,
         #[arg(long = "as", env = "CHATD_AS")]
         who: String,
         #[arg(long)]
@@ -530,8 +534,14 @@ fn fetch(who: &str, id: &str) -> Result<MessageView, String> {
 /// lost after the commit) is reported and the message may replay: delivery is at-least-once.
 fn announce(who: &str, m: &MessageView, mode: Announce) -> Option<ExitCode> {
     let Announce::Full { take, max_line } = mode else {
-        emit(&text::notification(m, who, now_ms()));
-        return None;
+        let mut out = io::stdout().lock();
+        return match writeln!(out, "{}", text::notification(m, who, now_ms())).and_then(|()| out.flush()) {
+            Ok(()) => None,
+            Err(e) => {
+                eprintln!("chatctl: could not write the message ({e}); not acknowledged");
+                Some(ExitCode::FAILURE)
+            }
+        };
     };
     let fetched = fetch(who, &m.id);
     let (body, error) = match &fetched {
@@ -605,9 +615,95 @@ fn left(deadline: Option<Instant>) -> Duration {
     deadline.map_or(Duration::from_secs(u32::MAX as u64), |d| d.saturating_duration_since(Instant::now()))
 }
 
-/// wait / wait --follow over a server-pushed watch, reconnecting within the deadline. Printing
-/// never acknowledges; a reconnect replays everything still unacknowledged.
-fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: bool, exclusive: bool, mode: Announce) -> ExitCode {
+/// A CLI policy only: the daemon continues streaming the complete inbox.
+#[derive(Clone, Debug)]
+struct WakeKinds(Vec<Kind>);
+
+fn parse_wake_kinds(value: &str) -> Result<WakeKinds, String> {
+    let mut kinds = Vec::new();
+    for token in value.split(',') {
+        if token == "all" {
+            kinds.extend(Kind::ALL);
+        } else {
+            kinds.push(
+                Kind::parse(token).ok_or_else(|| format!("invalid wake kind {token:?}; use request, info, progress, final, or all"))?,
+            );
+        }
+    }
+    kinds.sort_by_key(|k| Kind::ALL.iter().position(|v| v == k).unwrap());
+    kinds.dedup();
+    Ok(WakeKinds(kinds))
+}
+
+const HELD_CONTEXT_CAP: usize = 20;
+
+#[derive(Default)]
+struct HeldContext {
+    messages: VecDeque<MessageView>,
+    overflow: bool,
+}
+
+impl HeldContext {
+    fn hold(&mut self, message: MessageView) {
+        if self.messages.len() < HELD_CONTEXT_CAP {
+            self.messages.push_back(message);
+        } else {
+            self.overflow = true;
+        }
+    }
+
+    fn batch(&mut self, selected: MessageView) -> Vec<MessageView> {
+        let boundary = selected.seq;
+        let mut batch = vec![selected];
+        while self.messages.front().is_some_and(|m| m.seq < boundary) {
+            batch.push(self.messages.pop_front().unwrap());
+        }
+        batch
+    }
+}
+
+/// Check between announcements; an already-started fetch/write/ack retains its existing semantics.
+fn announce_before_deadline(
+    batch: &[MessageView],
+    mut expired: impl FnMut() -> bool,
+    mut output: impl FnMut(&MessageView) -> Option<ExitCode>,
+) -> Option<ExitCode> {
+    for message in batch {
+        if expired() {
+            eprintln!("chatctl: timeout");
+            return Some(ExitCode::from(EXIT_TIMEOUT));
+        }
+        if let Some(code) = output(message) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+fn announce_context(
+    who: &str,
+    selected: MessageView,
+    held: &mut HeldContext,
+    mode: Announce,
+    deadline: Option<Instant>,
+) -> Option<ExitCode> {
+    if held.overflow {
+        eprintln!("chatctl: more held messages may remain: chatctl status --as {who}");
+    }
+    announce_before_deadline(&held.batch(selected), || left(deadline).is_zero(), |m| announce(who, m, mode))
+}
+
+/// Reconnect within the absolute deadline; only --full --take acknowledges complete output.
+fn wait(
+    who: &str,
+    conversation: Option<String>,
+    timeout: Option<u64>,
+    follow: bool,
+    exclusive: bool,
+    mode: Announce,
+    wake_on: Option<WakeKinds>,
+) -> ExitCode {
+    let filtered = wake_on.filter(|k| k.0.len() != Kind::ALL.len());
     let mut warned = false;
     let deadline = wait_seconds(timeout, follow).map(|n| Instant::now() + Duration::from_secs(n));
     let mut printed_any = false;
@@ -634,6 +730,8 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
             continue;
         }
         let mut emitted: HashSet<String> = HashSet::new();
+        let mut held = HeldContext::default();
+        let mut selected_snapshot = Vec::new();
         loop {
             let remaining = left(deadline);
             if remaining.is_zero() {
@@ -653,8 +751,19 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
                 }
                 Ok(Response::SnapshotPage { unacknowledged }) => {
                     for m in unacknowledged {
-                        if emitted.insert(m.id.clone()) {
-                            if let Some(code) = announce(who, &m, mode) {
+                        if !emitted.insert(m.id.clone()) {
+                            continue;
+                        }
+                        if let Some(kinds) = &filtered {
+                            if kinds.0.contains(&m.kind) {
+                                if follow || selected_snapshot.is_empty() {
+                                    selected_snapshot.push(m);
+                                }
+                            } else {
+                                held.hold(m);
+                            }
+                        } else {
+                            if let Some(code) = announce_before_deadline(&[m], || left(deadline).is_zero(), |m| announce(who, m, mode)) {
                                 return code;
                             }
                             printed_any = true;
@@ -664,11 +773,26 @@ fn wait(who: &str, conversation: Option<String>, timeout: Option<u64>, follow: b
                         }
                     }
                 }
+                Ok(Response::SnapshotEnd { .. }) => {
+                    for m in selected_snapshot.drain(..) {
+                        if let Some(code) = announce_context(who, m, &mut held, mode, deadline) {
+                            return code;
+                        }
+                        printed_any = true;
+                        if !follow {
+                            return ExitCode::SUCCESS;
+                        }
+                    }
+                }
                 Ok(Response::Event { event, .. }) => {
                     if let Some(m) = view_from_event(&event, who)
                         && emitted.insert(m.id.clone())
                     {
-                        if let Some(code) = announce(who, &m, mode) {
+                        if filtered.as_ref().is_some_and(|kinds| !kinds.0.contains(&m.kind)) {
+                            held.hold(m);
+                            continue;
+                        }
+                        if let Some(code) = announce_context(who, m, &mut held, mode, deadline) {
                             return code;
                         }
                         printed_any = true;
@@ -870,9 +994,9 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                 println!("acknowledged {} (already {})", acknowledged.len(), already.len());
             }
         }
-        Cmd::Wait { who, conversation, timeout, follow, exclusive, full, take, max_line } => {
+        Cmd::Wait { who, conversation, timeout, follow, exclusive, full, take, max_line, wake_on } => {
             let mode = if full { Announce::Full { take, max_line: max_line as usize } } else { Announce::Line };
-            return match wait(&who, conversation, timeout, follow, exclusive, mode) {
+            return match wait(&who, conversation, timeout, follow, exclusive, mode, wake_on) {
                 c if c == ExitCode::SUCCESS => Ok(()),
                 c => Err(c),
             };
@@ -1181,8 +1305,9 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_watchers, cut, fit, wait_seconds};
+    use super::{EXIT_TIMEOUT, announce_before_deadline, check_watchers, cut, fit, wait_seconds};
     use chatd::proto::{Kind, MessageView};
+    use std::process::ExitCode;
 
     fn view(summary: &str) -> MessageView {
         MessageView {
@@ -1269,5 +1394,32 @@ mod tests {
         assert_eq!(wait_seconds(Some(5), true), Some(5));
         assert_eq!(wait_seconds(None, true), None);
         assert_eq!(wait_seconds(Some(0), true), wait_seconds(None, true));
+    }
+    #[test]
+    fn a_batch_stops_before_the_next_message_after_expiry_or_output_failure() {
+        use std::cell::Cell;
+        let batch = vec![view("trigger"), view("context"), view("unseen")];
+        let written = Cell::new(0);
+        let result = announce_before_deadline(
+            &batch,
+            || written.get() == 1,
+            |_| {
+                written.set(written.get() + 1);
+                None
+            },
+        );
+        assert_eq!(result, Some(ExitCode::from(EXIT_TIMEOUT)));
+        assert_eq!(written.get(), 1, "a completed announcement can exhaust the deadline");
+        written.set(0);
+        let result = announce_before_deadline(
+            &batch,
+            || false,
+            |_| {
+                written.set(written.get() + 1);
+                (written.get() == 2).then_some(ExitCode::FAILURE)
+            },
+        );
+        assert_eq!(result, Some(ExitCode::FAILURE));
+        assert_eq!(written.get(), 2, "no later announcement after the context write fails");
     }
 }
