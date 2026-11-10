@@ -191,7 +191,7 @@ fn readiness_is_sent_only_with_a_serving_socket_and_health() {
 	e.start();
 	match e.call(Request::Health) {
 		Response::Health { schema_version, head_seq, .. } => {
-			assert_eq!(schema_version, 2);
+			assert_eq!(schema_version, chatd::store::SCHEMA_VERSION);
 			assert!(head_seq >= 0);
 		}
 		other => panic!("{other:?}"),
@@ -2256,7 +2256,7 @@ fn schema_one_backup_restores_then_migrates_without_touching_the_backup() {
 	assert!(run_restore(&e, &backup, None).status.success());
 	e.start();
 	assert_eq!(facts(&e).1, 1);
-	assert!(matches!(e.call(Request::Health), Response::Health { schema_version: 2, .. }));
+	assert!(matches!(e.call(Request::Health), Response::Health { schema_version: chatd::store::SCHEMA_VERSION, .. }));
 	assert_eq!(std::fs::read(&backup).unwrap(), original);
 }
 
@@ -2949,4 +2949,89 @@ fn config_apply_concurrent_admissions_agree_with_directory() {
 	}
 	let (_, snap) = open_watch(&e, "new-team", None);
 	assert_eq!(snap.total, 0);
+}
+
+#[test]
+fn bulk_cli_preview_apply_history_and_id_ack_remain_distinct() {
+	let mut e = Env::standard();
+	e.start();
+	let id = e.send("claude", "codex", "cleanup", Kind::Request, "retire-cli", "old work");
+	e.send("codex", "claude", "boundary", Kind::Info, "boundary-cli", "boundary");
+	let bound = e.status(None).head_seq.to_string();
+	let args = [
+		"--json",
+		"retire",
+		"--as",
+		"claude",
+		"--before-seq",
+		&bound,
+		"--to",
+		"codex",
+		"--conversation",
+		"cleanup",
+		"--reason",
+		"finished work",
+	];
+	let out = e.cli(&args, None);
+	assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+	let preview: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	assert_eq!(preview["count"], 1);
+	assert_eq!(preview["applied"], false);
+	assert!(e.status(Some("codex")).unacknowledged.iter().any(|m| m.id == id));
+	let revision = preview["revision"].as_str().unwrap();
+	let mut apply = args.to_vec();
+	apply.extend(["--revision", revision]);
+	assert_eq!(code(&e.cli(&apply, None)), 0);
+	assert_eq!(code(&e.cli(&apply, None)), 5);
+	let history = e.cli(&["status", "--current", "--history", "--conversation", "cleanup"], None);
+	assert!(stdout(&history).contains("[retired]"));
+	assert!(stdout(&history).contains("retired: finished work"));
+	let (_, snapshot) = open_watch(&e, "codex", None);
+	assert_eq!(snapshot.total, 0);
+	// Duplicate send receipts report explicit retirement instead of a fictitious replacement.
+	let receipt = e.cli(
+		&["send", "--as", "claude", "--to", "codex", "--conversation", "cleanup", "--idempotency-key", "retire-cli"],
+		Some("old work"),
+	);
+	assert_eq!(code(&receipt), 0);
+	let stderr = String::from_utf8_lossy(&receipt.stderr);
+	assert!(stderr.contains("retired request"), "{stderr}");
+	assert!(!stderr.contains("superseded"));
+	let ack_args =
+		["--json", "ack", "--as", "codex", "--before-seq", &bound, "--from", "claude", "--conversation", "cleanup", "--kind", "request"];
+	let out = e.cli(&ack_args, None);
+	assert_eq!(code(&out), 0);
+	let ack: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+	assert_eq!(ack["count"], 1);
+	let mut ack_apply = ack_args.to_vec();
+	ack_apply.extend(["--revision", ack["revision"].as_str().unwrap()]);
+	assert_eq!(code(&e.cli(&ack_apply, None)), 0);
+	assert_eq!(code(&e.cli(&["ack", "--as", "codex", &id], None)), 0); // existing ID form, already acked
+	assert_eq!(code(&e.cli(&["ack", "--as", "codex", &id, "--before-seq", &bound], None)), 2);
+	assert_eq!(code(&e.cli(&["ack", "--as", "codex", &id, "--kind", "request"], None)), 2);
+	let empty = e.cli(&["retire", "--as", "claude", "--before-seq", &bound, "--reason", "finished work"], None);
+	assert!(stdout(&empty).contains("no change: 0 matched"));
+}
+
+#[test]
+fn bulk_apply_notifies_attached_watcher_after_commit() {
+	let mut e = Env::standard();
+	e.start();
+	let id = e.send("claude", "codex", "cleanup", Kind::Request, "notify-retire", "old work");
+	e.send("codex", "claude", "boundary", Kind::Info, "notify-boundary", "boundary");
+	let (mut watcher, _) = open_watch(&e, "codex", None);
+	let selection = chatd::proto::BulkSpec {
+		actor: "claude".into(),
+		before_seq: e.status(None).head_seq,
+		peer: None,
+		conversation: Some("cleanup".into()),
+		action: chatd::proto::BulkAction::Retire { reason: "finished".into() },
+	};
+	let Response::Bulk(preview) = e.call(Request::BulkPreview { selection: selection.clone() }) else { panic!() };
+	assert!(matches!(e.call(Request::BulkApply { selection, revision: preview.revision }), Response::Bulk(_)));
+	let (event, _) = next_event(&mut watcher);
+	assert_eq!(event.kind, "retired");
+	assert_eq!(event.message_id.as_deref(), Some(id.as_str()));
+	let status = e.cli(&["status"], None);
+	assert!(stdout(&status).contains("omitted 0 acknowledged or retired candidates"));
 }

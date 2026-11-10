@@ -68,15 +68,70 @@ are not cancelled and their submitted/failed/uncertain outcomes remain recorded.
 Rehearsals are classified
 only by explicit action, never by guessing from their text.
 
-`--current --history` includes final, superseded and rehearsal requests with their
+`--current --history` includes final, retired, superseded and rehearsal requests with their
 explicit states. Ordinary `status` and its JSON format retain their existing full
-report semantics, including non-request messages and delivery failures. `log`
+report semantics for unanswered/unacknowledged messages. The attention list excludes
+acknowledged or annotated requests as described below. `log`
 retains the durable audit. Current view uses a new protocol operation; an older
 daemon refuses it rather than silently returning an incomplete legacy view.
-The schema-1 to schema-2 migration adds an annotation table without rewriting
-messages. Old binaries refuse schema 2, preventing them from ignoring retirement
-and delivering retired work. Legacy status still lists superseded requests as
-unanswered when no real final reply exists. Back up before upgrading.
+Schema 2 introduced annotations; schema 3 distinguishes explicit retirement from
+supersession and rehearsal. Schema 1 and 2 stores and backups migrate forward without
+rewriting messages or existing evidence. Older binaries refuse schema 3. Ordinary
+status still lists retired requests as unanswered when no real final reply exists.
+Back up before upgrading.
+
+## Cleaning up an old backlog
+
+Use `chatctl status --json` to inspect the head sequence and choose a cutoff. A cutoff
+is required: `--before-seq N` means strictly below N, with `0 <= N <= head`. There is
+no unbounded cleanup command. Start with a preview, read the filters, count, sequence
+range and sample, then repeat the same command with its revision to apply:
+
+```sh
+chatctl retire --as alice --to bob --conversation old-work --before-seq 500 --reason 'Work completed elsewhere'
+chatctl retire --as alice --to bob --conversation old-work --before-seq 500 --reason 'Work completed elsewhere' --revision <preview-revision>
+
+chatctl ack --as bob --from alice --conversation old-work --kind info --before-seq 500
+chatctl ack --as bob --from alice --conversation old-work --kind info --before-seq 500 --revision <preview-revision>
+```
+
+Choose a cutoff appropriate to your store; 500 is only an example. `--to`/`--from`,
+`--conversation` and ack's `--kind` are optional filters. A kind is one of `request`,
+`info`, `progress`, `final`; omit it for every kind. Retirement requires a nonblank
+reason of at most 1024 bytes. `--as` asserts a local participant identity; it is not
+authentication. Positional message IDs cannot be mixed with bulk ack flags. The
+existing `chatctl ack --as bob ID...` continues to work as before.
+
+Retirement selects only the sender's requests that have neither a final reply nor
+an existing annotation. It records an immutable retired state and reason. It does
+not acknowledge a message or invent a final reply. Bulk ack selects the recipient's
+unacknowledged messages, including annotated requests: received still does not mean
+done. Neither operation deletes history. Inspect retired work with
+`chatctl status --current --history` and its audit events with `chatctl log`.
+
+Both operations support `--json`. Previews and results contain at most 10 summary
+samples (no message bodies), the count and oldest/newest matching sequence, the
+selection and a revision. The revision covers all matching IDs, operation, actor,
+filters, cutoff, reason, and store identity/restore generation. It does not depend
+on unrelated head advancement: a new message cannot enter a previously bounded set.
+Apply compares the complete set inside the transaction; a changed set or selection
+conflicts without partial writes. Restoring a backup invalidates old revisions.
+
+After an apply changes a nonempty set, retrying that revision conflicts. If a reply
+is lost or a revision conflicts, preview again to see what remains; the first apply
+may already have committed. An empty selection reports no change and remains safely
+repeatable. A progress reply auto-acknowledges its parent, so it changes bulk ack's
+set but does not by itself change retirement's unanswered-request set.
+
+Retirement and acknowledgement suppress future eligible delivery. They cannot recall
+an already claimed push, captured digest, or watch snapshot/output in flight, and are
+not proof that the recipient never saw the message. No running adapter is cancelled.
+
+`status` lists latest failed, uncertain or started submissions as needing attention
+only while their messages are unacknowledged and have no retirement annotation
+(retired, superseded or rehearsal). `attention_omitted_total` counts excluded
+candidates once, with the same filters and before pagination; human output reports
+that number too. Historical unanswered/unacknowledged totals remain unchanged.
 
 Shortcuts (plan 0002):
 
@@ -194,7 +249,7 @@ Policy is an observation, not a delivery promise. For example:
 | Duplicate with no evidence | already stored; no submission or receipt evidence recorded; current kind policy follows |
 | Duplicate with evidence | acknowledged 2s ago; carried in digest with ID; latest recorded attempt 12: submitted (generation 2) |
 | Answered request | answered by REPLY-ID, separately from acknowledgement and attempt evidence |
-| Retired request | retired rehearsal request (or superseded by ID); no automatic push or digest; redelivery refused |
+| Retired request | retired request, retired rehearsal request, or superseded by ID; no automatic push or digest; redelivery refused |
 | Observation failed | stored; delivery observation unavailable |
 
 Push policy includes `generation`, `wake_kinds`, `is_wake_kind`, `throttle_candidate` and

@@ -29,3 +29,34 @@ Paired ADR: ../adr/0014_bulk_backlog_retirement.md.
    push may finish and is not retried; migration of a populated schema-2 copy (superseded and
    rehearsal rows, acknowledgements, attempts, pending requests) and of schema 1, plus restore of a
    schema-2 backup; attention list and omitted count with both exclusions counted once.
+
+## Implemented details
+
+Schema 3 adds a default-false `retired` flag to the existing annotation table, preserving
+schema-1/2 upgrades and existing fields. All annotation writers use named columns; exact
+rehearsal retries also check the flag. Current history and delivery evidence distinguish the
+three annotation states. Restore accepts schema-2 backups and changes store identity as before.
+
+`BulkPreview` and `BulkApply` carry a typed selection; CLI apply uses `--revision` alongside
+the same filters. Unknown selection/action fields are refused. Ack kind is one existing Kind
+or omitted for all. Preview/result samples contain at most ten sanitized summaries. Selection
+is read in sequence-ordered pages of at most MAX_PAGE, keeping application memory bounded.
+SHA-256 hashes a length-framed, versioned JSON header (store identity, restore generation and
+selection, including exact reason), then length-framed IDs from every page. No global head is
+hashed. Zero matches is a repeatable no-change; successful nonempty applies require a fresh
+preview before retrying.
+
+Apply takes an immediate SQLite transaction, scans/hashes and compares before any mutation,
+then rereads pages and writes all per-message audit events before one commit. Preview uses one
+read transaction. Notifications follow commit. Ack includes annotated messages, while retire
+selects only unanswered, unannotated requests owned by the actor. Existing in-flight delivery
+is not cancelled. Attention counts the union of acknowledged/annotated latest-attempt candidates
+once, separately from its actionable total, without changing historical message totals.
+
+Twelve isolated store tests and two real-daemon CLI tests cover filters/ownership, per-operation
+invalidation, bounded 450-message batches, rollback, overlapping concurrent applies, empty
+retries, new arrivals, stale delivery selections and in-flight outcomes, schema-1/2 migration,
+schema-2 restore with old-revision rejection, attention counts, CLI mode conflicts, history and
+receipt rendering, and post-commit watcher notification. Existing schema/attention assertions
+are updated for the intended policy. An additional isolated compatibility smoke builds the
+pre-change daemon and verifies that it refuses schema 3 and both new operations without changes.

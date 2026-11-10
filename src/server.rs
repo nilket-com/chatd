@@ -503,6 +503,7 @@ fn handle(shared: &Arc<Shared>, stream: UnixStream) -> io::Result<()> {
 /// The name a client used that is reserved for the daemon, if any.
 fn reserved_name(req: &Request) -> Option<&str> {
 	let names: Vec<&str> = match req {
+		Request::BulkPreview { selection } | Request::BulkApply { selection, .. } => vec![selection.actor.as_str()],
 		Request::Send(r) => [Some(r.from.as_str()), r.to.as_deref()].into_iter().flatten().collect(),
 		Request::Receive { as_, .. }
 		| Request::Ack { as_, .. }
@@ -560,7 +561,9 @@ fn receipt_delivery(shared: &Shared, store: &Store, sender: &str, id: &str, dupl
 		};
 		let mut facts = Vec::new();
 		if let Some(retired) = &evidence.retirement {
-			facts.push(if retired.rehearsal {
+			facts.push(if retired.retired {
+				"retired request".into()
+			} else if retired.rehearsal {
 				"retired rehearsal request".into()
 			} else {
 				format!("retired request, superseded by {}", retired.superseded_by.as_deref().unwrap_or("unknown"))
@@ -674,6 +677,14 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
 	};
 	let mut wrote = false;
 	let resp = match req {
+		Request::BulkPreview { selection } => store.bulk(&selection, None).map(Response::Bulk).unwrap_or_else(err),
+		Request::BulkApply { selection, revision } => match store.bulk(&selection, Some(&revision)) {
+			Ok(result) => {
+				wrote = result.count > 0;
+				Response::Bulk(result)
+			}
+			Err(e) => err(e),
+		},
 		Request::Health => match (store.store_id(), store.head_seq()) {
 			(Ok(id), Ok(head)) => {
 				Response::Health { store_id: id, head_seq: head, schema_version: crate::store::SCHEMA_VERSION, pid: std::process::id() }

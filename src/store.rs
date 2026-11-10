@@ -15,7 +15,8 @@ use crate::proto::{
 };
 use crate::text;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
+mod bulk;
 /// Failed submissions per message (since its last explicit redelivery) before giving up.
 pub const MAX_FAILED_ATTEMPTS: i64 = 3;
 /// Default backoff after the n-th failed submission (1-based), in milliseconds.
@@ -203,7 +204,7 @@ impl Store {
 			.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get::<_, String>(0))?
 			.parse()
 			.map_err(|_| StoreError::new(ErrorCode::Storage, "schema_version is not an integer"))?;
-		if version != 1 && version != SCHEMA_VERSION {
+		if version != 1 && version != 2 && version != SCHEMA_VERSION {
 			return Err(StoreError::new(
 				ErrorCode::Storage,
 				format!("schema version {version} is not supported (this build: {SCHEMA_VERSION}); the database is left untouched"),
@@ -211,6 +212,7 @@ impl Store {
 		}
 		// Digests were an additive schema-1 extension. Schema 2 adds retirement semantics;
 		// schema-1 daemons must refuse it rather than silently deliver retired work.
+		// Schema 3 distinguishes explicit retirement from rehearsal; older binaries refuse it.
 		tx.execute_batch(DIGESTS)?;
 		tx.execute_batch(
 			"CREATE TABLE IF NOT EXISTS work_annotations (
@@ -220,6 +222,11 @@ impl Store {
             actor TEXT NOT NULL REFERENCES participants(name), reason TEXT NOT NULL, at_ms INTEGER NOT NULL
         ) STRICT;",
 		)?;
+		let has_retired: bool =
+			tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_annotations') WHERE name='retired')", [], |r| r.get(0))?;
+		if !has_retired {
+			tx.execute_batch("ALTER TABLE work_annotations ADD COLUMN retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1));")?;
+		}
 		tx.execute("UPDATE meta SET value=?1 WHERE key='schema_version'", [SCHEMA_VERSION.to_string()])?;
 		for p in participants {
 			if !valid_name(p) {
@@ -633,9 +640,14 @@ impl Store {
              WHERE a.id = (SELECT max(id) FROM attempts b WHERE b.message_id = a.message_id)
                AND a.state IN ('failed', 'uncertain', 'started')
                AND (?1 IS NULL OR m.sender = ?1 OR m.recipient = ?1) AND (?2 IS NULL OR m.conversation = ?2)";
-		let attempts_total: i64 = self.conn.query_row(&format!("SELECT count(*) {ATTEMPTS}"), params![who, conversation], |r| r.get(0))?;
+		let all_candidates: i64 = self.conn.query_row(&format!("SELECT count(*) {ATTEMPTS}"), params![who, conversation], |r| r.get(0))?;
+		let actionable = format!(
+			"{ATTEMPTS} AND NOT EXISTS(SELECT 1 FROM acks k WHERE k.message_id=m.id AND k.reader=m.recipient) AND NOT EXISTS(SELECT 1 FROM work_annotations w WHERE w.message_id=m.id)"
+		);
+		let attempts_total: i64 =
+			self.conn.query_row(&format!("SELECT count(*) {actionable}"), params![who, conversation], |r| r.get(0))?;
 		let mut stmt = self.conn.prepare(&format!(
-            "SELECT a.id, a.message_id, a.endpoint, a.generation, a.state, a.started_at_ms, a.finished_at_ms, a.exit_code, a.error {ATTEMPTS} ORDER BY a.id LIMIT ?3"
+            "SELECT a.id, a.message_id, a.endpoint, a.generation, a.state, a.started_at_ms, a.finished_at_ms, a.exit_code, a.error {actionable} ORDER BY a.id LIMIT ?3"
         ))?;
 		let attempts = stmt.query_map(params![who, conversation, limit], attempt_row)?.collect::<std::result::Result<_, _>>()?;
 		Ok(StatusView {
@@ -650,6 +662,7 @@ impl Store {
 			next_unanswered_after: next_unans,
 			uncertain_or_failed_submissions: attempts,
 			uncertain_or_failed_total: attempts_total,
+			attention_omitted_total: all_candidates - attempts_total,
 			endpoints: self.endpoints()?,
 			watchers: Vec::new(),
 		})
@@ -682,19 +695,19 @@ impl Store {
 		let now = now_ms();
 		let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		// One immutable annotation; conflicting rewrites are refused rather than silently changing history.
-		let previous: Option<(Option<String>, String, String)> = tx
-			.query_row("SELECT by_request,actor,reason FROM work_annotations WHERE message_id=?1", [id], |r| {
-				Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+		let previous: Option<(Option<String>, String, String, bool)> = tx
+			.query_row("SELECT by_request,actor,reason,retired FROM work_annotations WHERE message_id=?1", [id], |r| {
+				Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
 			})
 			.optional()?;
 		if let Some(previous) = previous {
-			if previous == (by.map(str::to_owned), actor.to_owned(), reason.to_owned()) {
+			if previous == (by.map(str::to_owned), actor.to_owned(), reason.to_owned(), false) {
 				return Ok(());
 			}
 			return Err(StoreError::new(ErrorCode::Conflict, "request already has a different annotation"));
 		}
 		tx.execute(
-			"INSERT INTO work_annotations VALUES (?1,?2,?3,?4,?5,?6)",
+			"INSERT INTO work_annotations (message_id,by_request,rehearsal,actor,reason,at_ms) VALUES (?1,?2,?3,?4,?5,?6)",
 			params![id, by, i64::from(by.is_none()), actor, reason, now],
 		)?;
 		for audience in BTreeSet::from([old.sender.as_str(), old.recipient.as_str()]) {
@@ -746,7 +759,7 @@ impl Store {
 		let limit = limit.clamp(1, MAX_PAGE) as usize;
 		let mut stmt = self.conn.prepare(&format!(
             "SELECT * FROM (SELECT m.id,m.seq,w.by_request,w.reason,w.rehearsal,
-             max(m.seq,coalesce((SELECT max(p.seq) FROM messages p WHERE p.reply_to=m.id AND p.kind='progress' AND p.seq<=?4),m.seq)) AS activity_seq
+             max(m.seq,coalesce((SELECT max(p.seq) FROM messages p WHERE p.reply_to=m.id AND p.kind='progress' AND p.seq<=?4),m.seq)) AS activity_seq, w.retired
              {filter}) WHERE activity_seq < ?5 ORDER BY activity_seq DESC LIMIT ?6"))?;
 		let records = stmt
 			.query_map(params![who, conversation, history, snapshot, before, limit as i64 + 1], |r| {
@@ -757,12 +770,13 @@ impl Store {
 					r.get::<_, Option<String>>(3)?,
 					r.get::<_, Option<bool>>(4)?,
 					r.get::<_, i64>(5)?,
+					r.get::<_, Option<bool>>(6)?,
 				))
 			})?
 			.collect::<std::result::Result<Vec<_>, _>>()?;
 		let more = records.len() > limit;
 		let mut rows = Vec::new();
-		for (id, seq, superseded_by, reason, rehearsal, activity_seq) in records.into_iter().take(limit) {
+		for (id, seq, superseded_by, reason, rehearsal, activity_seq, retired) in records.into_iter().take(limit) {
 			let message = self.status_line(&self.view_without_body(&id)?, now_ms())?;
 			let progress: Option<String> = self
 				.conn
@@ -773,7 +787,9 @@ impl Store {
 				)
 				.optional()?;
 			let latest_progress = progress.map(|id| self.status_line(&self.view_without_body(&id)?, now_ms())).transpose()?;
-			let state = if superseded_by.is_some() {
+			let state = if retired == Some(true) {
+				"retired"
+			} else if superseded_by.is_some() {
 				"superseded"
 			} else if rehearsal == Some(true) {
 				"rehearsal"
@@ -1074,8 +1090,8 @@ impl Store {
 			.optional()?;
 		let retirement = self
 			.conn
-			.query_row("SELECT by_request,rehearsal FROM work_annotations WHERE message_id=?1", [&m.id], |r| {
-				Ok(RetirementEvidence { superseded_by: r.get(0)?, rehearsal: r.get(1)? })
+			.query_row("SELECT by_request,rehearsal,retired FROM work_annotations WHERE message_id=?1", [&m.id], |r| {
+				Ok(RetirementEvidence { superseded_by: r.get(0)?, rehearsal: r.get(1)?, retired: r.get(2)? })
 			})
 			.optional()?;
 		let redelivery = self

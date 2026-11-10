@@ -87,9 +87,52 @@ pub struct BindResult {
 	pub changed: bool,
 }
 
+/// Owner-scoped, exclusive-bound bulk selection. Absence of peer/kind means all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BulkAction {
+	Retire { reason: String },
+	Ack { kind: Option<Kind> },
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkSpec {
+	pub actor: String,
+	pub before_seq: i64,
+	pub peer: Option<String>,
+	pub conversation: Option<String>,
+	pub action: BulkAction,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkSample {
+	pub id: String,
+	pub seq: i64,
+	pub sender: String,
+	pub recipient: String,
+	pub conversation: String,
+	pub summary: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkResult {
+	pub selection: BulkSpec,
+	pub revision: String,
+	pub count: u64,
+	pub oldest_seq: Option<i64>,
+	pub newest_seq: Option<i64>,
+	pub sample: Vec<BulkSample>,
+	pub applied: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
+	BulkPreview {
+		selection: BulkSpec,
+	},
+	BulkApply {
+		selection: BulkSpec,
+		revision: String,
+	},
 	ConfigPreview,
 	ConfigApply {
 		revision: String,
@@ -274,6 +317,8 @@ pub struct DigestEvidence {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetirementEvidence {
+	#[serde(default)]
+	pub retired: bool,
 	pub superseded_by: Option<String>,
 	pub rehearsal: bool,
 }
@@ -356,9 +401,11 @@ pub struct StatusView {
 	pub unanswered: Vec<StatusLine>,
 	pub unanswered_total: i64,
 	pub next_unanswered_after: Option<i64>,
-	/// Latest attempt per message where it is failed, uncertain or in flight (oldest first, one page).
+	/// Latest failed, uncertain or in-flight attempt for unacknowledged, unannotated messages.
 	pub uncertain_or_failed_submissions: Vec<AttemptView>,
 	pub uncertain_or_failed_total: i64,
+	#[serde(default)]
+	pub attention_omitted_total: i64,
 	pub endpoints: Vec<EndpointView>,
 	pub watchers: Vec<WatcherView>,
 	/// Every participant with its configured product and tier and the delivery path in place now.
@@ -491,6 +538,7 @@ pub struct LegacyFileReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "r", rename_all = "snake_case")]
 pub enum Response {
+	Bulk(BulkResult),
 	ConfigRefresh {
 		base_revision: String,
 		candidate_revision: String,

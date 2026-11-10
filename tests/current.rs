@@ -137,7 +137,9 @@ fn retirement_fences_new_pushes_digests_and_redelivery_but_keeps_attempt_evidenc
 	f.store.finish_attempt(attempt, "uncertain", None, Some("timeout"), &[], &[]).unwrap();
 	assert!(f.store.due_deliveries(i64::MAX, &|_| vec![Kind::Request]).unwrap().is_empty());
 	assert_eq!(f.store.attempts_for(&b).unwrap()[0].state, "uncertain");
-	assert_eq!(f.store.status(None, None, 20, None, None).unwrap().uncertain_or_failed_total, 1);
+	let status = f.store.status(None, None, 20, None, None).unwrap();
+	assert_eq!(status.uncertain_or_failed_total, 0);
+	assert_eq!(status.attention_omitted_total, 1);
 	assert!(f.store.receive("bob", &b).unwrap().received_at_ms.is_none());
 }
 
@@ -150,7 +152,7 @@ fn schema_one_upgrade_is_atomic_and_preserves_source_messages() {
 	assert_eq!(f.store.receive("bob", &id).unwrap().body.as_deref(), Some("details"));
 	assert_eq!(f.store.current(None, None, 20, None, false).unwrap().total, 1);
 	let version: String = f.store.conn().query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0)).unwrap();
-	assert_eq!(version, "2");
+	assert_eq!(version, chatd::store::SCHEMA_VERSION.to_string());
 	// The same guard shipped in schema-1 binaries will reject the upgraded store.
 	assert_ne!(version, "1");
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 
 use chatd::client::{Client, ClientError};
-use chatd::proto::{BindMode, ErrorCode, EventView, HealthState, Kind, MessageView, Request, Response, SendReq};
+use chatd::proto::{BindMode, BulkAction, BulkSpec, ErrorCode, EventView, HealthState, Kind, MessageView, Request, Response, SendReq};
 use chatd::store::now_ms;
 use chatd::{journal, paths, pending, text};
 
@@ -101,8 +101,33 @@ enum Cmd {
 	Ack {
 		#[arg(long = "as", env = "CHATD_AS")]
 		who: String,
-		#[arg(required = true)]
+		#[arg(required_unless_present = "before_seq", conflicts_with_all = ["before_seq", "from", "conversation", "kind", "revision"])]
 		ids: Vec<String>,
+		#[arg(long)]
+		before_seq: Option<i64>,
+		#[arg(long = "from", requires = "before_seq")]
+		from: Option<String>,
+		#[arg(long, requires = "before_seq")]
+		conversation: Option<String>,
+		#[arg(long, requires = "before_seq", value_parser = ["request", "info", "progress", "final"])]
+		kind: Option<String>,
+		#[arg(long, requires = "before_seq")]
+		revision: Option<String>,
+	},
+	/// Preview retirement of the sender's old unanswered requests; --revision applies that exact set.
+	Retire {
+		#[arg(long = "as", env = "CHATD_AS")]
+		who: String,
+		#[arg(long)]
+		before_seq: i64,
+		#[arg(long)]
+		to: Option<String>,
+		#[arg(long)]
+		conversation: Option<String>,
+		#[arg(long)]
+		reason: String,
+		#[arg(long)]
+		revision: Option<String>,
 	},
 	/// Wait for a message; use --full --take --wake-on request,final for a context batch.
 	Wait {
@@ -1041,7 +1066,27 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
 			};
 			eprintln!("chatctl: acknowledged {} (already {})", acknowledged.len(), already.len());
 		}
-		Cmd::Ack { who, ids } => {
+		Cmd::Retire { who, before_seq, to, conversation, reason, revision } => {
+			return bulk_command(
+				BulkSpec { actor: who, before_seq, peer: to, conversation, action: BulkAction::Retire { reason } },
+				revision,
+				json,
+			);
+		}
+		Cmd::Ack { who, ids, before_seq, from, conversation, kind, revision } => {
+			if let Some(before_seq) = before_seq {
+				return bulk_command(
+					BulkSpec {
+						actor: who,
+						before_seq,
+						peer: from,
+						conversation,
+						action: BulkAction::Ack { kind: kind.as_deref().and_then(Kind::parse) },
+					},
+					revision,
+					json,
+				);
+			}
 			let r = call(Request::Ack { as_: who, ids })?;
 			if json {
 				print_json(&r)
@@ -1098,9 +1143,10 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
 					"final",
 					"superseded",
 					"rehearsal",
+					"retired",
 				] {
 					for r in s.rows.iter().filter(|r| {
-						let group = if matches!(r.state.as_str(), "final" | "superseded" | "rehearsal") || r.message.received {
+						let group = if matches!(r.state.as_str(), "final" | "superseded" | "rehearsal" | "retired") || r.message.received {
 							r.state.as_str()
 						} else {
 							match r.delivery_state.as_deref() {
@@ -1122,6 +1168,9 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
 						}
 						if let Some(by) = &r.superseded_by {
 							println!("    replaced by {by}: {}", text::sanitize_line(r.annotation_reason.as_deref().unwrap_or(""), 1024));
+						}
+						if r.state == "retired" {
+							println!("    retired: {}", text::sanitize_line(r.annotation_reason.as_deref().unwrap_or(""), 1024));
 						}
 						if let Some(reason) = &r.rehearsal_reason {
 							println!("    rehearsal: {}", text::sanitize_line(reason, 1024));
@@ -1182,6 +1231,7 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
 				s.uncertain_or_failed_submissions.len(),
 				s.uncertain_or_failed_total
 			);
+			println!("  omitted {} acknowledged or retired candidates", s.attention_omitted_total);
 			for a in &s.uncertain_or_failed_submissions {
 				println!(
 					"  attempt {} {} -> {} gen {} {}{}",
@@ -1375,6 +1425,51 @@ fn main() -> ExitCode {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(c) => c,
 	}
+}
+
+fn bulk_command(selection: BulkSpec, revision: Option<String>, json: bool) -> Result<(), ExitCode> {
+	let request = match revision {
+		Some(revision) => Request::BulkApply { selection, revision },
+		None => Request::BulkPreview { selection },
+	};
+	let Response::Bulk(result) = call(request)? else {
+		return Err(ExitCode::FAILURE);
+	};
+	if json {
+		print_json(&result);
+		return Ok(());
+	}
+	// JSON escaping keeps every filter and the reason visible without terminal control characters.
+	println!("selection: {}", text::sanitize_line(&serde_json::to_string(&result.selection).expect("serializable selection"), 8192));
+	println!(
+		"{}: {} matched; oldest seq {}, newest seq {}",
+		if result.count == 0 {
+			"no change"
+		} else if result.applied {
+			"applied"
+		} else {
+			"preview"
+		},
+		result.count,
+		result.oldest_seq.map(|seq| seq.to_string()).unwrap_or_else(|| "none".into()),
+		result.newest_seq.map(|seq| seq.to_string()).unwrap_or_else(|| "none".into())
+	);
+	for sample in &result.sample {
+		println!(
+			"  {} [{}] {}->{} {}: {}",
+			sample.id,
+			sample.seq,
+			sample.sender,
+			sample.recipient,
+			sample.conversation,
+			text::sanitize_line(&sample.summary, 160)
+		);
+	}
+	println!("revision: {}", result.revision);
+	if !result.applied {
+		println!("To apply, repeat these filters and --revision {}", result.revision);
+	}
+	Ok(())
 }
 
 #[cfg(test)]
