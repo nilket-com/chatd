@@ -9,9 +9,9 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 
 use crate::proto::{
-    AttemptView, CurrentLine, CurrentView, DeliveryEvidence, DigestEvidence, EndpointView, ErrorCode, EventView, Kind, MAX_BODY,
-    MAX_CONVERSATION_LEN, MAX_KEY_LEN, MAX_LOG_PAGE, MAX_PAGE, MessageView, PushHold, Receipt, RedeliveryEvidence, RetirementEvidence,
-    SendReq, StatusLine, StatusView,
+    AttemptView, BindMode, BindResult, CurrentLine, CurrentView, DeliveryEvidence, DigestEvidence, EndpointView, ErrorCode, EventView,
+    Kind, MAX_BODY, MAX_CONVERSATION_LEN, MAX_KEY_LEN, MAX_LOG_PAGE, MAX_PAGE, MessageView, PushHold, Receipt, RedeliveryEvidence,
+    RetirementEvidence, SendReq, StatusLine, StatusView,
 };
 use crate::text;
 
@@ -813,10 +813,16 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Binds (or explicitly rebinds) a participant's delivery adapter. Each binding has a new
-    /// generation; failed attempts made under an older generation are fenced (never retried
-    /// automatically against the new session).
+    /// Legacy callers get the safe default too; intentional replacements use endpoint_bind.
     pub fn endpoint_register(&mut self, name: &str, session: &str, exe: &str) -> Result<EndpointView> {
+        Ok(self.endpoint_bind(name, session, exe, BindMode::Plain)?.endpoint)
+    }
+
+    /// Compare the generation before the identical-binding fast path, atomically with replacement.
+    pub fn endpoint_bind(&mut self, name: &str, session: &str, exe: &str, mode: BindMode) -> Result<BindResult> {
+        if matches!(mode, BindMode::ReplaceGeneration { generation } if generation <= 0) {
+            return Err(StoreError::new(ErrorCode::BadRequest, "expected generation must be positive"));
+        }
         self.require_participant(name)?;
         if !valid_token(session, 128) {
             return Err(StoreError::new(ErrorCode::BadRequest, "session must be 1-128 of [A-Za-z0-9-_.:]"));
@@ -826,6 +832,34 @@ impl Store {
         }
         let now = now_ms();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<EndpointView> = tx
+            .query_row("SELECT name,session,exe,generation,registered_at_ms FROM endpoints WHERE name=?1", [name], |r| {
+                Ok(EndpointView { name: r.get(0)?, session: r.get(1)?, exe: r.get(2)?, generation: r.get(3)?, registered_at_ms: r.get(4)? })
+            })
+            .optional()?;
+        let conflict = || {
+            let detail = match &current {
+                Some(ep) => format!(
+                    "current session {:?}, executable {:?}, generation {}, registered at {} ms; inspect chatctl peers; upgrade old chatctl and use endpoint register --as {name} --replace-generation {} (or --replace for unconditional replacement)",
+                    ep.session, ep.exe, ep.generation, ep.registered_at_ms, ep.generation
+                ),
+                None => "current binding is missing; inspect chatctl peers; use plain register to create a binding".into(),
+            };
+            StoreError::new(ErrorCode::Conflict, format!("endpoint {name:?}: {detail}"))
+        };
+        if let BindMode::ReplaceGeneration { generation } = mode
+            && current.as_ref().is_none_or(|ep| ep.generation != generation)
+        {
+            return Err(conflict());
+        }
+        if let Some(ep) = &current {
+            if ep.session == session && ep.exe == exe {
+                return Ok(BindResult { endpoint: ep.clone(), changed: false });
+            }
+            if mode == BindMode::Plain {
+                return Err(conflict());
+            }
+        }
         let generation: i64 =
             tx.query_row("SELECT coalesce(max(generation), 0) + 1 FROM endpoints WHERE name = ?1", [name], |r| r.get(0))?;
         // Generations only grow, even across a deleted row: the attempts made under it and the generation
@@ -848,7 +882,10 @@ impl Store {
             params![now, name, json!({"session": session, "exe": exe, "generation": generation}).to_string()],
         )?;
         tx.commit()?;
-        Ok(EndpointView { name: name.into(), session: session.into(), exe: exe.into(), generation, registered_at_ms: now })
+        Ok(BindResult {
+            endpoint: EndpointView { name: name.into(), session: session.into(), exe: exe.into(), generation, registered_at_ms: now },
+            changed: true,
+        })
     }
 
     /// Removes a participant's endpoint, making it a pull participant. Returns the removed binding and
@@ -1425,7 +1462,7 @@ mod tests {
     #[test]
     fn a_selection_acknowledged_before_its_attempt_is_not_attempted() {
         let (mut s, dir) = store();
-        s.endpoint_register("codex", "old", "/bin/true").unwrap();
+        s.endpoint_bind("codex", "old", "/bin/true", BindMode::Replace).unwrap();
         let id = send(&mut s, "k");
         let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         assert_eq!(due.len(), 1);
@@ -1438,10 +1475,10 @@ mod tests {
     #[test]
     fn a_selection_rebound_before_its_attempt_is_not_sent_to_the_old_session() {
         let (mut s, dir) = store();
-        s.endpoint_register("codex", "old", "/bin/true").unwrap();
+        s.endpoint_bind("codex", "old", "/bin/true", BindMode::Replace).unwrap();
         let id = send(&mut s, "k");
         let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
-        s.endpoint_register("codex", "new", "/bin/true").unwrap();
+        s.endpoint_bind("codex", "new", "/bin/true", BindMode::Replace).unwrap();
         assert_eq!(s.begin_attempt(&due[0]).unwrap(), None, "the old binding's selection is fenced");
         let fresh = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         assert_eq!(fresh[0].endpoint.session, "new");
@@ -1456,12 +1493,12 @@ mod tests {
         let (mut s, dir) = store();
         let first = send(&mut s, "k1");
         let second = send(&mut s, "k2");
-        s.endpoint_register("codex", "old-session", "/bin/true").unwrap();
+        s.endpoint_bind("codex", "old-session", "/bin/true", BindMode::Replace).unwrap();
         let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         assert_eq!(due.len(), 2);
         assert!(s.begin_attempt(&due[0]).unwrap().is_some(), "the first old-session attempt is genuinely in flight");
         if rebind {
-            s.endpoint_register("codex", "new-session", "/bin/true").unwrap();
+            s.endpoint_bind("codex", "new-session", "/bin/true", BindMode::Replace).unwrap();
         }
         if ack {
             s.ack("codex", std::slice::from_ref(&second)).unwrap();
@@ -1498,7 +1535,7 @@ mod tests {
     #[test]
     fn a_selection_is_attempted_at_most_once() {
         let (mut s, dir) = store();
-        s.endpoint_register("codex", "old", "/bin/true").unwrap();
+        s.endpoint_bind("codex", "old", "/bin/true", BindMode::Replace).unwrap();
         let id = send(&mut s, "k");
         let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         assert!(s.begin_attempt(&due[0]).unwrap().is_some());
@@ -1510,7 +1547,7 @@ mod tests {
     #[test]
     fn unregister_fences_a_queued_selection_and_generations_stay_monotonic() {
         let (mut s, dir) = store();
-        assert_eq!(s.endpoint_register("codex", "a", "/bin/true").unwrap().generation, 1);
+        assert_eq!(s.endpoint_bind("codex", "a", "/bin/true", BindMode::Replace).unwrap().endpoint.generation, 1);
         let id = send(&mut s, "k");
         let due = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap();
         let (removed, in_flight) = s.endpoint_unregister("codex").unwrap().unwrap();
@@ -1520,15 +1557,15 @@ mod tests {
         assert!(s.endpoint_unregister("codex").unwrap().is_none(), "idempotent");
         assert_eq!(s.endpoint_unregister("nobody").unwrap_err().code, ErrorCode::UnknownParticipant);
         assert_eq!(s.unacknowledged_page("codex", None, 0, 10).unwrap()[0].id, id, "the message stays for pull");
-        assert_eq!(s.endpoint_register("codex", "b", "/bin/true").unwrap().generation, 2);
+        assert_eq!(s.endpoint_bind("codex", "b", "/bin/true", BindMode::Replace).unwrap().endpoint.generation, 2);
         s.endpoint_unregister("codex").unwrap();
-        assert_eq!(s.endpoint_register("codex", "c", "/bin/true").unwrap().generation, 3);
+        assert_eq!(s.endpoint_bind("codex", "c", "/bin/true", BindMode::Replace).unwrap().endpoint.generation, 3);
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
     fn a_turn_that_started_after_a_push_and_completed_releases_its_in_flight_hold() {
         let (mut s, dir) = store();
-        let ep = s.endpoint_register("codex", "session", "/bin/true").unwrap();
+        let ep = s.endpoint_bind("codex", "session", "/bin/true", BindMode::Replace).unwrap().endpoint;
         let id = send(&mut s, "pushed-but-never-acknowledged");
         let selected = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap().remove(0);
         let attempt = s.begin_attempt(&selected).unwrap().unwrap();
@@ -1555,7 +1592,7 @@ mod tests {
     fn rebind_resets_both_throttle_windows_without_receiving_or_replaying_old_messages() {
         for state in ["started", "submitted", "uncertain"] {
             let (mut s, dir) = store();
-            let old = s.endpoint_register("codex", "old", "/bin/true").unwrap();
+            let old = s.endpoint_bind("codex", "old", "/bin/true", BindMode::Replace).unwrap().endpoint;
             let id = send(&mut s, "old-message");
             let selected = s.due_deliveries(now_ms(), &|_| Kind::ALL.to_vec()).unwrap().remove(0);
             let attempt = s.begin_attempt(&selected).unwrap().unwrap();
@@ -1565,7 +1602,7 @@ mod tests {
             let now = now_ms();
             assert!(!s.push_allowed(&old, now, 300_000, 0, None).unwrap(), "minimum interval: {state}");
             assert!(!s.push_allowed(&old, now, 0, 3_600_000, None).unwrap(), "in-flight window: {state}");
-            let fresh = s.endpoint_register("codex", "new", "/bin/true").unwrap();
+            let fresh = s.endpoint_bind("codex", "new", "/bin/true", BindMode::Replace).unwrap().endpoint;
             assert!(s.push_allowed(&fresh, now_ms(), 300_000, 3_600_000, None).unwrap(), "fresh generation: {state}");
             if state == "started" {
                 s.finish_attempt(attempt, "submitted", Some(0), None, &[], &[]).unwrap();

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 
 use chatd::client::{Client, ClientError};
-use chatd::proto::{ErrorCode, EventView, HealthState, Kind, MessageView, Request, Response, SendReq};
+use chatd::proto::{BindMode, ErrorCode, EventView, HealthState, Kind, MessageView, Request, Response, SendReq};
 use chatd::store::now_ms;
 use chatd::{journal, paths, pending, text};
 
@@ -249,6 +249,12 @@ enum EndpointCmd {
         session: String,
         #[arg(long)]
         exe: PathBuf,
+        /// Authorize replacing a different binding without a generation precondition.
+        #[arg(long, conflicts_with = "replace_generation")]
+        replace: bool,
+        /// Replace only if the current binding still has this positive generation.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        replace_generation: Option<i64>,
     },
     /// Remove a participant's endpoint: pushes stop and it pulls (wait, receive, take). Unacknowledged
     /// messages stay in its inbox. Succeeds when there is no endpoint.
@@ -278,8 +284,16 @@ fn connect(timeout: Option<Duration>) -> Result<Client, ExitCode> {
 
 fn call(req: Request) -> Result<Response, ExitCode> {
     let mut c = connect(Some(Duration::from_secs(60)))?;
+    let guarded_registration = matches!(req, Request::EndpointBind { .. });
     match c.call(req) {
         Ok(Response::Error { code, message }) => {
+            if guarded_registration
+                && code == ErrorCode::BadRequest
+                && message.starts_with("unreadable frame: unknown variant `endpoint_bind`, expected ")
+            {
+                eprintln!("chatctl: chatd predates guarded registration; restart chatd on the new binary");
+                return Err(ExitCode::from(EXIT_REFUSED));
+            }
             eprintln!("chatctl: {code:?}: {message}");
             Err(ExitCode::from(match code {
                 ErrorCode::NotFound => EXIT_NOT_FOUND,
@@ -1238,9 +1252,28 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
             print_json(&r);
         }
         Cmd::NewKey => println!("{}", uuid::Uuid::new_v4()),
-        Cmd::Endpoint { cmd: EndpointCmd::Register { who, session, exe } } => {
-            let r = call(Request::EndpointRegister { name: who, session, exe: exe.to_string_lossy().into_owned() })?;
-            print_json(&r);
+        Cmd::Endpoint { cmd: EndpointCmd::Register { who, session, exe, replace, replace_generation } } => {
+            let mode = match replace_generation {
+                Some(generation) => BindMode::ReplaceGeneration { generation },
+                None if replace => BindMode::Replace,
+                None => BindMode::Plain,
+            };
+            let r = call(Request::EndpointBind { name: who, session, exe: exe.to_string_lossy().into_owned(), mode })?;
+            if json {
+                print_json(&r);
+            } else if let Response::Bound(result) = r {
+                let ep = result.endpoint;
+                println!(
+                    "{} {}: session {}, executable {}, generation {}",
+                    if result.changed { "registered" } else { "already registered" },
+                    ep.name,
+                    ep.session,
+                    ep.exe,
+                    ep.generation
+                );
+            } else {
+                return Err(ExitCode::FAILURE);
+            }
         }
         Cmd::Endpoint { cmd: EndpointCmd::Unregister { who } } => {
             let r = call(Request::EndpointUnregister { name: who })?;

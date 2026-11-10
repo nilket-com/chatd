@@ -265,12 +265,37 @@ chatctl endpoint register --as codex --session <codex-session-id> --exe /absolut
 ```
 
 `<codex-session-id>` is the id of an existing Codex session you choose (for example, from the
-session's own `CODEX_THREAD_ID`). Re-registering creates a new generation, and failed attempts
-under the old binding are fenced: they are never retried against the new session automatically.
-The new generation starts with fresh push throttle windows and clears the previous session's
-cached health. A push submitted to an old session cannot hold the new session behind the
-minimum interval or unacknowledged-push timeout. Existing messages and acknowledgements are
-unchanged; registration does not replay already submitted messages.
+session's own `CODEX_THREAD_ID`). Registering the identical session and executable path is a no-op:
+no generation, timestamp, health, event or throttle changes. Plain registration refuses a different
+binding with its current details. Inspect `chatctl peers`, then explicitly replace your own binding:
+
+```sh
+chatctl peers
+chatctl endpoint register --as x1 --session NEW_SESSION --exe /absolute/path/to/codex-adapter --replace-generation 3
+```
+
+Use the current generation shown by the conflict or status. `--replace-generation G` requires a
+positive generation and checks that it still exists and equals G **before** the same-binding no-op.
+A stale generation or missing binding conflicts. Two replacements at the same expected generation
+cannot both mutate the binding, even if both ask for the same new session. `--replace` authorizes
+unconditional replacement instead; the flags are mutually exclusive. An identical binding is still
+a no-op with either flag after its generation precondition is satisfied. Plain registration or
+`--replace` can create a missing binding; registering after unregister preserves the generation floor.
+
+A real replacement creates a new generation. Failed attempts under the old binding are fenced:
+they are never retried against the new session automatically. The new generation starts with fresh
+push throttle windows and clears the previous session's cached health. A push submitted to an old
+session cannot hold the new session behind the minimum interval or unacknowledged-push timeout.
+Queued selections for the old binding are fenced too; an adapter submission already running is not
+cancelled. Existing messages and acknowledgements are unchanged, and registration does not replay
+already submitted messages. Use `chatctl redeliver ID` separately only when needed. Do not use
+unregister-then-register to bypass the generation guard.
+
+The CLI uses a new guarded registration operation. An older daemon rejects it before mutation;
+the CLI exits 5 with an upgrade diagnostic and never falls back to unsafe legacy registration.
+Other validation/conflict errors retain their own diagnostics; a disconnect is not evidence of an
+old daemon. An older CLI talking to a new daemon gets the safe default refusal for a different
+binding; upgrade the CLI to request explicit replacement. Endpoint commands require explicit `--as`.
 
 An unacknowledged push normally holds the next one back for the unacknowledged-push timeout, so a
 participant is not handed a new turn while it is still working. A push held back this way is
@@ -344,6 +369,49 @@ wake_kinds = ["request"]   # the default; ["all"] (or every kind listed) pushes 
 The tokens are `request`, `info`, `progress`, `final` and `all`; anything else stops the daemon at
 start. Pull participants are not affected by this push policy: the daemon streams every message
 to a watcher. `wait --wake-on` can filter when the CLI prints a batch (see below).
+
+## Several agent pairs on one host
+
+Give every agent a configured instance name. Conversations separate topics; the **participant name**
+determines the inbox and push endpoint. Two pairs using `codex` with different conversation names
+still share one endpoint. For example, provision these names in `config.toml` before attaching them:
+
+```toml
+participants = ["c1", "x1", "c2", "x2"]
+[participant.c1]
+product = "claude"
+[participant.x1]
+product = "codex"
+[participant.c2]
+product = "claude"
+[participant.x2]
+product = "codex"
+```
+
+Merge new entries with the existing configuration; preserve names used by active teams. Adding
+participants currently requires a coordinated daemon restart. Validated additions without restart
+are planned separately; registration does not create participant names.
+
+Set `CHATD_AS=c1` in pair one's Claude pane and `CHATD_AS=x1` in its Codex pane; pair two uses `c2` and
+`x2`. Each pull participant can run an exclusive wait, for example:
+
+```sh
+chatctl wait --as c1 --exclusive --full --take --wake-on request,final --conversation team-one
+```
+
+An exclusive watch checks overlap at startup; it does not establish participant ownership or prevent
+a later nonexclusive watch. Register each push session under its own name, using the current session
+ID from that pane (never a copied ID from another team):
+
+```sh
+chatctl endpoint register --as x1 --session "$CODEX_THREAD_ID" --exe /absolute/path/to/codex-adapter
+```
+
+Pair two registers `x2` from its own Codex pane. Use distinct conversations such as `team-one` and
+`team-two`, and address the other member's instance name when sending. A replacement must be deliberate:
+inspect peers and the current generation, and replace only your own endpoint. Names are routing labels
+under one Unix user, not authenticated identities; guarded registration prevents accidents, not a
+hostile local process.
 
 ## Connecting Claude (wake-up)
 

@@ -336,8 +336,13 @@ fn re_registering_clears_the_old_session_health_and_warning_immediately() {
     let bad = e.call(Request::EndpointRegister { name: "codex".into(), session: "bad session".into(), exe: "/bin/true".into() });
     assert!(matches!(bad, Response::Error { .. }));
     assert_eq!(e.codex_health(), Some(HealthState::Filtered), "failed registration retains the current binding's health");
-    let registered = e.call(Request::EndpointRegister { name: "codex".into(), session: "fresh-session".into(), exe: "/bin/true".into() });
-    assert!(matches!(registered, Response::Registered(_)));
+    let registered = e.call(Request::EndpointBind {
+        name: "codex".into(),
+        session: "fresh-session".into(),
+        exe: "/bin/true".into(),
+        mode: chatd::proto::BindMode::Replace,
+    });
+    assert!(matches!(registered, Response::Bound(_)));
     let health = e.codex().health;
     assert!(
         health.as_ref().is_none_or(|h| h.state == HealthState::Unknown && h.log.is_none()),

@@ -803,8 +803,13 @@ fn wait_for(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
 }
 
 fn register(e: &Env, exe: &Path, session: &str) -> i64 {
-    match e.call(Request::EndpointRegister { name: "codex".into(), session: session.into(), exe: exe.to_string_lossy().into_owned() }) {
-        Response::Registered(v) => v.generation,
+    match e.call(Request::EndpointBind {
+        name: "codex".into(),
+        session: session.into(),
+        exe: exe.to_string_lossy().into_owned(),
+        mode: chatd::proto::BindMode::Replace,
+    }) {
+        Response::Bound(v) => v.endpoint.generation,
         other => panic!("{other:?}"),
     }
 }
@@ -2654,4 +2659,130 @@ fn old_receipt_without_delivery_is_accepted_and_new_receipt_is_readable_by_old_s
     let old: OldReceipt = serde_json::from_value(new.clone()).unwrap();
     assert_eq!(old.id, new["id"].as_str().unwrap());
     assert_eq!(serde_json::to_value(old).unwrap()["seq"], new["seq"]);
+}
+
+// ---- plan 0010: guarded endpoint registration ----
+
+#[test]
+fn guarded_cli_reports_noop_and_requires_explicit_replacement() {
+    let mut e = Env::standard();
+    e.start();
+    let args = ["endpoint", "register", "--as", "codex", "--session", "original", "--exe", "/bin/true"];
+    let first = e.cli(&args, None);
+    assert_eq!(code(&first), 0);
+    assert!(stdout(&first).starts_with("registered codex:"));
+    let again = e.cli(&args, None);
+    assert_eq!(code(&again), 0);
+    assert!(stdout(&again).starts_with("already registered codex:"));
+    let different = ["endpoint", "register", "--as", "codex", "--session", "new", "--exe", "/bin/true"];
+    let refused = e.cli(&different, None);
+    assert_eq!(code(&refused), 5);
+    assert!(stderr(&refused).contains("--replace-generation 1"));
+    assert!(!stderr(&refused).contains("predates guarded"));
+    let mut replace = different.to_vec();
+    replace.extend(["--replace-generation", "1", "--json"]);
+    let out = e.cli(&replace, None);
+    assert_eq!(code(&out), 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["changed"], true);
+    assert_eq!(v["endpoint"]["generation"], 2);
+    assert_eq!(code(&e.cli(&replace, None)), 5, "CAS is checked before same-binding no-op");
+    let mut unconditional = args.to_vec();
+    unconditional.push("--replace");
+    assert_eq!(code(&e.cli(&unconditional, None)), 0);
+}
+
+#[test]
+fn guarded_cli_refuses_conflicting_flags_and_nonpositive_generations() {
+    let e = Env::standard(); // Argument validation needs no daemon.
+    let base = ["endpoint", "register", "--as", "codex", "--session", "s", "--exe", "/bin/true"];
+    for extra in [vec!["--replace-generation=0"], vec!["--replace-generation=-1"], vec!["--replace", "--replace-generation=1"]] {
+        let mut args = base.to_vec();
+        args.extend(extra);
+        assert_eq!(code(&e.cli(&args, None)), 2);
+    }
+}
+
+#[test]
+fn racing_guarded_replacements_change_exactly_once_even_for_the_same_new_binding() {
+    use chatd::proto::BindMode;
+    use std::sync::{Arc, Barrier};
+    for same_target in [false, true] {
+        let mut e = Env::standard();
+        e.start();
+        let generation = register(&e, Path::new("/bin/true"), "original");
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|i| {
+                let socket = e.socket();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut c = Client::connect(&socket, Some(Duration::from_secs(5))).unwrap();
+                    barrier.wait();
+                    c.call(Request::EndpointBind {
+                        name: "codex".into(),
+                        session: format!("new-{}", if same_target { 0 } else { i }),
+                        exe: "/bin/true".into(),
+                        mode: BindMode::ReplaceGeneration { generation },
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| matches!(r, Response::Bound(b) if b.changed)).count(), 1);
+        assert_eq!(results.iter().filter(|r| matches!(r, Response::Error { code: ErrorCode::Conflict, .. })).count(), 1);
+        assert_eq!(e.status(None).endpoints[0].generation, generation + 1);
+    }
+}
+
+#[test]
+fn guarded_registration_never_falls_back_and_only_unknown_operation_gets_upgrade_diagnostic() {
+    use chatd::proto::{PROTOCOL_VERSION, ServerFrame, read_frame, write_frame};
+    use std::os::unix::net::UnixListener;
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "op", rename_all = "snake_case")]
+    enum OldRequest {
+        EndpointRegister { name: String, session: String, exe: String },
+    }
+    for scenario in ["old", "bad_input", "disconnect"] {
+        let e = Env::standard();
+        let listener = UnixListener::bind(e.socket()).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let wire: serde_json::Value = read_frame(&mut socket).unwrap().unwrap();
+            assert_eq!(wire["req"]["op"], "endpoint_bind");
+            let mut binding = "original".to_owned();
+            let old_error = match serde_json::from_value::<OldRequest>(wire["req"].clone()) {
+                Ok(OldRequest::EndpointRegister { name, session, exe }) => {
+                    assert_eq!(name, "codex");
+                    assert_eq!(exe, "/bin/true");
+                    binding = session;
+                    None
+                }
+                Err(e) => Some(e.to_string()),
+            };
+            assert_eq!(binding, "original", "old decoder rejects before the upsert");
+            if scenario != "disconnect" {
+                let message =
+                    if scenario == "old" { format!("unreadable frame: {}", old_error.unwrap()) } else { "session must be valid".into() };
+                write_frame(
+                    &mut socket,
+                    &ServerFrame { v: PROTOCOL_VERSION, resp: Response::Error { code: ErrorCode::BadRequest, message } },
+                )
+                .unwrap();
+                let mut byte = [0];
+                assert_eq!(socket.read(&mut byte).unwrap(), 0, "no fallback frame on this connection");
+            }
+            drop(socket);
+            listener
+        });
+        let out = e.cli(&["endpoint", "register", "--as", "codex", "--session", "new", "--exe", "/bin/true"], None);
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(matches!(listener.accept(), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock), "no fallback connection");
+        assert_eq!(code(&out), if scenario == "disconnect" { 3 } else { 5 });
+        assert_eq!(stderr(&out).contains("predates guarded registration"), scenario == "old");
+    }
 }

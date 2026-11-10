@@ -70,6 +70,23 @@ pub struct SendReq {
     pub body: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BindMode {
+    #[default]
+    Plain,
+    Replace,
+    ReplaceGeneration {
+        generation: i64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BindResult {
+    pub endpoint: EndpointView,
+    pub changed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -117,6 +134,14 @@ pub enum Request {
         conversation: Option<String>,
         since_seq: Option<i64>,
         limit: u32,
+    },
+    /// Guarded registration. Old daemons reject this operation before any mutation.
+    EndpointBind {
+        name: String,
+        session: String,
+        exe: String,
+        #[serde(default)]
+        mode: BindMode,
     },
     EndpointRegister {
         name: String,
@@ -484,6 +509,7 @@ pub enum Response {
         events: Vec<EventView>,
     },
     Registered(EndpointView),
+    Bound(BindResult),
     /// `removed` is the binding that was removed, absent when there was none (nothing changed).
     /// `in_flight` counts its submissions still running: they finish and are recorded under the removed
     /// generation, and are never retried automatically.

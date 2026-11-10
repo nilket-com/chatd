@@ -15,8 +15,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::proto::{
-    ClientFrame, DeliveryObservation, DeliveryPolicy, EndpointView, ErrorCode, EventView, HealthView, Kind, MAX_PAGE, PROTOCOL_VERSION,
-    ParticipantView, PushHold, Request, Response, ServerFrame, WatcherView, read_frame, write_frame,
+    BindMode, BindResult, ClientFrame, DeliveryObservation, DeliveryPolicy, EndpointView, ErrorCode, EventView, HealthView, Kind, MAX_PAGE,
+    PROTOCOL_VERSION, ParticipantView, PushHold, Request, Response, ServerFrame, WatcherView, read_frame, write_frame,
 };
 use crate::store::{SYSTEM_SENDER, Store, StoreError, now_ms};
 use crate::{adapter, health, hub::Hub, journal, legacy, notify};
@@ -494,7 +494,9 @@ fn reserved_name(req: &Request) -> Option<&str> {
         | Request::Ack { as_, .. }
         | Request::Supersede { as_, .. }
         | Request::ClassifyRehearsal { as_, .. } => vec![as_.as_str()],
-        Request::EndpointRegister { name, .. } | Request::EndpointUnregister { name } => vec![name.as_str()],
+        Request::EndpointRegister { name, .. } | Request::EndpointBind { name, .. } | Request::EndpointUnregister { name } => {
+            vec![name.as_str()]
+        }
         _ => Vec::new(),
     };
     names.into_iter().find(|n| *n == SYSTEM_SENDER)
@@ -617,6 +619,23 @@ fn receipt_delivery(shared: &Shared, store: &Store, sender: &str, id: &str, dupl
     })
 }
 
+fn endpoint_bound(shared: &Shared, result: &BindResult, wrote: &mut bool) {
+    if !result.changed {
+        return;
+    }
+    *wrote = true;
+    let ep = &result.endpoint;
+    // Called under the store lock, as health inspection updates are: old health cannot reappear.
+    if let Ok(mut health) = shared.health.lock() {
+        health.remove(&ep.name);
+    }
+    journal::log(
+        journal::PRIORITY_NOTICE,
+        &format!("endpoint {} bound, generation {}", ep.name, ep.generation),
+        &[("SENDER", &ep.name), ("EVENT", "endpoint")],
+    );
+}
+
 fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
     if let Some(name) = reserved_name(&req) {
         return Response::Error {
@@ -709,20 +728,17 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
         Request::Log { conversation, since_seq, limit } => {
             store.log(conversation.as_deref(), since_seq, limit).map(|events| Response::Log { events }).unwrap_or_else(err)
         }
-        Request::EndpointRegister { name, session, exe } => match store.endpoint_register(&name, &session, &exe) {
-            Ok(v) => {
-                wrote = true;
-                // Held under the store lock, like unregister: an observation of the old
-                // session cannot repopulate its health after the binding changes.
-                if let Ok(mut h) = shared.health.lock() {
-                    h.remove(&name);
-                }
-                journal::log(
-                    journal::PRIORITY_NOTICE,
-                    &format!("endpoint {name} bound, generation {}", v.generation),
-                    &[("SENDER", &name), ("EVENT", "endpoint")],
-                );
-                Response::Registered(v)
+        Request::EndpointRegister { name, session, exe } => match store.endpoint_bind(&name, &session, &exe, BindMode::Plain) {
+            Ok(result) => {
+                endpoint_bound(shared, &result, &mut wrote);
+                Response::Registered(result.endpoint)
+            }
+            Err(e) => err(e),
+        },
+        Request::EndpointBind { name, session, exe, mode } => match store.endpoint_bind(&name, &session, &exe, mode) {
+            Ok(result) => {
+                endpoint_bound(shared, &result, &mut wrote);
+                Response::Bound(result)
             }
             Err(e) => err(e),
         },
@@ -1174,7 +1190,11 @@ mod receipt_delivery_tests {
             }
         }
         fn endpoint(&self) -> EndpointView {
-            self.shared.store.lock().unwrap().endpoint_register("codex", "test-session", "/bin/true").unwrap()
+            {
+                let mut store = self.shared.store.lock().unwrap();
+                let session = format!("test-session-{}", store.endpoints().unwrap().first().map_or(0, |e| e.generation));
+                store.endpoint_bind("codex", &session, "/bin/true", BindMode::Replace).unwrap().endpoint
+            }
         }
         fn start_attempt(&self, id: &str) -> i64 {
             let mut s = self.shared.store.lock().unwrap();
@@ -1387,6 +1407,105 @@ mod receipt_delivery_tests {
             (-1000, "<1s"),
         ] {
             assert_eq!(receipt_duration(milliseconds), expected);
+        }
+    }
+    #[test]
+    fn guarded_noops_and_refusals_preserve_health_events_and_throttle_state() {
+        let f = Fixture::new("");
+        let bind = |session: &str, exe: &str, mode| {
+            dispatch(&f.shared, Request::EndpointBind { name: "codex".into(), session: session.into(), exe: exe.into(), mode })
+        };
+        let Response::Bound(initial) = bind("original", "/bin/true", BindMode::Plain) else { panic!() };
+        assert!(initial.changed);
+        let request = f.send("work", Kind::Request, None);
+        f.start_attempt(&request.id);
+        f.shared.committed(); // Match the adapter's publication after recording its attempt.
+        let health = HealthView {
+            state: crate::proto::HealthState::Filtered,
+            detail: Some("test".into()),
+            since_ms: 1,
+            checked_at_ms: 2,
+            log: None,
+            log_modified_ms: None,
+        };
+        f.shared.health.lock().unwrap().insert("codex".into(), health.clone());
+        let head = f.shared.hub.head();
+        let at = now_ms();
+        let hold = f.shared.store.lock().unwrap().push_hold(&initial.endpoint, at, 1000, 60000, None).unwrap();
+        for mode in [BindMode::Plain, BindMode::Replace, BindMode::ReplaceGeneration { generation: initial.endpoint.generation }] {
+            let Response::Bound(result) = bind("original", "/bin/true", mode) else { panic!() };
+            assert!(!result.changed);
+            assert_eq!(result.endpoint, initial.endpoint);
+        }
+        for (session, exe, mode) in [
+            ("other", "/bin/true", BindMode::Plain),
+            ("original", "/bin/false", BindMode::Plain),
+            ("original", "/bin/true", BindMode::ReplaceGeneration { generation: 2 }),
+        ] {
+            let Response::Error { code: ErrorCode::Conflict, message } = bind(session, exe, mode) else { panic!() };
+            assert!(message.contains("original") && message.contains("/bin/true") && message.contains("--replace-generation 1"));
+        }
+        assert!(matches!(
+            dispatch(&f.shared, Request::EndpointRegister { name: "codex".into(), session: "other".into(), exe: "/bin/true".into() }),
+            Response::Error { code: ErrorCode::Conflict, .. }
+        ));
+        assert!(
+            matches!(
+                dispatch(
+                    &f.shared,
+                    Request::EndpointRegister { name: "codex".into(), session: "original".into(), exe: "/bin/true".into() }
+                ),
+                Response::Registered(_)
+            ),
+            "legacy response shape stays unchanged"
+        );
+        assert_eq!(f.shared.hub.head(), head);
+        assert_eq!(f.shared.store.lock().unwrap().head_seq().unwrap(), head);
+        assert_eq!(f.shared.health.lock().unwrap().get("codex"), Some(&health));
+        assert_eq!(f.shared.store.lock().unwrap().push_hold(&initial.endpoint, at, 1000, 60000, None).unwrap(), hold);
+        let Response::Bound(replacement) = bind("replacement", "/bin/true", BindMode::ReplaceGeneration { generation: 1 }) else {
+            panic!()
+        };
+        assert!(replacement.changed);
+        assert_eq!(replacement.endpoint.generation, 2);
+        assert!(f.shared.health.lock().unwrap().get("codex").is_none());
+        assert!(f.shared.hub.head() > head);
+    }
+
+    #[test]
+    fn guarded_missing_binding_and_generation_validation_are_explicit() {
+        for mode in [BindMode::Plain, BindMode::Replace] {
+            let f = Fixture::new("");
+            let bind = |generation| {
+                dispatch(
+                    &f.shared,
+                    Request::EndpointBind {
+                        name: "codex".into(),
+                        session: "s".into(),
+                        exe: "/bin/true".into(),
+                        mode: BindMode::ReplaceGeneration { generation },
+                    },
+                )
+            };
+            for generation in [-1, 0] {
+                assert!(matches!(bind(generation), Response::Error { code: ErrorCode::BadRequest, .. }));
+            }
+            assert!(matches!(bind(1), Response::Error { code:ErrorCode::Conflict, message } if message.contains("missing")));
+            let Response::Bound(first) =
+                dispatch(&f.shared, Request::EndpointBind { name: "codex".into(), session: "s".into(), exe: "/bin/true".into(), mode })
+            else {
+                panic!()
+            };
+            assert!(first.changed);
+            dispatch(&f.shared, Request::EndpointUnregister { name: "codex".into() });
+            assert!(matches!(bind(1), Response::Error { code:ErrorCode::Conflict, message } if message.contains("missing")));
+            let Response::Bound(next) = dispatch(
+                &f.shared,
+                Request::EndpointBind { name: "codex".into(), session: "s".into(), exe: "/bin/true".into(), mode: BindMode::Plain },
+            ) else {
+                panic!()
+            };
+            assert!(next.endpoint.generation > first.endpoint.generation);
         }
     }
 }
