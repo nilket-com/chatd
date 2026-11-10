@@ -513,6 +513,16 @@ the watcher's colour; legacy receipts without a recorded author keep the reader'
 Older receipt records did not record the author, so their from column shows `-`.
 Watch records have no message ID and use `-` in that column.
 
+## Commit conventions
+
+From ADR 0008 onward, use signed, subject-only `plan: adr NNNN summary` and
+`impl: adr NNNN summary` commits, with one implementation immediately after its plan.
+Each plan contains matching files in `plans/adr/` and `plans/impl/`. `cargo test`
+checks committed history and runs isolated checker controls; see [commit history
+checks](ci/README.md) for the fixed cutoff, identity, signature prerequisites and
+explicit missing-Python skip behavior. After committing an implementation, run
+`python3 -B ci/commit_subjects.py` again to verify that signed commit.
+
 ## License
 
 Licensed under either of

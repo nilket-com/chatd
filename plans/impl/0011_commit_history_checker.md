@@ -26,3 +26,14 @@ Paired ADR: ../adr/0011_commit_history_checker.md.
 4. README: a short "Commit conventions" section pointing at `ci/README.md`.
 5. Verify: the checker passes on the current history (0008 to 0011), the unit tests pass, and
    `cargo fmt`, Clippy with warnings denied and the full suite pass.
+
+
+## Implemented verification
+
+The port is pinned to rnx `1a3196d4ea88dcb397f544644d44bd4d784a81e2`.
+`tests/commit_history.rs` invokes the checker and Python controls directly with
+`python3 -B` from `CARGO_MANIFEST_DIR`. Only a missing Python executable skips;
+other errors fail. Fixture Git environments and SSH signing keys are isolated.
+History validation protects grandfathered flat plans as well as other paired
+records. After signing the implementation commit, run the checker once more
+against the resulting HEAD and retain its terminal JSON receipt outside the repo.
